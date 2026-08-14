@@ -17,6 +17,13 @@ from openjarvis.reliability.sources.github import (
     UnsafeBranchError,
     is_protected_path,
 )
+from openjarvis.reliability.sources.sql_guard import (
+    SqlVerdict,
+    WriteGateClosedError,
+    check_sql,
+    is_read_only,
+)
+from openjarvis.reliability.sources.supabase import SupabaseSource
 from openjarvis.reliability.sources.vercel import VercelSource
 
 __all__ = [
@@ -28,8 +35,13 @@ __all__ = [
     "ProtectedPathError",
     "ResilientClient",
     "SourceHealth",
+    "SqlVerdict",
+    "SupabaseSource",
     "UnsafeBranchError",
     "VercelSource",
+    "WriteGateClosedError",
+    "check_sql",
+    "is_read_only",
     "is_protected_path",
     "resolve_token",
 ]
