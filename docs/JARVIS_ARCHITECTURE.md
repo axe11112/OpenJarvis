@@ -7,6 +7,7 @@ what exists, what is partial, and what is not built.
 and the browser probes against a local fixture site with real Chromium. No Vercel, Supabase or
 GitHub credentials have been used, and no live Claude Code session has driven the repair loop,
 because no target application is configured (§12).
+
 **Scope:** How an autonomous website-reliability engineer ("JARVIS") is built *on top of*
 OpenJarvis, reusing the existing primitives rather than forking or replacing them.
 
