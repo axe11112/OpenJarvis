@@ -123,6 +123,7 @@ def _build_sources(config: Any) -> list:
             GitHubSource(
                 repo=rc.github.repo,
                 token_env=rc.github.token_env,
+                actions_token_env=rc.github.actions_token_env,
                 base_branch=rc.github.base_branch,
                 branch_prefix=rc.github.branch_prefix,
                 allow_push_to_default_branch=rc.policy.allow_push_to_default_branch,
@@ -1044,8 +1045,13 @@ def reliability_verify_audit() -> None:
 
 
 @reliability.command("doctor")
+@click.option(
+    "--connectivity",
+    is_flag=True,
+    help="Also check whether this network can reach each integration host.",
+)
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
-def reliability_doctor(as_json: bool) -> None:
+def reliability_doctor(connectivity: bool, as_json: bool) -> None:
     """Validate configuration and credentials. Contacts nothing.
 
     Reports which credentials are *present* by environment-variable name.  It
@@ -1053,18 +1059,27 @@ def reliability_doctor(as_json: bool) -> None:
     """
     import json as json_module
 
-    from openjarvis.reliability.target import credential_report, resolve_target
+    from openjarvis.reliability.target import (
+        connectivity_report,
+        credential_report,
+        resolve_target,
+    )
 
     console = Console()
     config = _load_config()
     target = resolve_target(config)
     credentials = credential_report(config)
+    # Contacting nothing is the default. --connectivity opts in to unauthenticated
+    # reachability checks, which is the one question a credential report cannot
+    # answer: "can this machine even get there?"
+    reachability = connectivity_report(target) if connectivity else []
 
     if as_json:
         console.print_json(
             json_module.dumps(
                 {
                     "target": target.to_dict(),
+                    "connectivity": reachability,
                     "credentials": [c.to_dict() for c in credentials],
                     "safety": _safety_snapshot(config),
                 }
@@ -1098,6 +1113,38 @@ def reliability_doctor(as_json: bool) -> None:
                 escape(status.required_for),
             )
         console.print(creds)
+
+        if reachability:
+            net = Table(title="Network reachability (no credentials sent)")
+            for column in ("Integration", "Host", "Result", "Detail"):
+                net.add_column(column)
+            _style = {
+                "REACHABLE": "green",
+                "BLOCKED": "red",
+                "UNKNOWN": "yellow",
+                "NOT_CONFIGURED": "dim",
+            }
+            for row in reachability:
+                net.add_row(
+                    escape(row["name"]),
+                    escape(row["host"] or "—"),
+                    f"[{_style.get(row['state'], 'white')}]{escape(row['state'])}[/]",
+                    escape(row["detail"][:70]),
+                )
+            console.print(net)
+            blocked = [r["name"] for r in reachability if r["state"] == "BLOCKED"]
+            if blocked:
+                console.print(
+                    "[yellow]"
+                    + escape(
+                        f"{len(blocked)} host(s) unreachable from this machine: "
+                        + ", ".join(blocked)
+                        + ". This is a network limitation, not an application "
+                        "failure — JARVIS will report those integrations BLOCKED "
+                        "and will not open incidents for them."
+                    )
+                    + "[/yellow]\n"
+                )
 
         console.print()
         safety = Table(title="Safety interlocks", show_header=False, box=None)

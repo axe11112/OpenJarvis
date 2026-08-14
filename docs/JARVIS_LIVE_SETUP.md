@@ -28,8 +28,51 @@ Companion documents: [`JARVIS_ARCHITECTURE.md`](JARVIS_ARCHITECTURE.md) ·
 | Telegram bot token | Notifications (optional) | `TELEGRAM_BOT_TOKEN` |
 | Test account | Authenticated probes (optional) | `JARVIS_TEST_EMAIL`, `JARVIS_TEST_PASSWORD` |
 
+### Accepted spellings
+
+Each identifier is read under more than one name, because both forms are natural
+to reach for and the failure mode of accepting only one is invisible: you export
+the variable, JARVIS ignores it, and `doctor` still reports it missing.
+
+| Identifier | Names accepted (first wins) |
+|---|---|
+| Repository | `TARGET_REPOSITORY`, `TARGET_REPO`, `GITHUB_REPOSITORY` |
+| Default branch | `TARGET_BRANCH`, `TARGET_DEFAULT_BRANCH`, `GITHUB_BASE_BRANCH` |
+| Production URL | `TARGET_PRODUCTION_URL`, `PRODUCTION_URL`, `TARGET_URL` |
+| Vercel project | `VERCEL_PROJECT`, `VERCEL_PROJECT_ID` |
+| Vercel team | `VERCEL_TEAM`, `VERCEL_TEAM_ID` |
+| Supabase ref | `SUPABASE_PROJECT_REF`, `SUPABASE_PROJECT_ID`, `SUPABASE_REF` |
+
+Tokens are read only under the names in `[reliability.*] token_env`, which
+default to `GITHUB_READONLY_TOKEN`, `VERCEL_READONLY_TOKEN` and
+`SUPABASE_READONLY_TOKEN`. Actions may use a separate token via
+`[reliability.github] actions_token_env` — useful when workflow read access is
+issued on a different token than repository contents, so the main one need not
+be widened.
+
 Identifiers may also live in `~/.openjarvis/config.toml`; environment variables
 win, so you can run a one-off diagnostic against staging without editing config.
+
+### Can this machine even get there?
+
+```bash
+jarvis reliability doctor --connectivity
+```
+
+Unauthenticated reachability per integration host, through the same HTTP stack
+and proxy settings JARVIS itself uses. Answers the question a credential report
+cannot, and the one worth answering first:
+
+```
+GitHub      api.github.com     REACHABLE   HTTP 200
+Vercel      api.vercel.com     BLOCKED     egress proxy refused the connection: 403
+```
+
+`BLOCKED` is not `FAILED`. It means this network cannot reach the host, the
+request never left the machine, and the target is very probably fine. JARVIS
+reports those integrations `BLOCKED` and **will not open incidents for them** —
+a monitoring system that reports "production is down" when the truth is "our
+firewall said no" is worse than no monitoring at all.
 
 **Credentials only ever live in environment variables.** Nothing in this
 document, in `config.toml`, or in any JARVIS record holds a secret value —

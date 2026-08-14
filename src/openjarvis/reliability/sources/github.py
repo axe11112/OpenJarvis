@@ -167,6 +167,7 @@ class GitHubSource(BaseSignalSource):
         *,
         repo: str,
         token_env: str = "GITHUB_READONLY_TOKEN",
+        actions_token_env: str = "",
         base_branch: str = "main",
         branch_prefix: str = "jarvis/incident-",
         allow_push_to_default_branch: bool = False,
@@ -181,7 +182,9 @@ class GitHubSource(BaseSignalSource):
         self._allow_default_branch_push = allow_push_to_default_branch
         self._protected_paths = list(protected_paths or [])
         self._token_env = token_env
+        self._actions_token_env = actions_token_env or token_env
         self._client = client
+        self._actions_client: Optional[ResilientClient] = None
         self._last_error = ""
 
     # -- client -----------------------------------------------------------
@@ -201,6 +204,28 @@ class GitHubSource(BaseSignalSource):
                 },
             )
         return self._client
+
+    @property
+    def actions_client(self) -> ResilientClient:
+        """Client for Actions reads, which may use a different token.
+
+        Falls back to the main client when no separate variable is configured,
+        so the common case costs nothing.
+        """
+        if self._actions_token_env == self._token_env:
+            return self.client
+        if self._actions_client is None:
+            token = resolve_token(self._actions_token_env, source=self.source_id)
+            self._actions_client = ResilientClient(
+                base_url=_API_ROOT,
+                source=self.source_id,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+        return self._actions_client
 
     # -- reads ------------------------------------------------------------
 
@@ -312,7 +337,7 @@ class GitHubSource(BaseSignalSource):
             params["status"] = status
         if branch:
             params["branch"] = branch
-        raw = self.client.get_json(
+        raw = self.actions_client.get_json(
             f"/repos/{self.repo}/actions/runs", params=params, default={}
         )
         return [
@@ -336,7 +361,7 @@ class GitHubSource(BaseSignalSource):
         caller must treat the result as untrusted external content.
         """
         try:
-            response = self.client.request(
+            response = self.actions_client.request(
                 "GET",
                 f"/repos/{self.repo}/actions/runs/{run_id}/logs",
                 expected=(200, 302),

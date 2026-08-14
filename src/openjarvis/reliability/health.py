@@ -39,6 +39,13 @@ class HealthState(str, Enum):
     DEGRADED = "DEGRADED"
     FAILED = "FAILED"
     UNKNOWN = "UNKNOWN"
+    #: The host could not be reached at all — DNS, a firewall, or an egress
+    #: proxy refusing CONNECT. Distinguished from UNKNOWN because the two need
+    #: different actions: UNKNOWN usually means a missing scope or an ambiguous
+    #: response, BLOCKED means *this network cannot get there*, and no amount of
+    #: fixing credentials will help. Distinguished from FAILED because the
+    #: target is very probably fine — JARVIS is the one that cannot see.
+    BLOCKED = "BLOCKED"
     NOT_CONFIGURED = "NOT_CONFIGURED"
     NOT_CHECKED = "NOT_CHECKED"
 
@@ -50,6 +57,7 @@ class HealthState(str, Enum):
             HealthState.DEGRADED: "🟡",
             HealthState.FAILED: "🔴",
             HealthState.UNKNOWN: "⚪",
+            HealthState.BLOCKED: "🚫",
             HealthState.NOT_CONFIGURED: "⚫",
             HealthState.NOT_CHECKED: "⚫",
         }[self]
@@ -90,6 +98,7 @@ _SEVERITY_ORDER: List[HealthState] = [
     HealthState.HEALTHY,
     HealthState.NOT_CONFIGURED,
     HealthState.UNKNOWN,
+    HealthState.BLOCKED,
     HealthState.DEGRADED,
     HealthState.FAILED,
 ]

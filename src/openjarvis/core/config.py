@@ -1478,6 +1478,11 @@ class ReliabilityGitHubConfig:
     enabled: bool = False
     repo: str = ""  # "owner/name"
     token_env: str = "GITHUB_READONLY_TOKEN"
+    #: Optional separate token for Actions. Some organisations issue workflow
+    #: read access on a different token than repository contents; naming it
+    #: separately means the operator does not have to widen the main one.
+    #: Empty means "use token_env".
+    actions_token_env: str = ""
     base_branch: str = "main"
     branch_prefix: str = "jarvis/incident-"
     poll_interval_seconds: int = 300

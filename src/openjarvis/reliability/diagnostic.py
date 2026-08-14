@@ -43,6 +43,23 @@ _UNKNOWN_MARKERS = (
 )
 
 
+#: Markers meaning the host was unreachable rather than unreadable. An egress
+#: proxy answering 403 to CONNECT looks like an authorization failure but is
+#: not one — the request never left the network.
+_BLOCKED_MARKERS = (
+    "proxyerror",
+    "connect tunnel failed",
+    "connecterror",
+    "connection refused",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "nodename nor servname",
+    "network is unreachable",
+    "ssl",
+    "certificate verify failed",
+)
+
+
 def _classify_exception(exc: BaseException) -> tuple[HealthState, str]:
     """Map an exception to a state and a human-readable reason.
 
@@ -51,10 +68,15 @@ def _classify_exception(exc: BaseException) -> tuple[HealthState, str]:
     """
     text = f"{type(exc).__name__}: {exc}"
     lowered = text.lower()
+    # Network refusals first: "this network cannot reach the host" is a
+    # different problem from "we lack the scope to read it", and conflating them
+    # sends the operator to rotate a credential that was never the issue.
+    if any(marker in lowered for marker in _BLOCKED_MARKERS):
+        return HealthState.BLOCKED, text
     if any(marker in lowered for marker in _UNKNOWN_MARKERS):
         return HealthState.UNKNOWN, text
     if "timeout" in lowered or "connect" in lowered:
-        return HealthState.UNKNOWN, text
+        return HealthState.BLOCKED, text
     return HealthState.FAILED, text
 
 

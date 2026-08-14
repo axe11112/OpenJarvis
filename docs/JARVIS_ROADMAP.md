@@ -1,6 +1,6 @@
 # JARVIS Roadmap
 
-**Status:** Phases 1–10, 12, 14 and 15 implemented. Completed tasks are marked ✅; anything unmarked or
+**Status:** Phases 1–10, 12, 14 and 15 implemented. Phase 16 is **blocked on network egress**. Completed tasks are marked ✅; anything unmarked or
 explicitly deferred is called out as such.
 
 **Partially exercised against real infrastructure.** As of Phase 10, **GitHub is the only
@@ -497,6 +497,64 @@ reported as blocked rather than as done.
 
 ---
 
+## Phase 16 — Real target activation
+
+**Status: BLOCKED, and not by anything in this repository.**
+
+The phase asks for the real chain end to end: real website, Vercel, Supabase,
+Playwright against a real preview, a real pull request and a real Telegram
+message. Two independent things prevent it, and no amount of implementation
+work removes either.
+
+**1. Egress.** Measured, not assumed. From this environment the proxy answers
+`403` to `CONNECT` for every integration host except GitHub:
+
+| Host | Result |
+|---|---|
+| `api.github.com` | HTTP 200 |
+| `api.vercel.com` | 403 to CONNECT |
+| `api.supabase.com` | 403 to CONNECT |
+| `api.telegram.org` | 403 to CONNECT |
+| the production domain | 403 to CONNECT |
+
+The proxy's own README says to report the blocked host rather than route around
+it, so that is what JARVIS now does.
+
+**2. Target identifiers.** §2 says the operator provides `TARGET_REPO`,
+`TARGET_BRANCH`, `PRODUCTION_URL`, `VERCEL_PROJECT`, `VERCEL_TEAM` and
+`SUPABASE_PROJECT_REF`, and that none may be guessed. They were not supplied.
+
+### What was done instead
+
+Running `doctor` first, as §1 instructs, found a defect that would have cost the
+operator an afternoon on the very first attempt.
+
+| ID | Task | Type | Status |
+|---|---|---|---|
+| J16.1 | Environment-variable aliases — the names in the brief were **not** the names JARVIS read | `[extend]` | ✅ |
+| J16.2 | `[reliability.github] actions_token_env` — a separate Actions-read token | `[extend]` | ✅ |
+| J16.3 | `HealthState.BLOCKED`, distinct from `UNKNOWN` and `FAILED` | `[extend]` | ✅ |
+| J16.4 | `doctor --connectivity` — unauthenticated reachability per host | `[new]` | ✅ |
+| J16.5 | Live-setup documentation for accepted names and the preflight | `[docs]` | ✅ |
+| J16.6 | Everything requiring a reachable Vercel/Supabase/Telegram/production host | `[test]` | **blocked** |
+
+**The defect.** Four of the six identifiers in the brief were spelled
+differently from what `resolve_target()` read: `TARGET_REPO` vs
+`TARGET_REPOSITORY`, `PRODUCTION_URL` vs `TARGET_PRODUCTION_URL`,
+`VERCEL_PROJECT_ID` vs `VERCEL_PROJECT`, `VERCEL_TEAM_ID` vs `VERCEL_TEAM`. An
+operator exporting the documented names would have had all four silently
+ignored, with `doctor` still reporting them missing and nothing in the output to
+suggest the *name* was the problem. Both spellings are now accepted.
+
+**A second defect, found by running the new preflight.** The first
+implementation opened a raw TLS socket, which bypassed `HTTPS_PROXY` entirely
+and reported all four blocked hosts as `REACHABLE`. A preflight that is green
+where the real client fails is worse than none, because it sends the operator
+looking in the wrong place. It now issues a real request through the same stack
+and proxy settings JARVIS itself uses.
+
+---
+
 ## Cross-cutting, every phase
 
 - No existing test removed or weakened.
@@ -542,6 +600,7 @@ After Phase 14: **8295 passed, 56 skipped**, same 4 environmental failures — 1
 regressions.
 After Phase 15: **8299 passed, 56 skipped**, same 4 environmental failures. The `live_claude` lane
 adds 14 more that drive the real `claude` CLI; run them with `-m live_claude`.
+After Phase 16: **8317 passed, 56 skipped**, same 4 environmental failures.
 
 Running the suite **unmarked** (without `-m "not live and not cloud and not hub"`) adds 20 further
 failures on top of those 4, in `tests/connectors/test_new_connectors_live.py`,
