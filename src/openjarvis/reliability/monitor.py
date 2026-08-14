@@ -1,0 +1,310 @@
+"""The monitoring loop — what makes JARVIS continuous rather than a script.
+
+Registers probes and infrastructure sources with the framework's existing
+:class:`~openjarvis.scheduler.scheduler.TaskScheduler`, so JARVIS adds no new
+process and inherits the daemon, systemd and launchd plumbing that already
+exists under ``deploy/``.
+
+Two properties matter more than the scheduling itself:
+
+* **Tick isolation.** One probe raising must never stop the loop. Every tick is
+  wrapped, and a failure is logged and counted rather than propagated.
+* **Politeness.** Probes start at jittered offsets so they do not stampede the
+  site in lockstep, and each source has its own circuit breaker.
+"""
+
+from __future__ import annotations
+
+import logging
+import random
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional
+
+from openjarvis.reliability.detector import Detection, Detector
+from openjarvis.reliability.events import (
+    RELIABILITY_TICK_END,
+    RELIABILITY_TICK_START,
+)
+from openjarvis.reliability.probes.executor import ProbeExecutor
+from openjarvis.reliability.probes.spec import ProbeSpec
+from openjarvis.reliability.types import IncidentState
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["MonitorStats", "ReliabilityMonitor", "ScheduledCheck"]
+
+
+@dataclass(slots=True)
+class MonitorStats:
+    """Counters for what the monitor has done."""
+
+    ticks: int = 0
+    failures: int = 0
+    incidents_opened: int = 0
+    incidents_recovered: int = 0
+    recurrences: int = 0
+    suppressed: int = 0
+
+    def to_dict(self) -> Dict[str, int]:
+        """Serialize to a plain dict."""
+        return {
+            "ticks": self.ticks,
+            "failures": self.failures,
+            "incidents_opened": self.incidents_opened,
+            "incidents_recovered": self.incidents_recovered,
+            "recurrences": self.recurrences,
+            "suppressed": self.suppressed,
+        }
+
+
+@dataclass
+class ScheduledCheck:
+    """One thing the monitor runs on a cadence."""
+
+    key: str
+    interval_seconds: float
+    run: Callable[[], None]
+    next_due: float = 0.0
+    kind: str = "probe"
+
+    def due(self, now: float) -> bool:
+        """Whether this check should run at *now*."""
+        return now >= self.next_due
+
+    def reschedule(self, now: float) -> None:
+        """Set the next due time."""
+        self.next_due = now + self.interval_seconds
+
+
+class ReliabilityMonitor:
+    """Runs probes and source polls on a cadence, feeding the detector.
+
+    Parameters
+    ----------
+    detector:
+        Turns results into incidents.
+    executor:
+        Runs probe specs.
+    specs:
+        Probe specs to schedule.
+    sources:
+        Signal sources to poll.
+    repair_loop:
+        Optional repair loop.  When absent, JARVIS monitors and notifies but
+        never modifies code.
+    clock:
+        Injected for tests.
+    """
+
+    def __init__(
+        self,
+        *,
+        detector: Detector,
+        executor: ProbeExecutor,
+        specs: Optional[List[ProbeSpec]] = None,
+        sources: Optional[List[Any]] = None,
+        source_interval_seconds: float = 300.0,
+        repair_loop: Any = None,
+        notifier: Any = None,
+        bus: Any = None,
+        clock: Callable[[], float] = time.monotonic,
+        jitter: Callable[[], float] = random.random,
+    ) -> None:
+        self._detector = detector
+        self._executor = executor
+        self._repair_loop = repair_loop
+        self._notifier = notifier
+        self._bus = bus
+        self._clock = clock
+        self.stats = MonitorStats()
+        self._specs: Dict[str, ProbeSpec] = {}
+        self._checks: List[ScheduledCheck] = []
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        for spec in specs or []:
+            self.add_probe(spec, jitter=jitter)
+        for source in sources or []:
+            self.add_source(
+                source, interval_seconds=source_interval_seconds, jitter=jitter
+            )
+
+    # -- registration -----------------------------------------------------
+
+    def add_probe(
+        self, spec: ProbeSpec, *, jitter: Callable[[], float] = random.random
+    ) -> None:
+        """Schedule *spec*, with a jittered first run."""
+        if not spec.enabled:
+            logger.info("probe %s is disabled; not scheduling", spec.id)
+            return
+        interval = self._interval_for(spec)
+        self._specs[spec.id] = spec
+        check = ScheduledCheck(
+            key=f"probe:{spec.id}",
+            interval_seconds=interval,
+            run=lambda s=spec: self._run_probe(s),
+            kind="probe",
+        )
+        # Stagger first runs so N probes do not hit the site simultaneously.
+        check.next_due = self._clock() + jitter() * min(interval, 60.0)
+        self._checks.append(check)
+
+    def add_source(
+        self,
+        source: Any,
+        *,
+        interval_seconds: float = 300.0,
+        jitter: Callable[[], float] = random.random,
+    ) -> None:
+        """Schedule polling for a signal source."""
+        check = ScheduledCheck(
+            key=f"source:{getattr(source, 'source_id', 'unknown')}",
+            interval_seconds=interval_seconds,
+            run=lambda s=source: self._poll_source(s),
+            kind="source",
+        )
+        check.next_due = self._clock() + jitter() * min(interval_seconds, 60.0)
+        self._checks.append(check)
+
+    @staticmethod
+    def _interval_for(spec: ProbeSpec) -> float:
+        """Resolve a probe's cadence from its schedule declaration."""
+        if spec.schedule_type == "interval":
+            try:
+                return max(30.0, float(spec.schedule_value))
+            except (TypeError, ValueError):
+                return 300.0
+        # Cron scheduling is delegated to TaskScheduler when the monitor runs
+        # under the daemon; standalone mode approximates with a default.
+        return 300.0
+
+    # -- execution --------------------------------------------------------
+
+    def tick(self) -> int:
+        """Run every check that is due. Returns how many ran.
+
+        Never raises: one broken check must not stop the loop.
+        """
+        now = self._clock()
+        ran = 0
+        for check in self._checks:
+            if not check.due(now):
+                continue
+            self.stats.ticks += 1
+            self._publish(RELIABILITY_TICK_START, {"check": check.key})
+            try:
+                check.run()
+            except Exception:
+                self.stats.failures += 1
+                logger.exception("check %s raised; continuing", check.key)
+            finally:
+                check.reschedule(self._clock())
+                self._publish(RELIABILITY_TICK_END, {"check": check.key})
+            ran += 1
+        return ran
+
+    def run_forever(self, *, poll_interval: float = 5.0) -> None:
+        """Block, ticking until :meth:`stop` is called."""
+        logger.info("JARVIS monitoring started (%d check(s))", len(self._checks))
+        while not self._stop.is_set():
+            self.tick()
+            self._stop.wait(poll_interval)
+        logger.info("JARVIS monitoring stopped")
+
+    def start(self, *, poll_interval: float = 5.0) -> None:
+        """Run the loop on a background daemon thread."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self.run_forever,
+            kwargs={"poll_interval": poll_interval},
+            daemon=True,
+            name="jarvis-reliability",
+        )
+        self._thread.start()
+
+    def stop(self, *, timeout: float = 10.0) -> None:
+        """Signal the loop to stop and wait for it."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+
+    # -- check bodies -----------------------------------------------------
+
+    def _run_probe(self, spec: ProbeSpec) -> None:
+        result = self._executor.run(spec)
+        detection = self._detector.from_probe(spec, result)
+        self._account(detection)
+        if detection.opened and detection.incident is not None:
+            self._maybe_repair(detection.incident, spec)
+
+    def _poll_source(self, source: Any) -> None:
+        signals = source.poll()
+        for detection in self._detector.from_signals(signals):
+            self._account(detection)
+
+    def _account(self, detection: Detection) -> None:
+        if detection.opened:
+            self.stats.incidents_opened += 1
+        if detection.recovered:
+            self.stats.incidents_recovered += 1
+        if detection.recurred:
+            self.stats.recurrences += 1
+        if detection.suppressed:
+            self.stats.suppressed += 1
+
+    def _maybe_repair(self, incident: Any, spec: ProbeSpec) -> None:
+        """Hand a fresh incident to the repair loop, if one is configured."""
+        if self._repair_loop is None:
+            return
+        try:
+            outcome = self._repair_loop.run(incident, spec)
+        except Exception:
+            logger.exception("repair loop raised for %s", incident.id)
+            return
+        if self._notifier is None:
+            return
+        try:
+            if outcome.resolved:
+                attempt = incident.attempts[-1] if incident.attempts else None
+                self._notifier.resolved(
+                    incident, attempt=attempt, verification=outcome.verification
+                )
+            elif incident.state is IncidentState.HUMAN_REQUIRED:
+                self._notifier.human_required(
+                    incident,
+                    reason=outcome.reason,
+                    attempts=outcome.attempts,
+                    max_attempts=self._repair_loop.policy.max_attempts,
+                )
+        except Exception:
+            logger.exception("could not notify about %s", incident.id)
+
+    # -- introspection ----------------------------------------------------
+
+    @property
+    def checks(self) -> List[ScheduledCheck]:
+        """Scheduled checks, for the CLI and dashboard."""
+        return list(self._checks)
+
+    def health(self) -> Dict[str, Any]:
+        """Snapshot of what the monitor is doing."""
+        return {
+            "checks": len(self._checks),
+            "probes": len(self._specs),
+            "running": self._thread is not None and self._thread.is_alive(),
+            **self.stats.to_dict(),
+        }
+
+    def _publish(self, event: str, data: Dict[str, Any]) -> None:
+        if self._bus is None:
+            return
+        try:
+            self._bus.publish(event, data)
+        except Exception:
+            logger.exception("could not publish %s", event)

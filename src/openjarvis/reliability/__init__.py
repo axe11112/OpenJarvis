@@ -17,7 +17,10 @@ from openjarvis.reliability.briefing import (
 )
 from openjarvis.reliability.code_agent import CodeAgent, CodeAgentResult
 from openjarvis.reliability.correlate import correlate
+from openjarvis.reliability.detector import Detection, Detector
 from openjarvis.reliability.fingerprint import fingerprint, normalize_error
+from openjarvis.reliability.monitor import ReliabilityMonitor
+from openjarvis.reliability.notify import NotificationRouter, Notifier
 from openjarvis.reliability.policy import Decision, SafetyPolicy
 from openjarvis.reliability.repair import RepairLoop, RepairOutcome
 from openjarvis.reliability.store import IncidentStore
@@ -46,6 +49,8 @@ __all__ = [
     "CodeAgentResult",
     "Correlation",
     "Decision",
+    "Detection",
+    "Detector",
     "Evidence",
     "EvidenceKind",
     "Incident",
@@ -53,10 +58,13 @@ __all__ = [
     "IncidentStore",
     "IncidentTransition",
     "InvalidTransitionError",
+    "NotificationRouter",
+    "Notifier",
     "ProbeResult",
     "RepairAttempt",
     "RepairLoop",
     "RepairOutcome",
+    "ReliabilityMonitor",
     "Resolution",
     "SafetyPolicy",
     "Severity",

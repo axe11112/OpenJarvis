@@ -94,6 +94,148 @@ def _build_executor(config: Any) -> Any:
     )
 
 
+def _build_sources(config: Any) -> list:
+    """Build the enabled signal sources from config."""
+    from openjarvis.reliability.sources.github import GitHubSource
+    from openjarvis.reliability.sources.supabase import SupabaseSource
+    from openjarvis.reliability.sources.vercel import VercelSource
+
+    rc = config.reliability
+    sources: list = []
+    if rc.vercel.enabled and rc.vercel.project_id:
+        sources.append(
+            VercelSource(
+                project_id=rc.vercel.project_id,
+                team_id=rc.vercel.team_id,
+                token_env=rc.vercel.token_env,
+            )
+        )
+    if rc.supabase.enabled and rc.supabase.project_ref:
+        sources.append(
+            SupabaseSource(
+                project_ref=rc.supabase.project_ref,
+                token_env=rc.supabase.token_env,
+                allow_production_writes=rc.supabase.allow_production_writes,
+            )
+        )
+    if rc.github.enabled and rc.github.repo:
+        sources.append(
+            GitHubSource(
+                repo=rc.github.repo,
+                token_env=rc.github.token_env,
+                base_branch=rc.github.base_branch,
+                branch_prefix=rc.github.branch_prefix,
+                allow_push_to_default_branch=rc.policy.allow_push_to_default_branch,
+                protected_paths=list(rc.policy.protected_paths),
+            )
+        )
+    return sources
+
+
+def _build_notifier(config: Any) -> Any:
+    """Build the notification router, falling back to console output."""
+    from openjarvis.reliability.notify import (
+        ConsoleNotifier,
+        NotificationRouter,
+        TelegramNotifier,
+    )
+    from openjarvis.reliability.types import Severity
+
+    rc = config.reliability
+    notifier: Any = ConsoleNotifier()
+    if rc.notify.enabled and rc.notify.channel == "telegram":
+        chat_ids = (config.channel.telegram.allowed_chat_ids or "").split(",")
+        chat_id = chat_ids[0].strip() if chat_ids else ""
+        if chat_id:
+            notifier = TelegramNotifier(
+                chat_id=chat_id,
+                bot_token=config.channel.telegram.bot_token,
+                allowed_chat_ids=config.channel.telegram.allowed_chat_ids,
+            )
+    return NotificationRouter(
+        notifier=notifier,
+        min_severity=Severity.parse(rc.notify.min_severity),
+        max_per_hour=rc.notify.max_messages_per_hour,
+        persona=rc.notify.persona,
+    )
+
+
+def _build_policy(config: Any) -> Any:
+    """Build the safety policy from config."""
+    from openjarvis.reliability.policy import SafetyPolicy
+
+    rc = config.reliability
+    return SafetyPolicy(
+        deploy_mode=rc.policy.deploy_mode,
+        auto_repair_severities=list(rc.policy.auto_repair_severities),
+        auto_deploy_fix_classes=list(rc.policy.auto_deploy_fix_classes),
+        protected_paths=list(rc.policy.protected_paths),
+        allow_push_to_default_branch=rc.policy.allow_push_to_default_branch,
+        max_attempts=rc.repair.max_attempts,
+        repair_enabled=rc.repair.enabled,
+    )
+
+
+def _build_monitor(config: Any, store: Any) -> Any:
+    """Assemble the full monitoring stack from config."""
+    from openjarvis.reliability.detector import Detector
+    from openjarvis.reliability.monitor import ReliabilityMonitor
+    from openjarvis.reliability.probes.spec import load_probes
+
+    rc = config.reliability
+    notifier = _build_notifier(config)
+    specs = load_probes(_probe_dir(config))
+    sources = _build_sources(config)
+
+    detector = Detector(
+        store,
+        environment=rc.site.environment,
+        notifier=notifier,
+    )
+    return ReliabilityMonitor(
+        detector=detector,
+        executor=_build_executor(config),
+        specs=specs,
+        sources=sources,
+        repair_loop=_build_repair_loop(config, store, sources),
+        notifier=notifier,
+    )
+
+
+def _build_repair_loop(config: Any, store: Any, sources: list) -> Any:
+    """Build the repair loop, or ``None`` when repair is disabled."""
+    rc = config.reliability
+    if not rc.repair.enabled:
+        return None
+
+    from openjarvis.reliability.code_agent import ClaudeCliAgent
+    from openjarvis.reliability.repair import RepairLoop
+    from openjarvis.reliability.sources.github import GitHubSource
+    from openjarvis.reliability.sources.vercel import VercelSource
+    from openjarvis.reliability.verify import Verifier
+
+    github = next((s for s in sources if isinstance(s, GitHubSource)), None)
+    vercel = next((s for s in sources if isinstance(s, VercelSource)), None)
+
+    def _preview(branch: str) -> str:
+        if vercel is None:
+            return ""
+        found = vercel.find_preview_deployment(branch)
+        return found["url"] if found else ""
+
+    return RepairLoop(
+        agent=ClaudeCliAgent(),
+        policy=_build_policy(config),
+        verifier=Verifier(evidence_dir=_evidence_dir(config)),
+        store=store,
+        workspace=rc.repair.workspace,
+        test_command=rc.repair.test_command,
+        github=github,
+        preview_lookup=_preview if vercel is not None else None,
+        protected_paths=list(rc.policy.protected_paths),
+    )
+
+
 def _severity_text(value: str) -> str:
     return f"[{_SEVERITY_STYLE.get(value, 'white')}]{value}[/]"
 
@@ -156,6 +298,63 @@ def reliability_status() -> None:
                 "[bold red]Audit chain broken at transition row "
                 f"{broken_row}[/bold red]"
             )
+    finally:
+        store.close()
+
+
+@reliability.command("watch")
+@click.option("--once", is_flag=True, help="Run one pass over every check and exit.")
+@click.option(
+    "--poll-interval", default=5.0, show_default=True, help="Seconds between ticks."
+)
+def reliability_watch(once: bool, poll_interval: float) -> None:
+    """Run the monitoring loop in the foreground."""
+    console = Console()
+    config = _load_config()
+    rc = config.reliability
+
+    if not rc.site.base_url:
+        console.print("[red]No site configured; set [reliability.site] base_url.[/red]")
+        raise SystemExit(1)
+
+    store = _get_store(config)
+    try:
+        monitor = _build_monitor(config, store)
+        if not monitor.checks:
+            console.print(
+                "[yellow]Nothing to monitor: no enabled probes and no enabled "
+                "sources.[/yellow]"
+            )
+            raise SystemExit(1)
+
+        console.print(
+            f"JARVIS monitoring {escape(rc.site.base_url)} "
+            f"({len(monitor.checks)} check(s))."
+        )
+        if rc.repair.enabled:
+            console.print(
+                f"[yellow]Automated repair is ENABLED "
+                f"(deploy_mode={escape(rc.policy.deploy_mode)}).[/yellow]"
+            )
+        else:
+            console.print("[dim]Automated repair is disabled; monitoring only.[/dim]")
+
+        if once:
+            ran = monitor.tick()
+            console.print(f"Ran {ran} check(s).")
+        else:
+            try:
+                monitor.run_forever(poll_interval=poll_interval)
+            except KeyboardInterrupt:
+                console.print("\nStopped.")
+
+        stats = monitor.health()
+        console.print(
+            f"Incidents opened: {stats['incidents_opened']} · "
+            f"recovered: {stats['incidents_recovered']} · "
+            f"recurrences: {stats['recurrences']} · "
+            f"suppressed: {stats['suppressed']}"
+        )
     finally:
         store.close()
 
