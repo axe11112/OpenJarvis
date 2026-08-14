@@ -168,9 +168,29 @@ class ClaudeCliAgent(CodeAgent):
         "TELEGRAM",
     )
 
-    #: Kept even though it matches the list above: without it the CLI cannot
+    #: Kept even though they match the list above: without them the CLI cannot
     #: authenticate, and the whole agent is inert.
-    KEEP_ENV = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+    #:
+    #: The descriptor variants are not hypothetical. Claude Code authenticates
+    #: through ``CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`` on managed hosts, and
+    #: an allowlist naming only ``CLAUDE_CODE_OAUTH_TOKEN`` silently stripped it
+    #: — which would have left the agent unauthenticated on exactly the machines
+    #: it is meant to run on. Found by running the real CLI, not by reading.
+    KEEP_ENV = (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN_FILE",
+        "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+    )
+
+    #: Session plumbing that is deliberately *not* kept. A repair agent should
+    #: get its own session rather than inheriting the identity, socket and
+    #: message bus of whatever launched JARVIS.
+    DROPPED_SESSION_ENV = (
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+        "CLAUDE_SESSION_INGRESS_TOKEN_FILE",
+    )
 
     def __init__(
         self,

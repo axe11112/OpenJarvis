@@ -1,6 +1,6 @@
 # JARVIS Roadmap
 
-**Status:** Phases 1–10, 12 and 14 implemented. Completed tasks are marked ✅; anything unmarked or
+**Status:** Phases 1–10, 12, 14 and 15 implemented. Completed tasks are marked ✅; anything unmarked or
 explicitly deferred is called out as such.
 
 **Partially exercised against real infrastructure.** As of Phase 10, **GitHub is the only
@@ -452,6 +452,51 @@ rather than a Vercel build reached over HTTP.
 
 ---
 
+## Phase 15 — Real-world activation
+
+Stop proving the machinery against doubles and start proving it against the real
+thing, one integration at a time, in the order that makes each step cheap to
+undo.
+
+| ID | Task | Type | Status |
+|---|---|---|---|
+| J15.1 | Real `claude` CLI driving real repairs — `tests/reliability/test_claude_live.py`, `-m live_claude` | `[test]` | ✅ **REAL** |
+| J15.2 | Preserve Claude's OAuth descriptor through environment scrubbing | `[extend]` | ✅ |
+| J15.3 | Non-destructive GitHub write-capability probe (`permissions()` / `can_write()`) | `[extend]` | ✅ |
+| J15.4 | `doctor` reports write access, and only when repair needs it | `[extend]` | ✅ |
+| J15.5 | `status` — integrations, Claude availability, production-safety posture, repairs in flight | `[extend]` | ✅ |
+| J15.6 | `deploy/systemd/jarvis-reliability.service` | `[new]` | ✅ |
+| J15.7 | Emergency stop verified to survive a separate process | `[test]` | ✅ **REAL** |
+| J15.8 | Activation runbook → [`JARVIS_RELIABILITY.md`](JARVIS_RELIABILITY.md) §17 | `[docs]` | ✅ |
+| J15.9 | Real Vercel preview deployment | `[test]` | **blocked — `api.vercel.com` unreachable** |
+| J15.10 | Real Playwright against a real preview URL | `[test]` | **blocked — production host unreachable** |
+| J15.11 | Real Telegram notification | `[test]` | **blocked — `api.telegram.org` unreachable** |
+| J15.12 | Real GitHub pull request on the target application | `[test]` | **not exercised — no write token supplied** |
+
+**Status: the coding agent is now real; the deployment path is not.**
+
+**What changed.** The largest standing gap since Phase 6 is closed. A real
+headless `claude -p` process now repairs a real bug in a real git worktree,
+given a briefing that describes symptoms and never names the file, and JARVIS
+judges the result from git rather than from the agent's account of itself. The
+sharpest test in the file wires verification to a reproduction that *cannot*
+pass: no amount of correct work by a real coding agent produces `RESOLVED`.
+
+**A defect found by running it.** `ClaudeCliAgent.scrubbed_environment()` kept
+only `ANTHROPIC_API_KEY` and `CLAUDE_CODE_OAUTH_TOKEN`. Claude Code on managed
+hosts authenticates through `CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR`, which the
+substring rule stripped — leaving the agent unauthenticated on exactly the
+machines JARVIS is meant to run on. It survived here only because this host has
+a credentials-file fallback. Reading the code would not have found this.
+
+**Network reality, measured rather than assumed.** From the development sandbox,
+`api.github.com` returns 200; `api.vercel.com`, `api.supabase.com`,
+`api.telegram.org` and the production domain all fail to connect. Those four
+tasks are blocked by egress policy, not by missing implementation, and are
+reported as blocked rather than as done.
+
+---
+
 ## Cross-cutting, every phase
 
 - No existing test removed or weakened.
@@ -495,6 +540,8 @@ After Phase 12: **8177 passed, 56 skipped**, same 4 environmental failures — 1
 regressions.
 After Phase 14: **8295 passed, 56 skipped**, same 4 environmental failures — 118 further tests, no
 regressions.
+After Phase 15: **8299 passed, 56 skipped**, same 4 environmental failures. The `live_claude` lane
+adds 14 more that drive the real `claude` CLI; run them with `-m live_claude`.
 
 Running the suite **unmarked** (without `-m "not live and not cloud and not hub"`) adds 20 further
 failures on top of those 4, in `tests/connectors/test_new_connectors_live.py`,

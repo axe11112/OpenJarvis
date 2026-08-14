@@ -392,3 +392,45 @@ class TestPollAndHealth:
         respx_mock.get(f"{API}/repos/{REPO}").mock(return_value=httpx.Response(404))
         health = _source().health()
         assert not health.reachable
+
+
+class TestWriteCapabilityProbe:
+    """§4/§5: answer "may this token write?" without writing anything."""
+
+    def test_reports_write_when_the_token_has_push(self, respx_mock):
+        source = _source()
+        respx_mock.get("https://api.github.com/repos/acme/site").mock(
+            return_value=httpx.Response(
+                200, json={"permissions": {"pull": True, "push": True, "admin": False}}
+            )
+        )
+        assert source.can_write() is True
+        assert source.permissions()["push"] is True
+
+    def test_reports_read_only_when_push_is_absent(self, respx_mock):
+        source = _source()
+        respx_mock.get("https://api.github.com/repos/acme/site").mock(
+            return_value=httpx.Response(
+                200, json={"permissions": {"pull": True, "push": False}}
+            )
+        )
+        assert source.can_write() is False
+
+    def test_a_silent_api_is_not_read_as_permission(self, respx_mock):
+        """No permissions block means "we do not know", never "yes"."""
+        source = _source()
+        respx_mock.get("https://api.github.com/repos/acme/site").mock(
+            return_value=httpx.Response(200, json={"name": "site"})
+        )
+        assert source.permissions() == {}
+        assert source.can_write() is False
+
+    def test_the_probe_issues_no_write_request(self, respx_mock):
+        """A capability probe that creates a branch is not a probe."""
+        source = _source()
+        route = respx_mock.get("https://api.github.com/repos/acme/site").mock(
+            return_value=httpx.Response(200, json={"permissions": {"push": True}})
+        )
+        source.can_write()
+        assert route.called
+        assert all(call.request.method == "GET" for call in respx_mock.calls)

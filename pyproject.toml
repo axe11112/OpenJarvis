@@ -214,6 +214,7 @@ markers = [
     "hub: downloads real datasets from the HuggingFace Hub at runtime; excluded from the default CI lane (run with -m hub)",
     "live_external: requires HERMES_AGENT_PATH and OPENCLAW_PATH; spawns real foreign-framework subprocesses",
     "modal: requires Modal token + network; runs real swebench harness on Modal",
+    "live_claude: drives the REAL `claude` CLI as a repair agent; costs tokens and needs an authenticated CLI. Excluded from the default lane (run with -m live_claude)",
 ]
 
 [tool.ruff]

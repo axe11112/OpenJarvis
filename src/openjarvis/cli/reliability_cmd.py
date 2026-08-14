@@ -381,6 +381,56 @@ def reliability_status() -> None:
     table.add_row("Max repair attempts", str(rc.repair.max_attempts))
     console.print(table)
 
+    # Integration reachability, without contacting anything: configuration and
+    # local availability only. Whether an integration actually *works* is what
+    # `live-diagnostic` answers, and it says so honestly rather than guessing.
+    import shutil as _shutil
+
+    stop_flag = _stop_flag_path(config)
+    availability = Table(title="Integrations", show_header=False, box=None)
+    availability.add_column("key", style="dim")
+    availability.add_column("value")
+
+    def _configured(ok: bool, yes: str = "CONFIGURED", no: str = "NOT CONFIGURED"):
+        return yes if ok else f"[dim]{no}[/]"
+
+    claude_ok = _shutil.which(rc.repair.agent_executable) is not None
+    availability.add_row(
+        "Claude CLI",
+        "AVAILABLE" if claude_ok else "[red]UNAVAILABLE[/]",
+    )
+    availability.add_row("GitHub", _configured(bool(rc.github.repo)))
+    availability.add_row("Vercel", _configured(bool(rc.vercel.project_id)))
+    availability.add_row("Supabase", _configured(bool(rc.supabase.project_ref)))
+    availability.add_row("Website", _configured(bool(rc.site.base_url)))
+    availability.add_row(
+        "Telegram",
+        _configured(rc.notify.enabled, "CONNECTED", "DISCONNECTED"),
+    )
+    availability.add_row(
+        "Emergency stop",
+        "[bold red]ENGAGED[/]" if stop_flag.exists() else "[dim]not engaged[/]",
+    )
+    console.print()
+    console.print(availability)
+
+    # The four questions an operator actually has, answered unambiguously.
+    safety = Table(title="Production safety", show_header=False, box=None)
+    safety.add_column("key", style="dim")
+    safety.add_column("value")
+    safety.add_row("Production deployment", "DISABLED")
+    safety.add_row("Automatic PR merge", "DISABLED")
+    safety.add_row(
+        "Default branch push",
+        "[red]ENABLED[/]" if rc.policy.allow_push_to_default_branch else "DISABLED",
+    )
+    safety.add_row(
+        "Supabase writes",
+        "[red]ENABLED[/]" if rc.supabase.allow_production_writes else "DISABLED",
+    )
+    console.print()
+    console.print(safety)
+
     store = _get_store(config)
     try:
         incidents = store.list(open_only=True, limit=500)
@@ -396,6 +446,21 @@ def reliability_status() -> None:
                 count = by_state.get(state.value)
                 if count:
                     console.print(f"  {_state_text(state.value)}: {count}")
+        in_repair = [
+            i for i in incidents if i.state.value in ("FIXING", "TESTING", "VERIFYING")
+        ]
+        console.print(f"Repairs in flight: {len(in_repair)}")
+        needs_recovery = [i for i in incidents if i.state.value == "RECOVERY_REQUIRED"]
+        if needs_recovery:
+            console.print(
+                "[yellow]"
+                + escape(
+                    f"{len(needs_recovery)} incident(s) need manual recovery: "
+                    + ", ".join(i.id for i in needs_recovery)
+                )
+                + "[/yellow]"
+            )
+
         intact, broken_row = store.verify_chain()
         if not intact:
             console.print(

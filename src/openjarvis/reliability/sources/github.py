@@ -239,6 +239,33 @@ class GitHubSource(BaseSignalSource):
         ]
         return summary
 
+    def permissions(self) -> Dict[str, bool]:
+        """Return what this token may do to the repository.
+
+        Answered by reading the repository object, which reports the
+        authenticated token's effective permissions. Deliberately not answered
+        by attempting a write: a capability probe that creates a branch to find
+        out whether it can create branches is not a probe, it is a write.
+
+        Keys are GitHub's own: ``pull`` (read), ``push`` (write), ``admin``.
+        An empty dict means the API did not say — reported as UNKNOWN upstream,
+        never as "no permission".
+        """
+        raw = self.client.get_json(f"/repos/{self.repo}", default={}) or {}
+        permissions = raw.get("permissions")
+        if not isinstance(permissions, dict):
+            return {}
+        return {k: bool(v) for k, v in permissions.items()}
+
+    def can_write(self) -> bool:
+        """Whether the token could create a branch and open a pull request.
+
+        JARVIS needs this only once automated repair is enabled; every earlier
+        phase is strictly read-only, and the diagnostic reports write access as
+        NOT_CONFIGURED rather than missing when repair is off.
+        """
+        return bool(self.permissions().get("push"))
+
     def list_branches(self, *, limit: int = 50) -> List[str]:
         """Return branch names."""
         raw = self.client.get_json(

@@ -305,6 +305,39 @@ class LiveDiagnostic:
             )
         )
 
+        # Write access is only *needed* once automated repair is enabled. Until
+        # then a read-only token is the correct configuration, and reporting the
+        # absence of write as a problem would be wrong.
+        if not rc.repair.enabled:
+            # Recorded as a fact, not as a capability. Adding it as an
+            # unconfigured capability would drag the whole integration to
+            # DEGRADED for lacking something it is correct not to have — a false
+            # alarm, which is the exact failure mode the health vocabulary
+            # exists to prevent.
+            result.facts["write_access"] = "not required (automated repair is disabled)"
+        else:
+            result.add(
+                _capability(
+                    "write_access",
+                    source.permissions,
+                    describe=lambda p: (
+                        "Contents+Pull requests: Write"
+                        if p.get("push")
+                        else "read-only — a repair could not open a pull request"
+                    ),
+                    remediation=(
+                        f"Grant the token in ${rc.github.token_env} "
+                        "'Contents: Write' and 'Pull requests: Write'. "
+                        "Administration and secrets scopes are NOT required."
+                    ),
+                )
+            )
+            write = result.capabilities["write_access"]
+            if write.state is HealthState.HEALTHY and not (
+                source.permissions().get("push")
+            ):
+                write.state = HealthState.FAILED
+
         result.derive_state()
         result.facts = {
             "repository": self.target.repository,

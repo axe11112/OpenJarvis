@@ -404,20 +404,137 @@ detector, store, git worktrees and project test suite:
   tick
 - the default branch is byte-identical after every scenario
 
-**Not proven.** The same two gaps as Phase 12, unchanged:
+**Proven as of Phase 15**, by `tests/reliability/test_claude_live.py` — run with
+`-m live_claude`, against the **real** `claude` CLI:
 
-- **The coding agent is scripted, not the real `claude` CLI.** `ClaudeCliAgent`
-  is unit-tested but has never driven a live session.
+- a real headless `claude -p` process repairs a real bug in a real worktree and
+  reaches a pull request, given a briefing that describes symptoms only and never
+  names the file;
+- the worktree's branch, HEAD and clean status are verified before it starts;
+- JARVIS reads the resulting diff from git, and records a real commit SHA;
+- verification retains final authority — wired to a reproduction that cannot
+  pass, no amount of correct work by a real agent produces `RESOLVED`;
+- the agent cannot read JARVIS's credentials, and nothing outside the worktree
+  changes.
+
+**Still not proven.** One gap remains, and it is a network gap rather than a
+design gap:
+
 - **The "preview deployment" is the worktree**, not a Vercel build reached over
-  HTTP by a browser.
+  HTTP by a browser. Closing it needs a reachable Vercel API and production host.
 
-Both need network access and an authenticated CLI. Until they are closed, treat
-"JARVIS can repair software autonomously" as demonstrated against a fixture and
-unproven against production.
+Until that is closed, treat "JARVIS repairs code with a real coding agent" as
+demonstrated, and "JARVIS verifies against a real preview deployment" as not.
 
 ---
 
-## 17. Troubleshooting
+## 17. Activation runbook
+
+The order matters. Each step is cheap to undo and proves one thing.
+
+### Step 1 — credentials, contacting nothing
+
+```bash
+jarvis reliability doctor
+```
+
+Reports every credential **by variable name**, never by value:
+`CONFIGURED` · `MISSING` · `INVALID` · `BLOCKED` · `UNKNOWN`.
+
+Least privilege, and nothing more:
+
+| Integration | Grant | Never grant |
+|---|---|---|
+| GitHub (monitoring) | `Contents: Read`, `Pull requests: Read`, `Actions: Read`, `Metadata: Read` | anything write |
+| GitHub (repair only) | additionally `Contents: Write`, `Pull requests: Write` | Administration, secrets, branch protection |
+| Vercel | read-only access token | project settings, env-var writes |
+| Supabase | Management API, read | **the `service_role` key, ever** |
+
+Write access is checked by **reading the repository's reported permissions**, not
+by attempting a write. A capability probe that creates a branch to find out
+whether it can create branches is not a probe.
+
+While repair is disabled, write access is reported as *not required* — a fact,
+not a blind spot, so it does not drag the integration to `DEGRADED`.
+
+### Step 2 — the coding agent, before any real target
+
+```bash
+which claude && claude --version
+uv run pytest -m live_claude
+```
+
+This drives the **real** `claude` CLI against a throwaway repository with a
+deterministic bug. It proves the agent runs, that JARVIS reads the diff from git
+rather than from the agent's account, that the guards fire on unsafe output, and
+that only verification can resolve an incident. No production system is involved.
+
+### Step 3 — read-only against the real target
+
+```bash
+jarvis reliability live-diagnostic
+```
+
+Exit `0` healthy · `1` failed or degraded · `2` incomplete. A run that checked
+nothing never exits `0`.
+
+### Step 4 — one probe
+
+Start with the homepage. Selectors must come from markup you have actually
+looked at — the shipped example specs are detected as placeholders and refused,
+so a probe with invented selectors can never report `PASS`.
+
+### Step 5 — supervised watch
+
+```bash
+jarvis reliability watch --once   # one pass
+jarvis reliability watch          # continuous, repair still off
+```
+
+### Step 6 — arm repair
+
+Only after steps 1–5. See [`JARVIS_REPAIR_LOOP.md`](JARVIS_REPAIR_LOOP.md) §12.
+`watch` refuses to start (exit 2) if repair is combined with any production
+reach.
+
+### Running under systemd
+
+`deploy/systemd/jarvis-reliability.service`:
+
+```bash
+sudo cp deploy/systemd/jarvis-reliability.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now jarvis-reliability
+journalctl -u jarvis-reliability -f
+```
+
+Three deliberate choices in that unit:
+
+- `ExecStartPre` runs `doctor`, so a bad configuration fails at boot rather than
+  at 3am.
+- `Restart=on-abnormal`, not `on-failure`. Exit 2 (unsafe configuration) and
+  exit 3 (emergency stop) are decisions, not crashes; restarting would fight the
+  operator.
+- Nothing resumes an interrupted repair. On restart, incidents left in
+  `FIXING`/`TESTING`/`VERIFYING` go to `RECOVERY_REQUIRED`.
+
+**Not Linux?** Use the platform's own supervisor — `launchd` on macOS (see
+`deploy/launchd/`), or a Windows service wrapper. The three properties above are
+what any of them must preserve; the unit file is not special.
+
+### Emergency stop, verified
+
+```bash
+jarvis reliability stop
+jarvis reliability watch     # exits 3, refuses to start
+```
+
+The stop is a **file**, so it survives a reboot and a `systemctl restart`. That
+is the point: a stop pulled in a panic must not be undone by a host reboot.
+
+---
+
+## 18. Troubleshooting
 
 | Symptom | Meaning | Fix |
 |---|---|---|
