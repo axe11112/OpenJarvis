@@ -1485,14 +1485,59 @@ class ReliabilityGitHubConfig:
 
 @dataclass(slots=True)
 class ReliabilityRepairConfig:
-    """The Claude Code repair loop."""
+    """The Claude Code repair loop.
+
+    Every field that widens what JARVIS may do defaults to the narrow value.
+    ``enabled`` is the master switch and is off; see ``docs/JARVIS_REPAIR_LOOP.md``
+    for the manual enablement procedure.
+    """
 
     enabled: bool = False
     max_attempts: int = 3
-    workspace: str = ""  # checkout JARVIS may modify
-    test_command: str = ""  # the target repo's own test command
+    #: Repository the isolated worktrees are cut from. Read-only: JARVIS creates
+    #: worktrees from it and never commits to it.
+    workspace: str = ""
+    #: Where per-incident worktrees are created. Defaults to
+    #: ``<config-dir>/reliability/worktrees``.
+    worktree_root: str = ""
+    #: Keep a failed repair's worktree so a human can see what the agent did.
+    keep_failed_worktrees: bool = True
+    #: Local gates, run inside the worktree. Empty means "not configured",
+    #: which is reported as not-run rather than as passing.
+    test_command: str = ""
+    lint_command: str = ""
+    typecheck_command: str = ""
+    build_command: str = ""
     test_timeout_seconds: int = 1800
+    #: A repair may not reach a pull request without a preview deployment to
+    #: verify against. Turning this off means trusting local checks alone.
     require_preview_verification: bool = True
+    #: How long to wait for a preview deployment to become READY.
+    preview_wait_seconds: int = 600
+    #: Ask the coding agent to add a regression test reproducing the failure.
+    request_regression_test: bool = True
+    #: The coding agent to drive. "claude_cli" runs the `claude` CLI headlessly.
+    agent: str = "claude_cli"
+    agent_executable: str = "claude"
+    agent_timeout_seconds: int = 1800
+
+    # -- change-scope control (see reliability/scope.py) -------------------
+    #: A diff larger than this fetches a human instead of opening a PR.
+    max_changed_files: int = 20
+    max_changed_lines: int = 800
+
+    # -- what the agent may do --------------------------------------------
+    #: Tools the coding agent is permitted. Constrained by JARVIS, not by the
+    #: agent. Bash is included because a repair must be able to run the
+    #: project's tests; the worktree is the blast radius.
+    agent_allowed_tools: List[str] = field(
+        default_factory=lambda: ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]
+    )
+    #: Refused outright. Network fetch tools are refused so evidence text cannot
+    #: talk the agent into contacting an attacker-controlled URL.
+    agent_disallowed_tools: List[str] = field(
+        default_factory=lambda: ["WebFetch", "WebSearch"]
+    )
 
 
 @dataclass(slots=True)

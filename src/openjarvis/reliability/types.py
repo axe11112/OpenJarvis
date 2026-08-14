@@ -529,6 +529,24 @@ class RepairAttempt:
     outcome: str = ""  # "verified" | "verification_failed" | "no_diff" | ...
     started_at: str = field(default_factory=now_iso)
     finished_at: str = ""
+    #: The commit the isolated worktree was cut from. Recorded before the agent
+    #: runs so the audit log can say exactly what the repair was based on,
+    #: rather than inferring it afterwards from a branch that has since moved.
+    base_commit: str = ""
+    #: The commit the agent's work was recorded as, inside the worktree.
+    commit_sha: str = ""
+    #: Filesystem path of the isolated worktree, for post-mortem inspection.
+    worktree_path: str = ""
+    #: Preview deployment this attempt was verified against.
+    preview_url: str = ""
+    #: Serialized :class:`~openjarvis.reliability.checks.CheckSuiteResult`.
+    checks: Dict[str, Any] = field(default_factory=dict)
+    #: Serialized :class:`~openjarvis.reliability.scope.ScopeVerdict`.
+    scope: Dict[str, Any] = field(default_factory=dict)
+    #: Insertions plus deletions against the base commit, for the scope guard.
+    lines_changed_total: int = 0
+    #: Test files the agent added or modified — the regression-test question.
+    regression_tests: List[str] = field(default_factory=list)
 
     @property
     def produced_changes(self) -> bool:
@@ -557,6 +575,14 @@ class RepairAttempt:
             "outcome": self.outcome,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            "base_commit": self.base_commit,
+            "commit_sha": self.commit_sha,
+            "worktree_path": self.worktree_path,
+            "preview_url": self.preview_url,
+            "checks": dict(self.checks),
+            "scope": dict(self.scope),
+            "lines_changed_total": self.lines_changed_total,
+            "regression_tests": list(self.regression_tests),
         }
 
     @classmethod
@@ -580,6 +606,14 @@ class RepairAttempt:
             outcome=d.get("outcome", ""),
             started_at=d.get("started_at") or now_iso(),
             finished_at=d.get("finished_at", ""),
+            base_commit=d.get("base_commit", ""),
+            commit_sha=d.get("commit_sha", ""),
+            worktree_path=d.get("worktree_path", ""),
+            preview_url=d.get("preview_url", ""),
+            checks=dict(d.get("checks") or {}),
+            scope=dict(d.get("scope") or {}),
+            lines_changed_total=int(d.get("lines_changed_total", 0) or 0),
+            regression_tests=list(d.get("regression_tests") or []),
         )
 
 

@@ -151,6 +151,27 @@ class ClaudeCliAgent(CodeAgent):
     DEFAULT_ALLOWED_TOOLS = ("Read", "Edit", "Write", "Grep", "Glob", "Bash")
     DEFAULT_DISALLOWED_TOOLS = ("WebFetch", "WebSearch")
 
+    #: Environment variables never passed through to the agent.  The repair
+    #: workspace is a checkout of the *target* application; the agent has no
+    #: reason to hold JARVIS's own read tokens, and a subprocess that cannot see
+    #: a credential cannot leak it.  Matched as substrings, case-insensitively.
+    STRIPPED_ENV_PARTS = (
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "API_KEY",
+        "APIKEY",
+        "CREDENTIAL",
+        "PRIVATE_KEY",
+        "SUPABASE",
+        "VERCEL",
+        "TELEGRAM",
+    )
+
+    #: Kept even though it matches the list above: without it the CLI cannot
+    #: authenticate, and the whole agent is inert.
+    KEEP_ENV = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+
     def __init__(
         self,
         *,
@@ -159,6 +180,7 @@ class ClaudeCliAgent(CodeAgent):
         disallowed_tools: Optional[Sequence[str]] = None,
         extra_args: Optional[Sequence[str]] = None,
         runner: Optional[Callable[..., Any]] = None,
+        strip_environment: bool = True,
     ) -> None:
         self._executable = executable
         self._allowed = list(
@@ -171,6 +193,25 @@ class ClaudeCliAgent(CodeAgent):
         )
         self._extra_args = list(extra_args or [])
         self._runner = runner or subprocess.run
+        self._strip_environment = strip_environment
+
+    @classmethod
+    def scrubbed_environment(cls, source: Optional[dict] = None) -> dict:
+        """Return *source* without JARVIS's own credentials.
+
+        The agent inherits PATH, HOME and everything the target project needs to
+        build, but not the tokens JARVIS uses to read GitHub, Vercel or Supabase.
+        """
+        import os
+
+        env = dict(os.environ if source is None else source)
+        for name in list(env):
+            if name in cls.KEEP_ENV:
+                continue
+            upper = name.upper()
+            if any(part in upper for part in cls.STRIPPED_ENV_PARTS):
+                env.pop(name, None)
+        return env
 
     def available(self) -> bool:
         """Whether the CLI can be found on PATH."""
@@ -193,6 +234,8 @@ class ClaudeCliAgent(CodeAgent):
             command += ["--disallowedTools", ",".join(self._disallowed)]
         command += self._extra_args
 
+        # The task text is passed as an argv element, never through a shell, so
+        # evidence content cannot become a command however it is punctuated.
         try:
             proc = self._runner(
                 command,
@@ -201,6 +244,7 @@ class ClaudeCliAgent(CodeAgent):
                 text=True,
                 timeout=timeout,
                 check=False,
+                env=(self.scrubbed_environment() if self._strip_environment else None),
             )
         except subprocess.TimeoutExpired:
             return CodeAgentResult(

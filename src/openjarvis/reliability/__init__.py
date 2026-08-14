@@ -16,6 +16,7 @@ from openjarvis.reliability.briefing import (
     BriefingRefusedError,
     build_briefing,
 )
+from openjarvis.reliability.checks import CheckSuite, CheckSuiteResult
 from openjarvis.reliability.code_agent import CodeAgent, CodeAgentResult
 from openjarvis.reliability.correlate import correlate
 from openjarvis.reliability.detector import Detection, Detector
@@ -26,6 +27,7 @@ from openjarvis.reliability.monitor import ReliabilityMonitor
 from openjarvis.reliability.notify import NotificationRouter, Notifier
 from openjarvis.reliability.policy import Decision, SafetyPolicy
 from openjarvis.reliability.repair import RepairLoop, RepairOutcome
+from openjarvis.reliability.scope import ScopeLimits, ScopeVerdict, assess_scope
 from openjarvis.reliability.store import IncidentStore
 from openjarvis.reliability.target import (
     TargetConfig,
@@ -49,8 +51,17 @@ from openjarvis.reliability.types import (
     VerificationResult,
 )
 from openjarvis.reliability.verify import Verifier
+from openjarvis.reliability.workspace import RepairWorkspace, WorkspaceError, Worktree
 
 __all__ = [
+    "assess_scope",
+    "Worktree",
+    "WorkspaceError",
+    "ScopeVerdict",
+    "ScopeLimits",
+    "RepairWorkspace",
+    "CheckSuiteResult",
+    "CheckSuite",
     "Briefing",
     "BriefingRefusedError",
     "CodeAgent",

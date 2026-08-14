@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -50,6 +51,48 @@ class ProtectedPathError(RuntimeError):
     """Raised when a change touches a path repairs may never modify."""
 
 
+def normalize_path(path: str) -> str:
+    """Reduce *path* to the form the guard matches against.
+
+    Separators are unified, ``.`` and ``..`` segments are resolved, and the
+    result is lower-cased. Resolution is textual rather than filesystem-based on
+    purpose: the guard must give the same answer for a path that does not exist
+    yet (a file the agent is about to create) as for one that does, and it must
+    not be steerable by a symlink planted in the worktree.
+
+    A path that climbs above the repository root keeps its leading ``../``
+    segments, so callers can reject it outright rather than having it silently
+    collapse into a harmless-looking relative path.
+    """
+    unified = path.replace("\\", "/")
+    segments: List[str] = []
+    escaped = 0
+    for segment in unified.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if segments:
+                segments.pop()
+            else:
+                escaped += 1
+            continue
+        segments.append(segment)
+    prefix = "../" * escaped
+    return (prefix + "/".join(segments)).lower()
+
+
+def escapes_repository(path: str) -> bool:
+    """Whether *path* points outside the repository root.
+
+    An absolute path or one that climbs past the root is never a legitimate
+    target for a repair, whatever it names.
+    """
+    unified = path.replace("\\", "/")
+    if unified.startswith("/") or re.match(r"^[a-zA-Z]:/", unified):
+        return True
+    return normalize_path(path).startswith("../")
+
+
 def matches_path_pattern(path: str, pattern: str) -> bool:
     """Match *path* against a glob *pattern*, generously.
 
@@ -58,7 +101,7 @@ def matches_path_pattern(path: str, pattern: str) -> bool:
     guard that under-matches is a security hole, while one that over-matches
     merely sends a human a pull request.
 
-    Two fnmatch sharp edges are handled explicitly:
+    Three fnmatch sharp edges are handled explicitly:
 
     * ``lstrip("./")`` would strip leading ``.`` and ``/`` *characters*, turning
       ``.github/workflows/ci.yml`` into ``github/workflows/ci.yml``; use
@@ -66,9 +109,12 @@ def matches_path_pattern(path: str, pattern: str) -> bool:
     * ``**/middleware.*`` does not match a bare ``middleware.ts`` at the
       repository root, because fnmatch wants the literal separator. Patterns are
       therefore also tried without the ``**/`` prefix and against the basename.
+    * ``a/../.github/workflows/ci.yml`` and ``.github\\workflows\\ci.yml`` name a
+      protected file without matching the pattern textually, so the path is
+      normalized before any comparison.
     """
-    normalized = path.removeprefix("./").lower()
-    lowered = pattern.lower()
+    normalized = normalize_path(path)
+    lowered = pattern.replace("\\", "/").lower()
     basename = normalized.rsplit("/", 1)[-1]
     bare = lowered.removeprefix("**/")
     candidates = (
@@ -86,7 +132,14 @@ def matches_path_pattern(path: str, pattern: str) -> bool:
 
 
 def is_protected_path(path: str, extra_patterns: Optional[List[str]] = None) -> bool:
-    """Return ``True`` when *path* must never be modified by an automated repair."""
+    """Return ``True`` when *path* must never be modified by an automated repair.
+
+    A path that leaves the repository is protected unconditionally: there is no
+    pattern list under which writing to ``/etc/passwd`` or ``../../.ssh/config``
+    is a legitimate repair.
+    """
+    if escapes_repository(path):
+        return True
     candidates = list(ALWAYS_PROTECTED_PATHS) + list(extra_patterns or [])
     return any(matches_path_pattern(path, pattern) for pattern in candidates)
 

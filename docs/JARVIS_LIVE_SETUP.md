@@ -313,8 +313,25 @@ Do not set `[reliability.repair] enabled = true` until:
 - [ ] `jarvis reliability analyze <id>` has produced a diagnosis you judge to be
       accurate on a real incident
 - [ ] `[reliability.repair] workspace` points at a checkout of the target
-- [ ] `test_command` runs the target's own suite
+- [ ] `test_command` runs the target's own suite, and it is **green at HEAD**
 - [ ] `deploy_mode` is `pr_only` and `allow_push_to_default_branch` is `false`
 
-The repair loop is implemented and tested but has never been run against a live
-Claude Code session. Enabling it is a separate, deliberate decision.
+The repair loop is implemented and proven end to end against a controlled
+fixture, but has never driven a live Claude Code session or verified against a
+real Vercel preview. Enabling it is a separate, deliberate decision — the full
+procedure, and what remains unproven, is in
+[`JARVIS_REPAIR_LOOP.md`](JARVIS_REPAIR_LOOP.md).
+
+### What the repair loop additionally needs
+
+| Thing | Why | Where |
+|---|---|---|
+| A checkout of the target | Isolated worktrees are cut from it; never committed to | `[reliability.repair] workspace` |
+| A push remote on that checkout | The incident branch must reach GitHub for a preview build | the checkout's `origin` |
+| GitHub token with **write** access | Creating branches and pull requests — the only phase that needs it | `GITHUB_READONLY_TOKEN` must be replaced by a token with `Contents: Write` and `Pull requests: Write` |
+| The `claude` CLI, authenticated | The coding agent | `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` |
+| The target's own commands | Local gates before anything is pushed | `test_command`, `lint_command`, `typecheck_command`, `build_command` |
+| Disk for worktrees | One directory per incident; failures are kept for inspection | `worktree_root` |
+
+Grant the GitHub write scopes **only** when you enable repair, and no earlier.
+Every phase before this one is strictly read-only.

@@ -42,6 +42,33 @@ class TestSafeDefaults:
     def test_preview_verification_required_by_default(self):
         assert ReliabilityConfig().repair.require_preview_verification is True
 
+    def test_repair_loop_defaults_are_the_narrow_ones(self):
+        """§26/§27: nothing that widens JARVIS's reach may default to true."""
+        repair = ReliabilityConfig().repair
+        assert repair.enabled is False
+        assert repair.workspace == ""
+        assert repair.worktree_root == ""
+        # Local gates are unset, which is reported as not-run rather than passed.
+        assert repair.test_command == ""
+        assert repair.lint_command == ""
+        assert repair.typecheck_command == ""
+        assert repair.build_command == ""
+
+    def test_scope_limits_have_a_ceiling(self):
+        repair = ReliabilityConfig().repair
+        assert repair.max_changed_files > 0
+        assert repair.max_changed_lines > 0
+
+    def test_the_agent_may_not_reach_the_network(self):
+        """Evidence text must not be able to send the agent to a chosen URL."""
+        repair = ReliabilityConfig().repair
+        assert "WebFetch" in repair.agent_disallowed_tools
+        assert "WebSearch" in repair.agent_disallowed_tools
+        assert "WebFetch" not in repair.agent_allowed_tools
+
+    def test_failed_worktrees_are_kept_for_inspection(self):
+        assert ReliabilityConfig().repair.keep_failed_worktrees is True
+
     def test_protected_paths_cover_ci_and_auth(self):
         paths = ReliabilityConfig().policy.protected_paths
         assert any(".github/workflows" in p for p in paths)

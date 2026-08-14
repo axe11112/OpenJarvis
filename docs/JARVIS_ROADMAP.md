@@ -1,6 +1,6 @@
 # JARVIS Roadmap
 
-**Status:** Phases 1–10 implemented. Completed tasks are marked ✅; anything unmarked or
+**Status:** Phases 1–10 and 12 implemented. Completed tasks are marked ✅; anything unmarked or
 explicitly deferred is called out as such.
 
 **Partially exercised against real infrastructure.** As of Phase 10, **GitHub is the only
@@ -336,6 +336,66 @@ production system working, and only a real run distinguishes them.
 
 ---
 
+## Phase 12 — Safe live repair
+
+Give the coding agent a real, isolated place to work; prove the loop end to end
+against a controlled fixture; keep production locked down throughout.
+
+| ID | Task | Type | Status |
+|---|---|---|---|
+| J12.1 | `workspace.py` — a git worktree per incident, cut from a recorded base commit; the operator's checkout is never modified | `[new]` | ✅ |
+| J12.2 | `scope.py` — blast-radius control: credential files, infrastructure, declarative security config, runaway diffs → `HUMAN_REQUIRED` | `[new]` | ✅ |
+| J12.3 | `checks.py` — lint, typecheck, tests and build inside the worktree; unconfigured is reported as not-run, never as passed | `[new]` | ✅ |
+| J12.4 | Path guard hardened against `..`, `//`, `./`, Windows separators and absolute paths | `[extend]` | ✅ |
+| J12.5 | Repair loop rewired: worktree → scope → checks → commit → push → preview → verify → PR | `[extend]` | ✅ |
+| J12.6 | Preview build logs fed back to the agent when no preview appears | `[extend]` | ✅ |
+| J12.7 | Agent output redacted before it is persisted, rendered into a PR, or notified | `[extend]` | ✅ |
+| J12.8 | Agent subprocess environment scrubbed of JARVIS's own credentials | `[extend]` | ✅ |
+| J12.9 | Regression-test detection, surfaced in the pull-request body | `[extend]` | ✅ |
+| J12.10 | Notifications at detection, repair start, escalation and resolution | `[extend]` | ✅ |
+| J12.11 | Controlled broken-fixture repository and end-to-end repair tests | `[test]` | ✅ |
+| J12.12 | Negative tests: false success, protected paths, runaway diffs, secrets, default-branch pushes, GitHub unavailable | `[test]` | ✅ |
+| J12.13 | [`JARVIS_REPAIR_LOOP.md`](JARVIS_REPAIR_LOOP.md) | `[docs]` | ✅ |
+| J12.14 | Drive the loop with the real `claude` CLI against a real preview deployment | `[test]` | **not done — needs live infrastructure** |
+
+**Status: complete as implementation; the live rehearsal remains.**
+
+**What the fixture proves.** `tests/reliability/test_repair_e2e.py` drives real
+git worktrees, a real `pytest` suite inside the worktree, and a reproduction that
+executes the repaired code. It establishes that a correct fix reaches a pull
+request; that a *plausible but wrong* fix — one which passes the project's own
+test suite — is caught by verification, retried three times and escalated to
+`HUMAN_REQUIRED`; and that in every path the operator's checkout and the default
+branch are byte-for-byte unchanged.
+
+**What it does not prove.** The agent is scripted rather than the real `claude`
+CLI, and the "preview deployment" is the worktree rather than a Vercel build
+reached over HTTP. Both gaps need network access and an authenticated CLI to
+close.
+
+**Two defects were found by writing the tests rather than by reasoning:**
+
+1. The protected-path guard could be bypassed by spelling a path differently —
+   `a/../.github/workflows/ci.yml` and `.github\workflows\ci.yml` both named a
+   protected file without matching the pattern. Paths are now normalized before
+   any comparison, and anything escaping the repository root is protected
+   unconditionally.
+2. The coding agent's summary was persisted, rendered into the pull-request body
+   and sent to the owner **unredacted** — and it is model output written after
+   reading the application's source. It now passes the same redaction as inbound
+   evidence.
+
+**One deliberate deviation from the brief.** §8 asks for security-configuration
+changes to stop the repair. Taken literally — blocking every path containing
+"auth" — JARVIS could never repair a login failure, which is the reference
+incident for this whole project. The category is therefore split: declarative
+security controls (RLS, middleware, migrations, `.sql`) stop the loop, while
+application authentication code is flagged prominently in the pull request and
+remains barred from automatic deployment. This is called out in
+`JARVIS_REPAIR_LOOP.md` §6.
+
+---
+
 ## Cross-cutting, every phase
 
 - No existing test removed or weakened.
@@ -374,6 +434,8 @@ After Phase 1: **7465 passed** (+142 tests).
 After Phase 9: **7929 passed, 56 skipped**, same 4 environmental failures — 606 net new tests, no
 regressions. The `browser` lane adds 12 more, run separately with `-m browser`.
 After Phase 10: **8031 passed, 56 skipped**, same 4 environmental failures — 708 net new tests, no
+regressions.
+After Phase 12: **8177 passed, 56 skipped**, same 4 environmental failures — 146 further tests, no
 regressions.
 
 Running the suite **unmarked** (without `-m "not live and not cloud and not hub"`) adds 20 further

@@ -208,14 +208,24 @@ def _build_repair_loop(config: Any, store: Any, sources: list) -> Any:
     if not rc.repair.enabled:
         return None
 
+    from openjarvis.reliability.checks import CheckSuite
     from openjarvis.reliability.code_agent import ClaudeCliAgent
     from openjarvis.reliability.repair import RepairLoop
+    from openjarvis.reliability.scope import ScopeLimits
     from openjarvis.reliability.sources.github import GitHubSource
     from openjarvis.reliability.sources.vercel import VercelSource
     from openjarvis.reliability.verify import Verifier
+    from openjarvis.reliability.workspace import RepairWorkspace
 
     github = next((s for s in sources if isinstance(s, GitHubSource)), None)
     vercel = next((s for s in sources if isinstance(s, VercelSource)), None)
+
+    if not rc.repair.workspace:
+        raise click.ClickException(
+            "[reliability.repair] enabled = true but workspace is unset. "
+            "Point it at a checkout of the target repository; JARVIS cuts an "
+            "isolated worktree from it for every repair and never commits to it."
+        )
 
     def _preview(branch: str) -> str:
         if vercel is None:
@@ -223,17 +233,63 @@ def _build_repair_loop(config: Any, store: Any, sources: list) -> Any:
         found = vercel.find_preview_deployment(branch)
         return found["url"] if found else ""
 
+    def _preview_build_logs(branch: str) -> str:
+        """Why the preview never appeared — fed back to the coding agent."""
+        if vercel is None:
+            return ""
+        for deployment in vercel.list_deployments(limit=20, target="preview"):
+            if deployment.get("branch") == branch:
+                return vercel.get_build_logs(deployment.get("id", ""))
+        return ""
+
     return RepairLoop(
-        agent=ClaudeCliAgent(),
+        agent=ClaudeCliAgent(
+            executable=rc.repair.agent_executable,
+            allowed_tools=list(rc.repair.agent_allowed_tools),
+            disallowed_tools=list(rc.repair.agent_disallowed_tools),
+        ),
         policy=_build_policy(config),
         verifier=Verifier(evidence_dir=_evidence_dir(config)),
         store=store,
         workspace=rc.repair.workspace,
+        workspace_manager=RepairWorkspace(
+            repo_path=rc.repair.workspace,
+            root=_worktree_root(config),
+            branch_prefix=rc.github.branch_prefix,
+            keep_on_failure=rc.repair.keep_failed_worktrees,
+        ),
         test_command=rc.repair.test_command,
+        checks=CheckSuite.from_config(
+            test_command=rc.repair.test_command,
+            lint_command=rc.repair.lint_command,
+            typecheck_command=rc.repair.typecheck_command,
+            build_command=rc.repair.build_command,
+            timeout=rc.repair.test_timeout_seconds,
+        ),
+        scope_limits=ScopeLimits(
+            max_files=rc.repair.max_changed_files,
+            max_lines_changed=rc.repair.max_changed_lines,
+        ),
         github=github,
+        base_branch=rc.github.base_branch,
         preview_lookup=_preview if vercel is not None else None,
+        preview_logs=_preview_build_logs if vercel is not None else None,
+        preview_wait_seconds=rc.repair.preview_wait_seconds,
         protected_paths=list(rc.policy.protected_paths),
+        notifier=_build_notifier(config),
     )
+
+
+def _worktree_root(config: Any) -> str:
+    """Where isolated repair worktrees are created."""
+    from pathlib import Path
+
+    from openjarvis.core.config import get_config_dir
+
+    configured = config.reliability.repair.worktree_root
+    if configured:
+        return str(Path(configured).expanduser())
+    return str(get_config_dir() / "reliability" / "worktrees")
 
 
 def _severity_text(value: str) -> str:

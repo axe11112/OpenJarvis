@@ -40,6 +40,7 @@ __all__ = [
     "BriefingRefusedError",
     "build_briefing",
     "fence",
+    "redact_secrets",
     "scan_for_injection",
 ]
 
@@ -221,6 +222,19 @@ def _redact(text: str) -> str:
         return f"{name}{match.group('sep')}[REDACTED]"
 
     return _ASSIGNMENT_RE.sub(_replace, stripped)
+
+
+def redact_secrets(text: str) -> str:
+    """Strip credentials from *text*.
+
+    Public entry point to the same redaction the briefing applies on the way in.
+    Used on the way *out* as well: the coding agent's own summary is written by
+    a model that has just read the application's source and run its test suite,
+    so it can repeat a credential it saw. That summary is persisted in the
+    incident record, rendered into the pull-request body, and included in owner
+    notifications — three places a secret must not reach.
+    """
+    return _redact(text)
 
 
 def _has_critical_secret(text: str) -> bool:
