@@ -10,7 +10,16 @@ See ``docs/JARVIS_ARCHITECTURE.md``, ``docs/JARVIS_ROADMAP.md`` and
 
 from __future__ import annotations
 
+from openjarvis.reliability.briefing import (
+    Briefing,
+    BriefingRefusedError,
+    build_briefing,
+)
+from openjarvis.reliability.code_agent import CodeAgent, CodeAgentResult
+from openjarvis.reliability.correlate import correlate
 from openjarvis.reliability.fingerprint import fingerprint, normalize_error
+from openjarvis.reliability.policy import Decision, SafetyPolicy
+from openjarvis.reliability.repair import RepairLoop, RepairOutcome
 from openjarvis.reliability.store import IncidentStore
 from openjarvis.reliability.types import (
     Correlation,
@@ -28,9 +37,15 @@ from openjarvis.reliability.types import (
     TrustLevel,
     VerificationResult,
 )
+from openjarvis.reliability.verify import Verifier
 
 __all__ = [
+    "Briefing",
+    "BriefingRefusedError",
+    "CodeAgent",
+    "CodeAgentResult",
     "Correlation",
+    "Decision",
     "Evidence",
     "EvidenceKind",
     "Incident",
@@ -40,11 +55,17 @@ __all__ = [
     "InvalidTransitionError",
     "ProbeResult",
     "RepairAttempt",
+    "RepairLoop",
+    "RepairOutcome",
     "Resolution",
+    "SafetyPolicy",
     "Severity",
     "Signal",
     "TrustLevel",
     "VerificationResult",
+    "Verifier",
+    "build_briefing",
+    "correlate",
     "fingerprint",
     "normalize_error",
 ]

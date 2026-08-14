@@ -212,6 +212,43 @@ class InvalidTransitionError(ValueError):
     """Raised when an incident is moved between states illegally."""
 
 
+def path_between(
+    start: "IncidentState", target: "IncidentState"
+) -> List["IncidentState"]:
+    """Return the shortest legal sequence of states from *start* to *target*.
+
+    The list excludes *start* and includes *target*; an empty list means they
+    are the same state.
+
+    Callers that need to reach a state several steps away (the repair loop moves
+    a freshly-DETECTED incident to FIXING) use this to walk the machine properly
+    instead of jumping, which keeps the transition log a truthful account of
+    what happened.
+
+    Raises
+    ------
+    InvalidTransitionError
+        When no legal path exists.
+    """
+    if start is target:
+        return []
+    # Breadth-first search: the state graph is tiny, so this is instant and
+    # always yields the shortest legal route.
+    queue: List[tuple[IncidentState, List[IncidentState]]] = [(start, [])]
+    seen = {start}
+    while queue:
+        current, route = queue.pop(0)
+        for nxt in sorted(LEGAL_TRANSITIONS.get(current, frozenset()), key=str):
+            if nxt in seen:
+                continue
+            extended = [*route, nxt]
+            if nxt is target:
+                return extended
+            seen.add(nxt)
+            queue.append((nxt, extended))
+    raise InvalidTransitionError(f"no legal path from {start.value} to {target.value}")
+
+
 #: The single automatic predecessor of ``RESOLVED``.  Guarded by a test: no
 #: autonomous path may reach ``RESOLVED`` except through ``VERIFYING``.
 AUTOMATIC_RESOLVE_PREDECESSOR = IncidentState.VERIFYING

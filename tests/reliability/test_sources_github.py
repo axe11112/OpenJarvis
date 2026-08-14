@@ -55,6 +55,15 @@ class TestProtectedPaths:
         assert not is_protected_path("app/auth/callback.ts")
         assert not is_protected_path("README.md")
 
+    def test_root_level_file_matches_a_globbed_pattern(self):
+        """`**/middleware.*` must also catch a bare `middleware.ts` at the
+        repository root -- fnmatch alone wants the literal separator."""
+        assert is_protected_path("middleware.ts", ["**/middleware.*"])
+        assert is_protected_path("app/middleware.ts", ["**/middleware.*"])
+
+    def test_bare_pattern_matches_nested_file(self):
+        assert is_protected_path("app/lib/rls_helpers.ts", ["*rls*"])
+
     def test_extra_patterns_apply(self):
         assert is_protected_path("app/auth/session.ts", ["**/auth/**"])
         assert is_protected_path("supabase/rls_policies.sql", ["*rls*"])

@@ -50,25 +50,45 @@ class ProtectedPathError(RuntimeError):
     """Raised when a change touches a path repairs may never modify."""
 
 
-def is_protected_path(path: str, extra_patterns: Optional[List[str]] = None) -> bool:
-    """Return ``True`` when *path* must never be modified by an automated repair.
+def matches_path_pattern(path: str, pattern: str) -> bool:
+    """Match *path* against a glob *pattern*, generously.
 
-    Note the prefix strip uses ``removeprefix``, not ``lstrip``: ``lstrip("./")``
-    removes leading ``.`` and ``/`` *characters*, which would turn
-    ``.github/workflows/ci.yml`` into ``github/workflows/ci.yml`` and let every
-    CI-configuration edit through this guard.
+    Shared by the protected-path guard and the policy's security-sensitive
+    check so the two cannot drift apart.  "Generously" is deliberate: a path
+    guard that under-matches is a security hole, while one that over-matches
+    merely sends a human a pull request.
+
+    Two fnmatch sharp edges are handled explicitly:
+
+    * ``lstrip("./")`` would strip leading ``.`` and ``/`` *characters*, turning
+      ``.github/workflows/ci.yml`` into ``github/workflows/ci.yml``; use
+      ``removeprefix``.
+    * ``**/middleware.*`` does not match a bare ``middleware.ts`` at the
+      repository root, because fnmatch wants the literal separator. Patterns are
+      therefore also tried without the ``**/`` prefix and against the basename.
     """
+    normalized = path.removeprefix("./").lower()
+    lowered = pattern.lower()
+    basename = normalized.rsplit("/", 1)[-1]
+    bare = lowered.removeprefix("**/")
+    candidates = (
+        lowered,
+        bare,
+        lowered.rstrip("/") + "/*",
+        bare.rstrip("/") + "/*",
+    )
+    if any(fnmatch.fnmatch(normalized, candidate) for candidate in candidates):
+        return True
+    if fnmatch.fnmatch(basename, bare):
+        return True
+    # Bare-directory patterns like ".github/workflows/"
+    return lowered.endswith("/") and normalized.startswith(lowered)
+
+
+def is_protected_path(path: str, extra_patterns: Optional[List[str]] = None) -> bool:
+    """Return ``True`` when *path* must never be modified by an automated repair."""
     candidates = list(ALWAYS_PROTECTED_PATHS) + list(extra_patterns or [])
-    normalized = path.removeprefix("./")
-    for pattern in candidates:
-        if fnmatch.fnmatch(normalized, pattern) or fnmatch.fnmatch(
-            normalized, pattern.rstrip("/") + "/*"
-        ):
-            return True
-        # Bare-directory patterns like ".github/workflows/"
-        if pattern.endswith("/") and normalized.startswith(pattern):
-            return True
-    return False
+    return any(matches_path_pattern(path, pattern) for pattern in candidates)
 
 
 class GitHubSource(BaseSignalSource):
