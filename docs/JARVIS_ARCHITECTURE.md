@@ -1,6 +1,9 @@
 # JARVIS Architecture
 
-**Status:** Design document — Phase 1 (Foundation). No JARVIS code has been implemented yet.
+**Status:** Phase 1 (Foundation) implemented — incident model, state machine, fingerprinting,
+persistence with a tamper-evident history, the `[reliability]` config section and the
+`jarvis reliability` CLI. Phases 2–9 are still design only. See
+[`JARVIS_ROADMAP.md`](JARVIS_ROADMAP.md) for exactly what exists.
 **Scope:** How an autonomous website-reliability engineer ("JARVIS") is built *on top of*
 OpenJarvis, reusing the existing primitives rather than forking or replacing them.
 
@@ -393,7 +396,7 @@ of success is recorded as an assertion, never as evidence.
 | Repair safety | `LoopGuard`, `agents/errors.py` retry classification | — | `RepairLoop` attempt cap |
 | Secrets | `core/credentials.py`, `cli/vault_cmd.py`, `CredentialStripper`, `SecretScanner` | add JARVIS env-var names to `TOOL_CREDENTIALS` | — |
 | Injection defense | `InjectionScanner`, `taint.py`, `wrap_tool_output()` | — | `<untrusted_external_data>` fencing in `briefing.py` |
-| Audit | `AuditLogger` (Merkle chain) | — | incident transition mirroring |
+| Audit | `AuditLogger`'s Merkle-chain *approach* | — | self-chained transition log (see §2.11) |
 | Permissions | `CapabilityPolicy`, `Capability` | new capability labels for infra reads/writes | — |
 | Network safety | `ssrf.py`, `rate_limiter.py` | — | per-source circuit breaker |
 | Browser | `playwright` extra | — | `BrowserProbe` (see §2.9 — the existing tools are unsuitable) |
@@ -419,7 +422,28 @@ The existing browser tools are built for *interactive agent* use, not for reliab
 existing tools remain untouched for agent use. The `playwright` dependency and the `BrowserConfig`
 section (`headless`, `timeout_ms`, viewport) are shared.
 
-### 2.10 Configuration sketch
+### 2.10 Why the transition log is self-chained rather than mirrored to `AuditLogger`
+
+The original plan (roadmap J1.9) was to mirror every incident transition into
+`security/audit.py`'s `AuditLogger`. Implementation showed that to be the wrong shape:
+
+- `AuditLogger.log()` takes a `SecurityEvent`, whose fields are `findings: List[ScanFinding]`,
+  `content_preview` and `action_taken` — a scan-result record, not a state-change record.
+- Its `SecurityEventType` enum has exactly four members (`secret_detected`, `pii_detected`,
+  `sensitive_file_blocked`, `tool_blocked`). Recording incident transitions would mean adding
+  reliability concepts to a deliberately narrow security taxonomy, in a module JARVIS is otherwise
+  careful not to modify.
+
+So `incident_transitions` carries its own `row_hash`/`prev_hash` chain using the same construction
+`AuditLogger` uses, verified by `IncidentStore.verify_chain()` and surfaced as
+`jarvis reliability verify-audit`. The guarantee is identical — an edited or deleted transition is
+detectable — without widening a security enum. Deleting an incident deliberately does **not** delete
+its transition history: the audit trail outlives the record it describes.
+
+`AuditLogger` is still the right home for *security* events JARVIS generates (capability denials,
+secret-scanner findings on outbound briefings); those go through it unchanged in Phase 6.
+
+### 2.11 Configuration sketch
 
 ```toml
 [reliability]

@@ -1,7 +1,9 @@
 # JARVIS Security Model
 
-**Status:** Design document. None of the controls below are implemented yet — this defines what must
-be true before JARVIS is pointed at production infrastructure.
+**Status:** Mostly design. This defines what must be true before JARVIS is pointed at production
+infrastructure. Implemented in Phase 1: the safe-by-default configuration surface (§3.1, §8),
+structural exclusion of credentials from `Evidence` and `ProbeResult` (§3.2 layer 1), and the
+tamper-evident incident history (§10). Everything else is still to build.
 
 Companion documents: [`JARVIS_ARCHITECTURE.md`](JARVIS_ARCHITECTURE.md) ·
 [`JARVIS_ROADMAP.md`](JARVIS_ROADMAP.md)
@@ -288,8 +290,12 @@ approach, escalate its own permissions, or try a "bigger" fix.
 
 ## 10. Audit trail
 
-Every autonomous action is written to the existing `AuditLogger` (`security/audit.py`) — append-only
-SQLite with a Merkle hash chain, so tampering is detectable.
+Incident state changes are written to an append-only, hash-chained `incident_transitions` table —
+detectably tamper-evident, verified by `IncidentStore.verify_chain()` and surfaced as
+`jarvis reliability verify-audit`. Deleting an incident does not delete its history. The rationale for
+chaining this table rather than mirroring into `security/audit.py`'s `AuditLogger` is in
+`JARVIS_ARCHITECTURE.md` §2.10; security-specific events JARVIS generates (capability denials,
+secret-scanner findings on outbound briefings) still go to `AuditLogger` unchanged.
 
 Recorded for every incident: creation and fingerprint; every state transition with actor and reason;
 every capability check and denial; every external API call (method, host, path, status — never bodies);

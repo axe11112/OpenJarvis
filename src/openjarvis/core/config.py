@@ -1416,6 +1416,136 @@ class WorkflowConfig:
     default_node_timeout: int = 300
 
 
+# ---------------------------------------------------------------------------
+# Reliability (JARVIS) — see docs/JARVIS_ARCHITECTURE.md
+#
+# Every field that names a credential holds the *name of an environment
+# variable*, never the value: no token ever enters config.toml.  Every
+# dangerous capability defaults to off.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class ReliabilitySiteConfig:
+    """The web application under observation."""
+
+    base_url: str = ""
+    environment: str = "production"
+
+
+@dataclass(slots=True)
+class ReliabilityProbesConfig:
+    """Where probe specs live and how often they run."""
+
+    directory: str = ""  # defaults to <config-dir>/reliability/probes
+    default_interval_seconds: int = 300
+    confirm_runs: int = 2  # N-of-M confirmation before an incident opens
+    evidence_dir: str = ""  # defaults to <config-dir>/reliability/evidence
+    evidence_retention_days: int = 30
+    trace_on_failure: bool = True
+
+
+@dataclass(slots=True)
+class ReliabilityVercelConfig:
+    """Vercel monitoring — read-only."""
+
+    enabled: bool = False
+    team_id: str = ""
+    project_id: str = ""
+    token_env: str = "VERCEL_READONLY_TOKEN"
+    poll_interval_seconds: int = 120
+
+
+@dataclass(slots=True)
+class ReliabilitySupabaseConfig:
+    """Supabase monitoring — read-only unless explicitly unlocked."""
+
+    enabled: bool = False
+    project_ref: str = ""
+    token_env: str = "SUPABASE_READONLY_TOKEN"
+    poll_interval_seconds: int = 300
+    allow_production_writes: bool = False  # hard gate; see JARVIS_SECURITY.md §5
+
+
+@dataclass(slots=True)
+class ReliabilityGitHubConfig:
+    """GitHub integration for correlation and, later, repair branches."""
+
+    enabled: bool = False
+    repo: str = ""  # "owner/name"
+    token_env: str = "GITHUB_READONLY_TOKEN"
+    base_branch: str = "main"
+    branch_prefix: str = "jarvis/incident-"
+    poll_interval_seconds: int = 300
+
+
+@dataclass(slots=True)
+class ReliabilityRepairConfig:
+    """The Claude Code repair loop."""
+
+    enabled: bool = False
+    max_attempts: int = 3
+    workspace: str = ""  # checkout JARVIS may modify
+    test_command: str = ""  # the target repo's own test command
+    test_timeout_seconds: int = 1800
+    require_preview_verification: bool = True
+
+
+@dataclass(slots=True)
+class ReliabilityPolicyConfig:
+    """What JARVIS is permitted to do without a human."""
+
+    deploy_mode: str = "pr_only"  # "pr_only" | "auto_deploy_allowlisted" | "never"
+    allow_push_to_default_branch: bool = False
+    auto_repair_severities: List[str] = field(
+        default_factory=lambda: ["HIGH", "MEDIUM"]
+    )
+    auto_deploy_fix_classes: List[str] = field(default_factory=list)
+    protected_paths: List[str] = field(
+        default_factory=lambda: [
+            ".github/workflows/",
+            "middleware.*",
+            "**/auth/**",
+            "**/*rls*",
+        ]
+    )
+
+
+@dataclass(slots=True)
+class ReliabilityNotifyConfig:
+    """Owner notifications."""
+
+    enabled: bool = False
+    channel: str = "telegram"
+    persona: bool = True  # JARVIS voice on user-facing messages
+    min_severity: str = "MEDIUM"
+    max_messages_per_hour: int = 20
+
+
+@dataclass
+class ReliabilityConfig:
+    """JARVIS autonomous reliability engineering settings.
+
+    Disabled by default.  Enabling it only starts *monitoring*; repair,
+    notifications and every integration are separately opt-in.
+    """
+
+    enabled: bool = False
+    db_path: str = field(
+        default_factory=lambda: str(get_config_dir() / "reliability" / "incidents.db")
+    )
+    site: ReliabilitySiteConfig = field(default_factory=ReliabilitySiteConfig)
+    probes: ReliabilityProbesConfig = field(default_factory=ReliabilityProbesConfig)
+    vercel: ReliabilityVercelConfig = field(default_factory=ReliabilityVercelConfig)
+    supabase: ReliabilitySupabaseConfig = field(
+        default_factory=ReliabilitySupabaseConfig
+    )
+    github: ReliabilityGitHubConfig = field(default_factory=ReliabilityGitHubConfig)
+    repair: ReliabilityRepairConfig = field(default_factory=ReliabilityRepairConfig)
+    policy: ReliabilityPolicyConfig = field(default_factory=ReliabilityPolicyConfig)
+    notify: ReliabilityNotifyConfig = field(default_factory=ReliabilityNotifyConfig)
+
+
 @dataclass(slots=True)
 class SessionConfig:
     """Cross-channel session settings."""
@@ -1608,6 +1738,7 @@ class JarvisConfig:
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     workflow: WorkflowConfig = field(default_factory=WorkflowConfig)
+    reliability: ReliabilityConfig = field(default_factory=ReliabilityConfig)
     sessions: SessionConfig = field(default_factory=SessionConfig)
     a2a: A2AConfig = field(default_factory=A2AConfig)
     operators: OperatorsConfig = field(default_factory=OperatorsConfig)
@@ -1897,6 +2028,7 @@ def load_config(path: Optional[Path] = None) -> JarvisConfig:
             "sandbox",
             "scheduler",
             "workflow",
+            "reliability",
             "sessions",
             "a2a",
             "operators",

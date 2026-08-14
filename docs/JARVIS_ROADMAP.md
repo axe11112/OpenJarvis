@@ -1,8 +1,7 @@
 # JARVIS Roadmap
 
-**Status:** Planning document. Nothing on this roadmap has been implemented yet — Phase 1 items
-J1.1–J1.3 (this document, the architecture document and the security document) are the only completed
-work.
+**Status:** Phase 1 complete. Phases 2–9 are planning only — nothing in them has been implemented.
+Completed tasks are marked ✅; everything unmarked is not built.
 
 Read [`JARVIS_ARCHITECTURE.md`](JARVIS_ARCHITECTURE.md) first; task IDs below refer to the module
 layout in §2.3 of that document.
@@ -32,24 +31,37 @@ baseline; no existing test modified or deleted.
 **Goal:** understand the ground, then lay the incident and configuration substrate that every later
 phase writes to.
 
-| ID | Task | Type | Depends on |
+| ID | Task | Type | Status |
 |---|---|---|---|
-| J1.1 | Repository analysis and architecture map → `docs/JARVIS_ARCHITECTURE.md` | `[docs]` | — |
-| J1.2 | Phased implementation plan → `docs/JARVIS_ROADMAP.md` | `[docs]` | J1.1 |
-| J1.3 | Security model → `docs/JARVIS_SECURITY.md` | `[docs]` | J1.1 |
-| J1.4 | Record the test baseline (see §"Baseline" below) | `[test]` | — |
-| J1.5 | `reliability/types.py`: `Severity`, `IncidentState`, `Incident`, `Evidence`, `RepairAttempt`, `VerificationResult`, `Signal`, `ProbeResult` — dataclasses with `to_dict`/`from_dict`, following `scheduler.ScheduledTask` | `[new]` | J1.1 |
-| J1.6 | State-machine validation: legal transition table, `Incident.transition_to()` raising on illegal moves, append-only transition log | `[new]` | J1.5 |
-| J1.7 | `reliability/fingerprint.py`: stable fingerprint from (component, probe_id, failure_kind, normalized error); normalization strips timestamps, UUIDs, ports, line numbers | `[new]` | J1.5 |
-| J1.8 | `reliability/store.py`: `IncidentStore` (SQLite under `~/.openjarvis/reliability/incidents.db`), schema + migrations, `create`/`get`/`list`/`transition`/`append_evidence`/`find_by_fingerprint`, mirroring `scheduler/store.py` | `[new]` | J1.5, J1.6 |
-| J1.9 | Mirror every transition to `AuditLogger` so the Merkle chain covers incident history | `[new]` | J1.8 |
-| J1.10 | `ReliabilityConfig` + nested sections in `core/config.py`; add `"reliability"` to `load_config`'s `top_sections` | `[extend]` | J1.1 |
-| J1.11 | Config round-trip tests: TOML → dataclass, `validate_config_key("reliability.repair.max_attempts")`, defaults are all safe (`enabled = false`, `deploy_mode = "pr_only"`) | `[test]` | J1.10 |
-| J1.12 | `reliability/monitor.py` skeleton: `ReliabilityMonitor` registering ticks with the existing `TaskScheduler`; per-tick exception isolation; event constants (`reliability_tick_start`/`_end`, `reliability_incident_opened`, …) as module-level strings, **not** new `EventType` members | `[new]` | J1.10 |
-| J1.13 | `cli/reliability_cmd.py` with `status`, `incident list`, `incident show`, `doctor`; register in `cli/__init__.py` | `[new]` + `[extend]` | J1.8, J1.10 |
+| J1.1 | Repository analysis and architecture map → `docs/JARVIS_ARCHITECTURE.md` | `[docs]` | ✅ |
+| J1.2 | Phased implementation plan → `docs/JARVIS_ROADMAP.md` | `[docs]` | ✅ |
+| J1.3 | Security model → `docs/JARVIS_SECURITY.md` | `[docs]` | ✅ |
+| J1.4 | Record the test baseline (see §"Baseline" below) | `[test]` | ✅ |
+| J1.5 | `reliability/types.py`: `Severity`, `IncidentState`, `Incident`, `Evidence`, `RepairAttempt`, `VerificationResult`, `Signal`, `ProbeResult`, `Correlation`, `Resolution` — dataclasses with `to_dict`/`from_dict` | `[new]` | ✅ |
+| J1.6 | State-machine validation: `LEGAL_TRANSITIONS` table, `Incident.transition_to()` raising `InvalidTransitionError`, append-only transition list | `[new]` | ✅ |
+| J1.7 | `reliability/fingerprint.py`: stable fingerprint; normalization strips timestamps, UUIDs, hex blobs, ports, line numbers, query strings, durations | `[new]` | ✅ |
+| J1.8 | `reliability/store.py`: `IncidentStore` (SQLite), five tables, `create`/`get`/`list`/`transition`/`add_evidence`/`add_attempt`/`find_by_fingerprint`/`record_occurrence` | `[new]` | ✅ |
+| J1.9 | Tamper-evident incident history — **implemented as a self-chained transition log rather than an `AuditLogger` mirror**; see the deviation note below | `[new]` | ✅ |
+| J1.10 | `ReliabilityConfig` + 8 nested sections in `core/config.py`; `"reliability"` added to `load_config`'s `top_sections` | `[extend]` | ✅ |
+| J1.11 | Config tests: TOML overlay, `validate_config_key`, and assertions that every dangerous default is off | `[test]` | ✅ |
+| J1.12 | `reliability/events.py`: event-name constants as module-level strings, **not** new `EventType` members; published by the store | `[new]` | ✅ |
+| J1.13 | `cli/reliability_cmd.py` with `status`, `incident list`, `incident show`, `verify-audit`, `doctor`; registered in `cli/__init__.py` | `[new]` + `[extend]` | ✅ |
+| J1.14 | `reliability/monitor.py`: `ReliabilityMonitor` registering ticks with `TaskScheduler`, with per-tick exception isolation | `[new]` | deferred to Phase 2 — there is nothing to schedule until probes exist |
 
-**Exit criteria:** an incident can be created, transitioned through every legal state, persisted,
-listed from the CLI, and audited — with no network, no browser, and no model involved.
+**Exit criteria — met.** An incident can be created, transitioned through every legal state,
+persisted, listed and inspected from the CLI, and its history verified — with no network, no browser
+and no model involved. 146 new tests; the full suite matches baseline.
+
+**Deviation from the plan (J1.9).** `AuditLogger.log()` takes a `SecurityEvent`
+(`findings`/`content_preview`/`action_taken`) and its `SecurityEventType` enum has four scan-oriented
+members. Mirroring incident transitions through it would mean adding reliability concepts to a
+deliberately narrow security taxonomy. Instead `incident_transitions` carries its own
+`row_hash`/`prev_hash` chain using the same construction, verified by `IncidentStore.verify_chain()`
+and exposed as `jarvis reliability verify-audit`. Same guarantee, no security enum widened. See
+`JARVIS_ARCHITECTURE.md` §2.10.
+
+**Also deferred from J1.14:** the monitor skeleton. Writing a scheduler wrapper with no probes to run
+would have been speculative structure; it moves to J2.11 where it has a real caller.
 
 ---
 
@@ -264,6 +276,9 @@ calls that the sandbox's egress proxy blocks:
 | `tests/server/test_connectors_router.py::test_connect_granola_invalid_key_returns_400_keeps_existing` | proxy returns `403 Forbidden` instead of the expected upstream 401 |
 
 **Effective baseline for JARVIS work: 7323 passed, 0 genuine failures.** Every phase must match this.
+
+After Phase 1: **7465 passed, 56 skipped**, same 4 environmental failures — 142 net new tests, no
+regressions.
 
 Two environmental notes for anyone reproducing it:
 
