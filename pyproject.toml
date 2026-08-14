@@ -203,6 +203,7 @@ testpaths = ["tests"]
 markers = [
     "amd: requires AMD GPU",
     "apple: requires Apple Silicon",
+    "browser: requires Playwright plus an installed Chromium; excluded from the default CI lane (run with -m browser)",
     "cloud: requires cloud API keys",
     "docker: requires a working Docker daemon (no GPU required)",
     "live: requires running inference engine",

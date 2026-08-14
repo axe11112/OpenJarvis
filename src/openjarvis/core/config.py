@@ -1443,6 +1443,10 @@ class ReliabilityProbesConfig:
     evidence_dir: str = ""  # defaults to <config-dir>/reliability/evidence
     evidence_retention_days: int = 30
     trace_on_failure: bool = True
+    browser_executable_path: str = ""  # override the bundled Chromium
+    # Probing a loopback/private address requires opting out of the SSRF guard.
+    # Legitimate for a self-hosted target; never enable it to reach a public URL.
+    allow_private_targets: bool = False
 
 
 @dataclass(slots=True)

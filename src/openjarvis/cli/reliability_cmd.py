@@ -49,6 +49,51 @@ def _get_store(config: Any = None) -> Any:
     return IncidentStore(db_path)
 
 
+def _probe_dir(config: Any) -> Any:
+    """Resolve the probe-spec directory, falling back to the config dir."""
+    from pathlib import Path
+
+    from openjarvis.core.paths import get_config_dir
+
+    configured = getattr(config.reliability.probes, "directory", "")
+    if configured:
+        return Path(configured)
+    return get_config_dir() / "reliability" / "probes"
+
+
+def _evidence_dir(config: Any) -> str:
+    """Resolve the evidence-artifact directory."""
+    from openjarvis.core.paths import get_config_dir
+
+    configured = getattr(config.reliability.probes, "evidence_dir", "")
+    return configured or str(get_config_dir() / "reliability" / "evidence")
+
+
+def _build_executor(config: Any) -> Any:
+    """Build a :class:`ProbeExecutor` wired from user config."""
+    from openjarvis.reliability.probes.executor import ProbeExecutor
+
+    rc = config.reliability
+    browser_options: dict[str, Any] = {
+        "headless": config.tools.browser.headless,
+        "viewport": (
+            config.tools.browser.viewport_width,
+            config.tools.browser.viewport_height,
+        ),
+    }
+    if getattr(rc.probes, "browser_executable_path", ""):
+        browser_options["executable_path"] = rc.probes.browser_executable_path
+
+    return ProbeExecutor(
+        base_url=rc.site.base_url,
+        evidence_dir=_evidence_dir(config),
+        runner_options={
+            "browser": browser_options,
+            "http": {"verify_ssrf": not rc.probes.allow_private_targets},
+        },
+    )
+
+
 def _severity_text(value: str) -> str:
     return f"[{_SEVERITY_STYLE.get(value, 'white')}]{value}[/]"
 
@@ -113,6 +158,143 @@ def reliability_status() -> None:
             )
     finally:
         store.close()
+
+
+@reliability.group("probe")
+def probe_group() -> None:
+    """Inspect and run website probes."""
+
+
+@probe_group.command("list")
+def probe_list() -> None:
+    """List the probe specs JARVIS can run."""
+    from openjarvis.reliability.probes.spec import ProbeSpecError, load_probes
+
+    console = Console()
+    config = _load_config()
+    directory = _probe_dir(config)
+    try:
+        specs = load_probes(directory, strict=True)
+    except ProbeSpecError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise SystemExit(1) from exc
+
+    if not specs:
+        console.print(f"[dim]No probe specs in {escape(str(directory))}.[/dim]")
+        console.print(
+            "[dim]Copy the examples from configs/reliability/probes/ to get "
+            "started.[/dim]"
+        )
+        return
+
+    table = Table(title=f"Probes ({directory})")
+    table.add_column("ID", style="bold")
+    table.add_column("Runner")
+    table.add_column("Severity")
+    table.add_column("Component")
+    table.add_column("Schedule")
+    table.add_column("Enabled")
+    for spec in specs:
+        table.add_row(
+            spec.id,
+            spec.runner,
+            _severity_text(spec.severity.value),
+            escape(spec.component),
+            f"{spec.schedule_type}:{spec.schedule_value}",
+            "[green]yes[/]" if spec.enabled else "[dim]no[/]",
+        )
+    console.print(table)
+
+
+@probe_group.command("show")
+@click.argument("probe_id")
+def probe_show(probe_id: str) -> None:
+    """Show a probe's workflow as human-readable reproduction steps."""
+    from openjarvis.reliability.probes.spec import load_probes
+
+    console = Console()
+    config = _load_config()
+    specs = {s.id: s for s in load_probes(_probe_dir(config))}
+    spec = specs.get(probe_id)
+    if spec is None:
+        console.print(f"[red]No such probe: {escape(probe_id)}[/red]")
+        raise SystemExit(1)
+
+    console.print(
+        Panel(
+            escape(spec.description or spec.expectation_summary()),
+            title=f"{spec.id} — {escape(spec.display_name)}",
+        )
+    )
+    meta = Table(show_header=False, box=None)
+    meta.add_column("key", style="dim")
+    meta.add_column("value")
+    meta.add_row("Runner", spec.runner)
+    meta.add_row("Component", escape(spec.component))
+    meta.add_row("Severity", _severity_text(spec.severity.value))
+    meta.add_row("Schedule", f"{spec.schedule_type}:{spec.schedule_value}")
+    meta.add_row("Enabled", "yes" if spec.enabled else "no")
+    meta.add_row("Mutating", "yes" if spec.mutating else "no")
+    if spec.credentials:
+        # Names only — this is the whole point of the indirection.
+        meta.add_row("Credentials", ", ".join(sorted(spec.credentials.values())))
+    console.print(meta)
+
+    console.print("\n[bold]Steps[/bold]")
+    for index, step in enumerate(spec.repro_steps(), start=1):
+        console.print(f"  {index}. {escape(step)}")
+
+
+@probe_group.command("run")
+@click.argument("probe_id")
+@click.option("--base-url", default="", help="Override the configured site URL.")
+def probe_run(probe_id: str, base_url: str) -> None:
+    """Run one probe now and report what happened."""
+    from openjarvis.reliability.probes.executor import escalate_severity
+    from openjarvis.reliability.probes.spec import load_probes
+
+    console = Console()
+    config = _load_config()
+    specs = {s.id: s for s in load_probes(_probe_dir(config))}
+    spec = specs.get(probe_id)
+    if spec is None:
+        console.print(f"[red]No such probe: {escape(probe_id)}[/red]")
+        raise SystemExit(1)
+
+    if base_url:
+        config.reliability.site.base_url = base_url
+    if not config.reliability.site.base_url and not spec.url.startswith("http"):
+        console.print(
+            "[red]No site configured; set [reliability.site] base_url or pass "
+            "--base-url.[/red]"
+        )
+        raise SystemExit(1)
+
+    executor = _build_executor(config)
+    console.print(f"Running [bold]{escape(spec.id)}[/bold]...")
+    result = executor.run(spec)
+
+    if result.success:
+        console.print(
+            f"[green]PASS[/green] in {result.duration_seconds:.2f}s "
+            f"({result.steps_completed} step(s))"
+        )
+        return
+
+    severity = escalate_severity(spec, result)
+    console.print(
+        f"[red]FAIL[/red] ({escape(result.failure_kind)}) "
+        f"→ severity {_severity_text(severity.value)}"
+    )
+    console.print(f"  {escape(result.error)}")
+    if result.final_url:
+        console.print(f"  Final URL: {escape(result.final_url)}")
+    if result.evidence:
+        console.print("\n[bold]Evidence[/bold]")
+        for item in result.evidence:
+            location = f" → {escape(item.artifact_path)}" if item.artifact_path else ""
+            console.print(f"  [{item.kind.value}] {escape(item.summary)}{location}")
+    raise SystemExit(2)
 
 
 @reliability.group("incident")

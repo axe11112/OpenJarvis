@@ -1,0 +1,60 @@
+# Authenticated dashboard renders without client-side errors.
+#
+# Catches the class of failure where the page loads with HTTP 200 but the
+# application is broken: a failed data fetch, a thrown exception, an empty
+# shell. An uptime monitor reports this as healthy.
+#
+# Selectors are placeholders — point them at your own markup before enabling.
+
+[probe]
+id = "dashboard"
+name = "Dashboard renders"
+component = "dashboard"
+severity = "high"
+runner = "browser"
+enabled = false
+timeout_ms = 30000
+
+[probe.schedule]
+type = "interval"
+value = "600"
+
+[probe.retry]
+attempts = 2
+confirm_runs = 2
+
+[probe.credentials]
+email = "JARVIS_TEST_USER_EMAIL"
+password = "JARVIS_TEST_USER_PASSWORD"
+
+[probe.assertions]
+no_console_errors = true
+no_failed_requests = true
+max_http_status = 399
+max_duration_seconds = 10.0
+
+[[probe.steps]]
+action = "goto"
+url = "/login"
+
+[[probe.steps]]
+action = "fill"
+selector = "input[name=email]"
+value_from = "email"
+
+[[probe.steps]]
+action = "fill"
+selector = "input[name=password]"
+value_from = "password"
+
+[[probe.steps]]
+action = "click"
+selector = "button[type=submit]"
+
+[[probe.steps]]
+action = "goto"
+url = "/dashboard"
+
+[[probe.expect]]
+kind = "visible"
+selector = "[data-testid=dashboard-root]"

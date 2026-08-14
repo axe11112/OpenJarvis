@@ -1,0 +1,29 @@
+# Backend health endpoint.
+#
+# Distinguishes "the site is up" from "the site's backend is up" — a static
+# front end can render perfectly while every API call fails.
+
+[probe]
+id = "api-health"
+name = "API health endpoint"
+component = "api"
+severity = "high"
+runner = "http"
+url = "/api/health"
+timeout_ms = 10000
+
+[probe.schedule]
+type = "interval"
+value = "300"
+
+[probe.retry]
+attempts = 2
+confirm_runs = 2
+
+[probe.assertions]
+max_http_status = 399
+max_duration_seconds = 3.0
+
+[[probe.expect]]
+kind = "status"
+matches = "200"
