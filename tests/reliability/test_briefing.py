@@ -312,3 +312,51 @@ class TestSecretHandling:
 
     def test_clean_incident_is_not_refused(self):
         assert build_briefing(_incident()).redacted is True
+
+
+class TestAssignedSecretRedaction:
+    """Application logs print `NAME=value` pairs that have no token shape."""
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "PASSWORD=hunter2000",
+            "password: hunter2000",
+            "api_key=abcd1234efgh",
+            "SESSION_ID=deadbeefcafe",
+            '{"secret": "topsecretvalue"}',
+            "DB_PASSWORD=p4ssw0rd!",
+        ],
+    )
+    def test_assigned_secrets_are_redacted(self, line):
+        incident = _incident()
+        incident.add_evidence(
+            Evidence(
+                kind=EvidenceKind.LOG, summary="log", content=line, source="app_logs"
+            )
+        )
+        text = build_briefing(incident).text
+        assert "[REDACTED]" in text
+        for secret in (
+            "hunter2000",
+            "abcd1234efgh",
+            "deadbeefcafe",
+            "topsecretvalue",
+            "p4ssw0rd!",
+        ):
+            if secret in line:
+                assert secret not in text
+
+    def test_ordinary_text_is_untouched(self):
+        incident = _incident()
+        incident.add_evidence(
+            Evidence(
+                kind=EvidenceKind.LOG,
+                summary="log",
+                content="status=200 duration=41ms route=/dashboard",
+                source="app_logs",
+            )
+        )
+        text = build_briefing(incident).text
+        assert "status=200" in text
+        assert "/dashboard" in text

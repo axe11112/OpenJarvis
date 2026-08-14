@@ -106,6 +106,23 @@ class HttpProbeRunner(BaseProbeRunner):
                 final_url=url,
                 started_at=started_at,
             )
+        except httpx.ProxyError as exc:
+            # An egress proxy refusing the tunnel says nothing about the target.
+            # Reporting this as a site failure would open an incident about a
+            # site that may be perfectly healthy — JARVIS simply cannot see it.
+            return ProbeResult(
+                probe_id=spec.id,
+                success=False,
+                failure_kind="blocked",
+                error=redactor.redact(
+                    f"could not reach {url}: the network refused the connection "
+                    f"({type(exc).__name__}: {exc}). This is a JARVIS network "
+                    "problem, not evidence about the target."
+                ),
+                duration_seconds=time.monotonic() - started,
+                final_url=url,
+                started_at=started_at,
+            )
         except httpx.HTTPError as exc:
             return ProbeResult(
                 probe_id=spec.id,

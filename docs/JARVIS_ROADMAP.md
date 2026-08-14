@@ -1,12 +1,16 @@
 # JARVIS Roadmap
 
-**Status:** Phases 1–9 implemented. Completed tasks are marked ✅; anything unmarked or
+**Status:** Phases 1–10 implemented. Completed tasks are marked ✅; anything unmarked or
 explicitly deferred is called out as such.
 
-**Not yet exercised against real infrastructure.** Every integration is tested against recorded
-HTTP fixtures (`respx`) and the browser probes against a local fixture site with real Chromium. No
-Vercel, Supabase or GitHub credentials have been used, because no target application is configured
-— see §"Open decisions" in `JARVIS_ARCHITECTURE.md`.
+**Partially exercised against real infrastructure.** As of Phase 10, **GitHub is the only
+integration that has been driven against a live system** — `GitHubSource` was pointed at the real
+private target repository with a read-only token and returned real commits, branches and pull
+requests. Vercel, Supabase, the production website and Telegram have **not** been reached: the
+development sandbox's egress proxy blocks those hosts, and no read-only tokens were supplied. Those
+integrations remain fixture-tested only (`respx`), and the browser probes remain tested against a
+local fixture site with real Chromium. See §"Phase 10" below and
+[`JARVIS_LIVE_SETUP.md`](JARVIS_LIVE_SETUP.md) for exactly what is still unverified.
 
 Read [`JARVIS_ARCHITECTURE.md`](JARVIS_ARCHITECTURE.md) first; task IDs below refer to the module
 layout in §2.3 of that document.
@@ -286,6 +290,52 @@ host files.
 
 ---
 
+## Phase 10 — Live integration and production readiness
+
+Connect JARVIS to the real target application read-only, and prove the monitoring and diagnosis
+pipeline works against a real system. **No repair capability is enabled by this phase.**
+
+| ID | Task | Type | Status |
+|---|---|---|---|
+| J10.1 | `health.py` — six-state vocabulary (`HEALTHY`/`DEGRADED`/`FAILED`/`UNKNOWN`/`NOT_CONFIGURED`/`NOT_CHECKED`) so "we could not check" is never rendered as green | `[new]` | ✅ |
+| J10.2 | `target.py` — resolve the target from config with environment overrides; report credentials **by variable name only** | `[new]` | ✅ |
+| J10.3 | `diagnostic.py` — read-only `live-diagnostic` across configuration, GitHub, Vercel, Supabase, website, probes, notifications and the coding agent | `[new]` | ✅ |
+| J10.4 | `probes/placeholder.py` — detect the shipped example selectors and refuse to run them, so a placeholder can never report `PASS` | `[new]` | ✅ |
+| J10.5 | `analysis.py` — diagnosis-only Claude prompt that forbids modification, branching, deploying and migrations | `[new]` | ✅ |
+| J10.6 | Rewrite `doctor`; add `live-diagnostic`, `notify-test` and `analyze` to the CLI | `[extend]` | ✅ |
+| J10.7 | Assignment-based secret redaction in briefings (`PASSWORD=hunter2`, not just token shapes) | `[extend]` | ✅ |
+| J10.8 | `blocked` failure kind — a proxy/egress failure is JARVIS's problem, never evidence about the target | `[extend]` | ✅ |
+| J10.9 | [`JARVIS_LIVE_SETUP.md`](JARVIS_LIVE_SETUP.md) — env vars, least-privilege scopes, probes, health states, troubleshooting, and the pre-repair checklist | `[docs]` | ✅ |
+| J10.10 | Live verification against the real target | `[test]` | **partial — GitHub only** |
+
+**Status: complete as implementation; partial as live verification.**
+
+**What was genuinely exercised.** `GitHubSource` against the real private target repository with a
+read-only token: health, commits, 36 branches and the open pull request all returned real data.
+`actions` returned `403` because the token lacks `Actions: Read` — reported as `UNKNOWN`, and the
+integration as a whole as `DEGRADED`. That is the intended behaviour and it is what surfaced the
+gap.
+
+**What was not.** Vercel, Supabase, the production website and Telegram were unreachable from the
+development sandbox (`api.vercel.com`, `api.supabase.com`, `api.telegram.org`, the Supabase project
+host and the production domain all return `403` at the egress proxy), and no read-only tokens for
+them were supplied. They are reported `NOT_CONFIGURED`/`UNKNOWN` — **not** healthy.
+
+**Three false-health defects were found by running the diagnostic for real**, each of which had
+been reporting green from an absence of evidence:
+
+1. `vercel.production_deployment` reported `HEALTHY` with "no production deployment found" — an
+   empty list read as success. Now raises, yielding `UNKNOWN`.
+2. `supabase.rls_diagnostics` and `auth_diagnostics` reported `HEALTHY` with "0 denials" when the
+   log query had silently failed for want of a token. Now raise when nothing was sampled.
+3. Probes reported `FAILED` for proxy-blocked URLs and opened a false incident claiming production
+   was down. Now a distinct `blocked` failure kind, excluded from detection.
+
+This is the phase's main argument for itself: the architecture existing is not the same as the
+production system working, and only a real run distinguishes them.
+
+---
+
 ## Cross-cutting, every phase
 
 - No existing test removed or weakened.
@@ -323,6 +373,15 @@ calls that the sandbox's egress proxy blocks:
 After Phase 1: **7465 passed** (+142 tests).
 After Phase 9: **7929 passed, 56 skipped**, same 4 environmental failures — 606 net new tests, no
 regressions. The `browser` lane adds 12 more, run separately with `-m browser`.
+After Phase 10: **8031 passed, 56 skipped**, same 4 environmental failures — 708 net new tests, no
+regressions.
+
+Running the suite **unmarked** (without `-m "not live and not cloud and not hub"`) adds 20 further
+failures on top of those 4, in `tests/connectors/test_new_connectors_live.py`,
+`tests/engine/test_gemma_cpp.py`, `tests/evals/datasets/`, `tests/evals/test_dataset_splits_integration.py`
+and `tests/skills/test_integration_live.py`. These need connector credential files, a local Gemma
+binary and HuggingFace Hub downloads; they were confirmed to fail identically with this branch's
+changes stashed. The marked lane above is the one to compare against.
 
 Two environmental notes for anyone reproducing it:
 

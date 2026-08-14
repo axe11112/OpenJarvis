@@ -155,13 +155,72 @@ def scan_for_injection(text: str) -> List[str]:
     ]
 
 
+#: Assignments whose value is a secret regardless of its format. The framework's
+#: stripper matches recognisable token *shapes* (``ghp_``, ``sk-``, ``AKIA``);
+#: an application log printing ``PASSWORD=hunter2`` has no shape to match, so it
+#: needs a rule of its own.
+#: Any ``name = value`` assignment. The name is matched as one bounded token and
+#: the "is this a secret?" decision is made in Python.
+#:
+#: Deliberately NOT ``[A-Za-z0-9_.\-]*(?:password|secret|...)``: a wildcard
+#: prefix in front of an alternation backtracks catastrophically, and evidence
+#: text is attacker-influenceable, so that shape is a denial-of-service waiting
+#: to happen. This form is linear.
+_ASSIGNMENT_RE = re.compile(
+    r"""(?x)
+    (?P<name> [A-Za-z0-9_.\-]{1,64} )
+    (?P<sep> \s*[:=]\s* | "\s*:\s*" )
+    (?P<value> [^\s,;'"}\]]{4,} )
+    """
+)
+
+#: Substrings in a variable name that mean its value must never be shown.
+_SECRET_NAME_PARTS = (
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "apikey",
+    "api_key",
+    "api-key",
+    "auth",
+    "credential",
+    "private_key",
+    "privatekey",
+    "session_id",
+    "sessionid",
+    "cookie",
+)
+
+
+def _looks_like_a_secret_name(name: str) -> bool:
+    """Whether an assignment's left-hand side names a secret."""
+    lowered = name.lower()
+    return any(part in lowered for part in _SECRET_NAME_PARTS)
+
+
 def _redact(text: str) -> str:
-    """Strip credentials from *text* using the framework's stripper."""
+    """Strip credentials from *text*.
+
+    Two passes: the framework's shape-matching stripper, then an assignment
+    rule for ``NAME=value`` pairs whose name says the value is a secret. The
+    framework's stripper only recognises token *shapes* (``ghp_``, ``sk-``,
+    ``AKIA``); an application log printing ``DB_PASSWORD=hunter2`` has no shape
+    to match.
+    """
     if not text:
         return ""
     from openjarvis.security.credential_stripper import CredentialStripper
 
-    return CredentialStripper().strip(text)
+    stripped = CredentialStripper().strip(text)
+
+    def _replace(match: "re.Match[str]") -> str:
+        name = match.group("name")
+        if not _looks_like_a_secret_name(name):
+            return match.group(0)
+        return f"{name}{match.group('sep')}[REDACTED]"
+
+    return _ASSIGNMENT_RE.sub(_replace, stripped)
 
 
 def _has_critical_secret(text: str) -> bool:

@@ -658,61 +658,342 @@ def reliability_verify_audit() -> None:
 
 
 @reliability.command("doctor")
-def reliability_doctor() -> None:
-    """Report what is configured, what is missing, and what is unsafe."""
-    import os
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+def reliability_doctor(as_json: bool) -> None:
+    """Validate configuration and credentials. Contacts nothing.
+
+    Reports which credentials are *present* by environment-variable name.  It
+    never reads, prints or transmits a credential value.
+    """
+    import json as json_module
+
+    from openjarvis.reliability.target import credential_report, resolve_target
+
+    console = Console()
+    config = _load_config()
+    target = resolve_target(config)
+    credentials = credential_report(config)
+
+    if as_json:
+        console.print_json(
+            json_module.dumps(
+                {
+                    "target": target.to_dict(),
+                    "credentials": [c.to_dict() for c in credentials],
+                    "safety": _safety_snapshot(config),
+                }
+            )
+        )
+    else:
+        table = Table(title="JARVIS target", show_header=False, box=None)
+        table.add_column("key", style="dim")
+        table.add_column("value")
+        for label, value in target.to_dict().items():
+            table.add_row(label, escape(str(value)) or "[dim]not set[/]")
+        console.print(table)
+
+        console.print()
+        creds = Table(title="Credentials (names only — values are never read)")
+        creds.add_column("Integration")
+        creds.add_column("Status")
+        creds.add_column("Environment variable")
+        creds.add_column("Needed for", style="dim")
+        for status in credentials:
+            if status.present:
+                mark = "[green]🟢 configured[/]"
+            elif status.optional:
+                mark = "[dim]⚫ optional, not set[/]"
+            else:
+                mark = f"[red]🔴 missing ${escape(status.env_name)}[/]"
+            creds.add_row(
+                status.label,
+                mark,
+                escape(status.env_name),
+                escape(status.required_for),
+            )
+        console.print(creds)
+
+        console.print()
+        safety = Table(title="Safety interlocks", show_header=False, box=None)
+        safety.add_column("key", style="dim")
+        safety.add_column("value")
+        for label, value in _safety_snapshot(config).items():
+            style = "green" if value in ("OFF", "pr_only", "active") else "yellow"
+            safety.add_row(label, f"[{style}]{escape(str(value))}[/]")
+        console.print(safety)
+
+    problems = [
+        f"missing ${c.env_name} ({c.required_for})"
+        for c in credentials
+        if not c.present and not c.optional
+    ]
+    problems += [f"missing ${name}" for name in target.missing()]
+    for note in (target.url_problem(), target.repository_problem()):
+        if note:
+            problems.append(note)
+
+    if problems and not as_json:
+        console.print()
+        for problem in problems:
+            console.print(f"[red]✗[/red] {escape(problem)}")
+    if problems:
+        raise SystemExit(1)
+    if not as_json:
+        console.print("\n[green]✓[/green] Configuration and credentials look complete.")
+
+
+def _safety_snapshot(config: Any) -> dict:
+    """The interlocks a reader most wants confirmed, as plain strings."""
+    rc = config.reliability
+    return {
+        "Automatic repair": "ON" if rc.repair.enabled else "OFF",
+        "Deploy mode": rc.policy.deploy_mode,
+        "Push to default branch": (
+            "ON" if rc.policy.allow_push_to_default_branch else "OFF"
+        ),
+        "Supabase production writes": (
+            "ON" if rc.supabase.allow_production_writes else "OFF"
+        ),
+        "SQL write guard": "active",
+    }
+
+
+def _render_check(console: Any, check: Any, *, indent: int = 0) -> None:
+    """Print one check and its capabilities."""
+    pad = "  " * indent
+    console.print(
+        f"{pad}{check.state.icon} [bold]{escape(check.name)}[/bold] "
+        f"{escape(check.state.value)}"
+        + (f" — {escape(check.summary)}" if check.summary else "")
+    )
+    for capability in check.capabilities.values():
+        console.print(
+            f"{pad}    {capability.state.icon} {escape(capability.name)}: "
+            f"{escape(capability.summary or capability.state.value)}"
+        )
+        if capability.remediation and not capability.state.was_checked:
+            console.print(f"{pad}       [dim]→ {escape(capability.remediation)}[/dim]")
+    if check.remediation and not check.state.was_checked:
+        console.print(f"{pad}    [dim]→ {escape(check.remediation)}[/dim]")
+
+
+@reliability.command("live-diagnostic")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+@click.option(
+    "--no-probes", is_flag=True, help="Skip browser probes (integrations only)."
+)
+@click.option(
+    "--no-incidents", is_flag=True, help="Report only; do not open incidents."
+)
+@click.option("--notify/--no-notify", default=False, help="Send a Telegram summary.")
+def reliability_live_diagnostic(
+    as_json: bool, no_probes: bool, no_incidents: bool, notify: bool
+) -> None:
+    """Run every read-only check against the configured target.
+
+    Modifies nothing: no deployments, no branches, no database writes, no code
+    changes.  Exit status is 0 healthy, 1 something failed, 2 incomplete.
+    """
+    import json as json_module
+
+    from openjarvis.reliability.diagnostic import LiveDiagnostic
+
+    console = Console()
+    config = _load_config()
+    store = _get_store(config)
+    notifier = _build_notifier(config) if notify else None
+
+    try:
+        diagnostic = LiveDiagnostic(config, store=store, notifier=notifier)
+        report = diagnostic.run(
+            include_probes=not no_probes, open_incidents=not no_incidents
+        )
+
+        if as_json:
+            console.print_json(json_module.dumps(report.to_dict()))
+        else:
+            console.print("\n[bold]JARVIS FULL DIAGNOSTIC[/bold]\n")
+            for check in report.checks:
+                _render_check(console, check)
+                console.print()
+
+            console.print(
+                f"[bold]Overall:[/bold] {report.overall.state.icon} "
+                f"{escape(report.overall.state.value)}"
+            )
+
+            blind = report.blind_spots()
+            if blind:
+                console.print(
+                    f"\n[yellow]Not verified ({len(blind)}) — these are blind "
+                    "spots, not passes:[/yellow]"
+                )
+                for spot in blind:
+                    console.print(f"  [yellow]•[/yellow] {escape(spot)}")
+
+            if report.incidents_opened:
+                console.print(
+                    f"\n[red]Incidents opened:[/red] "
+                    f"{escape(', '.join(report.incidents_opened))}"
+                )
+            else:
+                console.print("\nIncidents opened: 0")
+
+            if report.audit_chain_intact is True:
+                console.print("Audit chain: [green]intact[/green]")
+            elif report.audit_chain_intact is False:
+                console.print("Audit chain: [bold red]BROKEN[/bold red]")
+
+            console.print()
+            for label, value in _safety_snapshot(config).items():
+                console.print(f"[dim]{escape(label)}:[/dim] {escape(str(value))}")
+
+        if notify and notifier is not None:
+            _notify_diagnostic(notifier, report, config)
+    finally:
+        store.close()
+
+    raise SystemExit(report.exit_code)
+
+
+def _notify_diagnostic(notifier: Any, report: Any, config: Any) -> None:
+    """Send a diagnostic summary. Redaction happens inside the router."""
+    from openjarvis.reliability.types import Severity
+
+    lines = ["🤖 JARVIS", "", "Live diagnostic complete.", ""]
+    for check in report.checks:
+        lines.append(f"{check.state.icon} {check.name}: {check.state.value}")
+    lines += ["", f"Overall: {report.overall.state.value}"]
+    if report.incidents_opened:
+        lines.append(f"Incidents: {', '.join(report.incidents_opened)}")
+    safety = _safety_snapshot(config)
+    lines += [
+        "",
+        f"Automatic repair: {safety['Automatic repair']}",
+        f"Production deployment: {safety['Deploy mode']}",
+    ]
+    notifier.notify("\n".join(lines), severity=Severity.MEDIUM)
+
+
+@reliability.command("notify-test")
+def reliability_notify_test() -> None:
+    """Send one test notification through the configured channel."""
+    from openjarvis.reliability.target import resolve_target
+    from openjarvis.reliability.types import Severity
 
     console = Console()
     config = _load_config()
     rc = config.reliability
 
-    problems: list[str] = []
-    warnings: list[str] = []
-
-    if not rc.enabled:
-        warnings.append("Monitoring is disabled ([reliability] enabled = false).")
-    if not rc.site.base_url:
-        problems.append("No site configured ([reliability.site] base_url).")
-
-    for label, section in (
-        ("Vercel", rc.vercel),
-        ("Supabase", rc.supabase),
-        ("GitHub", rc.github),
-    ):
-        if not section.enabled:
-            continue
-        env_name = section.token_env
-        if not env_name:
-            problems.append(f"{label} is enabled but names no token_env.")
-        elif not os.environ.get(env_name):
-            problems.append(f"{label} is enabled but ${env_name} is not set.")
-
-    if rc.repair.enabled and not rc.repair.workspace:
-        problems.append(
-            "Repair is enabled but [reliability.repair] workspace is unset."
+    if not rc.notify.enabled:
+        console.print(
+            "[red]Notifications are disabled "
+            "([reliability.notify] enabled = false).[/red]"
         )
-    if rc.repair.enabled and not rc.repair.test_command:
-        warnings.append(
-            "Repair is enabled with no test_command; fixes will not be tested."
-        )
-
-    if rc.policy.allow_push_to_default_branch:
-        warnings.append(
-            "allow_push_to_default_branch is TRUE — JARVIS may write to the "
-            "default branch."
-        )
-    if rc.supabase.allow_production_writes:
-        warnings.append(
-            "allow_production_writes is TRUE — Supabase is no longer read-only."
-        )
-    if rc.policy.deploy_mode != "pr_only":
-        warnings.append(f"deploy_mode is '{rc.policy.deploy_mode}', not 'pr_only'.")
-
-    for problem in problems:
-        console.print(f"[red]✗[/red] {escape(problem)}")
-    for warning in warnings:
-        console.print(f"[yellow]![/yellow] {escape(warning)}")
-    if not problems and not warnings:
-        console.print("[green]✓[/green] Configuration looks consistent.")
-    if problems:
         raise SystemExit(1)
+
+    target = resolve_target(config)
+    safety = _safety_snapshot(config)
+    message = "\n".join(
+        [
+            "🤖 JARVIS",
+            "",
+            "Connection test successful.",
+            "",
+            f"Target: {target.repository or target.production_url or 'not configured'}",
+            f"Environment: {target.environment}",
+            "",
+            f"Automatic repair: {safety['Automatic repair']}",
+            f"Production deployment: {safety['Deploy mode']}",
+            f"Supabase writes: {safety['Supabase production writes']}",
+        ]
+    )
+    notifier = _build_notifier(config)
+    sent = notifier.notify(message, severity=Severity.MEDIUM)
+    if sent:
+        console.print("[green]Test notification sent.[/green]")
+    else:
+        console.print(
+            "[red]Notification was not sent (check the channel configuration "
+            "and rate limits).[/red]"
+        )
+        raise SystemExit(1)
+
+
+@reliability.command("analyze")
+@click.argument("incident_id")
+@click.option("--out", default="", help="Write the prompt to a file instead of stdout.")
+@click.option("--run", "invoke", is_flag=True, help="Invoke the claude CLI read-only.")
+def reliability_analyze(incident_id: str, out: str, invoke: bool) -> None:
+    """Build a diagnostic-only Claude Code prompt for an incident.
+
+    The prompt asks for a root-cause analysis and explicitly forbids modifying
+    files, deploying, or touching data.  Nothing is repaired by this command.
+    """
+    from openjarvis.reliability.analysis import build_analysis_prompt
+    from openjarvis.reliability.briefing import BriefingRefusedError
+
+    console = Console()
+    config = _load_config()
+    store = _get_store(config)
+    try:
+        incident = store.get(incident_id)
+        if incident is None:
+            console.print(f"[red]No such incident: {escape(incident_id)}[/red]")
+            raise SystemExit(1)
+        try:
+            prompt = build_analysis_prompt(
+                incident,
+                protected_paths=list(config.reliability.policy.protected_paths),
+            )
+        except BriefingRefusedError as exc:
+            console.print(
+                f"[bold red]Refused to build a prompt:[/bold red] {escape(str(exc))}"
+            )
+            raise SystemExit(1) from exc
+    finally:
+        store.close()
+
+    if prompt.injection_findings:
+        console.print(
+            "[yellow]Note: the evidence contains text matching injection "
+            "patterns; it is fenced in the prompt.[/yellow]"
+        )
+
+    if out:
+        from pathlib import Path
+
+        Path(out).write_text(prompt.text, encoding="utf-8")
+        console.print(
+            f"Wrote the analysis prompt to {escape(out)} (hash {prompt.hash})"
+        )
+    elif not invoke:
+        console.print(prompt.text)
+
+    if invoke:
+        from openjarvis.reliability.code_agent import ClaudeCliAgent
+
+        workspace = config.reliability.repair.workspace
+        if not workspace:
+            console.print(
+                "[red]Set [reliability.repair] workspace to a checkout of the "
+                "target application first.[/red]"
+            )
+            raise SystemExit(1)
+        # Read-only tool set: the agent may look, never edit.
+        agent = ClaudeCliAgent(
+            allowed_tools=["Read", "Grep", "Glob"],
+            disallowed_tools=["Edit", "Write", "Bash", "WebFetch", "WebSearch"],
+        )
+        if not agent.available():
+            console.print("[red]The claude CLI is not on PATH.[/red]")
+            raise SystemExit(1)
+        console.print("[dim]Running Claude Code in read-only analysis mode…[/dim]")
+        result = agent.run(prompt.text, workspace=workspace, timeout=900)
+        console.print(escape(result.claim or result.error))
+        if result.changed_files:
+            console.print(
+                "[bold red]The agent modified files during a read-only "
+                f"analysis: {escape(', '.join(result.changed_files))}[/bold red]"
+            )
+            raise SystemExit(1)

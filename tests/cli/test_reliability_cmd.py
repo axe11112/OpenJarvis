@@ -168,9 +168,10 @@ class TestExternalContentIsEscaped:
     parsed away (or crash the renderer).
     """
 
-    def test_doctor_prints_literal_config_paths(self, wired):
+    def test_doctor_prints_literal_env_var_names(self, wired):
         result = CliRunner().invoke(cli, ["reliability", "doctor"])
-        assert "[reliability.site] base_url" in result.output
+        assert "GITHUB_READONLY_TOKEN" in result.output
+        assert "VERCEL_READONLY_TOKEN" in result.output
 
     def test_incident_show_preserves_bracketed_text(self, wired):
         _, store = wired
@@ -233,55 +234,104 @@ class TestVerifyAudit:
 
 
 class TestDoctor:
-    def test_clean_when_disabled_but_configured(self, wired):
-        config, _ = wired
-        config.reliability.site.base_url = "https://example.com"
-        result = CliRunner().invoke(cli, ["reliability", "doctor"])
-        assert result.exit_code == 0
-        assert "Monitoring is disabled" in result.output
+    """The Phase 10 doctor: validates config and credentials, contacts nothing."""
 
-    def test_missing_site_is_a_problem(self, wired):
+    def test_reports_the_target(self, wired):
+        config, _ = wired
+        config.reliability.github.repo = "acme/site"
+        result = CliRunner().invoke(cli, ["reliability", "doctor"])
+        assert "acme/site" in result.output
+
+    def test_missing_credentials_exit_nonzero(self, wired, monkeypatch):
+        for name in (
+            "GITHUB_READONLY_TOKEN",
+            "VERCEL_READONLY_TOKEN",
+            "SUPABASE_READONLY_TOKEN",
+        ):
+            monkeypatch.delenv(name, raising=False)
         result = CliRunner().invoke(cli, ["reliability", "doctor"])
         assert result.exit_code == 1
-        assert "No site configured" in result.output
+        assert "missing" in result.output
 
-    def test_missing_token_env_is_a_problem(self, wired, monkeypatch):
-        config, _ = wired
-        config.reliability.site.base_url = "https://example.com"
-        config.reliability.vercel.enabled = True
-        monkeypatch.delenv("VERCEL_READONLY_TOKEN", raising=False)
+    def test_present_credential_is_reported_configured(self, wired, monkeypatch):
+        monkeypatch.setenv("GITHUB_READONLY_TOKEN", "ghp_" + "a" * 36)
         result = CliRunner().invoke(cli, ["reliability", "doctor"])
-        assert result.exit_code == 1
-        assert "VERCEL_READONLY_TOKEN is not set" in result.output
+        assert "configured" in result.output
 
-    def test_present_token_env_passes(self, wired, monkeypatch):
-        config, _ = wired
-        config.reliability.site.base_url = "https://example.com"
-        config.reliability.enabled = True
-        config.reliability.vercel.enabled = True
-        monkeypatch.setenv("VERCEL_READONLY_TOKEN", "not-a-real-token")
+    def test_never_prints_a_credential_value(self, wired, monkeypatch):
+        """The whole point of reporting by name."""
+        secret = "ghp_" + "s" * 36
+        monkeypatch.setenv("GITHUB_READONLY_TOKEN", secret)
         result = CliRunner().invoke(cli, ["reliability", "doctor"])
+        assert secret not in result.output
+
+    def test_reports_the_safety_interlocks(self, wired):
+        result = CliRunner().invoke(cli, ["reliability", "doctor"])
+        assert "Automatic repair" in result.output
+        assert "OFF" in result.output
+        assert "pr_only" in result.output
+
+    def test_json_output_is_parseable_and_secret_free(self, wired, monkeypatch):
+        import json
+
+        secret = "ghp_" + "j" * 36
+        monkeypatch.setenv("GITHUB_READONLY_TOKEN", secret)
+        result = CliRunner().invoke(cli, ["reliability", "doctor", "--json"])
+        assert secret not in result.output
+        payload = json.loads(result.output)
+        assert "target" in payload
+        assert "credentials" in payload
+        assert payload["safety"]["Automatic repair"] == "OFF"
+
+
+class TestLiveDiagnosticCommand:
+    def test_help(self):
+        result = CliRunner().invoke(cli, ["reliability", "live-diagnostic", "--help"])
         assert result.exit_code == 0
-
-    def test_warns_about_unsafe_settings(self, wired):
-        config, _ = wired
-        config.reliability.enabled = True
-        config.reliability.site.base_url = "https://example.com"
-        config.reliability.policy.allow_push_to_default_branch = True
-        config.reliability.supabase.allow_production_writes = True
-        config.reliability.policy.deploy_mode = "auto_deploy_allowlisted"
-
-        result = CliRunner().invoke(cli, ["reliability", "doctor"])
-        assert result.exit_code == 0  # warnings, not failures
-        assert "default branch" in result.output
         assert "read-only" in result.output
-        assert "deploy_mode" in result.output
 
-    def test_repair_without_workspace_is_a_problem(self, wired):
-        config, _ = wired
-        config.reliability.enabled = True
-        config.reliability.site.base_url = "https://example.com"
-        config.reliability.repair.enabled = True
-        result = CliRunner().invoke(cli, ["reliability", "doctor"])
+    def test_unconfigured_run_never_exits_zero(self, wired, monkeypatch):
+        """A run that checked nothing must not look like success."""
+        for name in (
+            "GITHUB_READONLY_TOKEN",
+            "VERCEL_READONLY_TOKEN",
+            "SUPABASE_READONLY_TOKEN",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        result = CliRunner().invoke(
+            cli, ["reliability", "live-diagnostic", "--no-probes", "--no-incidents"]
+        )
+        assert result.exit_code != 0
+
+    def test_reports_blind_spots_rather_than_passes(self, wired, monkeypatch):
+        for name in ("VERCEL_READONLY_TOKEN", "SUPABASE_READONLY_TOKEN"):
+            monkeypatch.delenv(name, raising=False)
+        result = CliRunner().invoke(
+            cli, ["reliability", "live-diagnostic", "--no-probes", "--no-incidents"]
+        )
+        assert "blind spots, not passes" in result.output
+
+    def test_prints_the_safety_interlocks(self, wired):
+        result = CliRunner().invoke(
+            cli, ["reliability", "live-diagnostic", "--no-probes", "--no-incidents"]
+        )
+        assert "Automatic repair: OFF" in result.output
+
+
+class TestAnalyzeCommand:
+    def test_help(self):
+        result = CliRunner().invoke(cli, ["reliability", "analyze", "--help"])
+        assert result.exit_code == 0
+
+    def test_missing_incident_is_an_error(self, wired):
+        result = CliRunner().invoke(cli, ["reliability", "analyze", "INC-99999"])
         assert result.exit_code == 1
-        assert "workspace is unset" in result.output
+        assert "No such incident" in result.output
+
+    def test_emits_a_read_only_prompt(self, wired):
+        _, store = wired
+        incident = store.create(_incident())
+        result = CliRunner().invoke(cli, ["reliability", "analyze", incident.id])
+        assert result.exit_code == 0
+        assert "Do NOT modify any file." in result.output
+        assert "Root cause" in result.output

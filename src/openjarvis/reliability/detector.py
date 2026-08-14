@@ -40,8 +40,11 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["Detection", "Detector"]
 
-#: Probe failure kinds that describe JARVIS being broken, not the site.
-_SELF_FAILURE_KINDS = frozenset({"misconfigured", "runner_error"})
+#: Probe failure kinds that describe JARVIS being unable to look, rather than
+#: the site being broken. None of these may open an incident: an incident that
+#: says "production is down" when the truth is "our network refused the
+#: connection" is worse than no monitoring at all.
+_SELF_FAILURE_KINDS = frozenset({"misconfigured", "runner_error", "blocked"})
 
 
 @dataclass(slots=True)
