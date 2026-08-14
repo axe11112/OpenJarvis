@@ -175,6 +175,10 @@ nav:
       - Query Flow: architecture/query-flow.md
       - Security: architecture/security.md
       - Design Principles: architecture/design-principles.md
+  - JARVIS:
+      - Architecture: JARVIS_ARCHITECTURE.md
+      - Roadmap: JARVIS_ROADMAP.md
+      - Security: JARVIS_SECURITY.md
   - API Reference: api-reference/
   - User Guide:
       - CLI: user-guide/cli.md
