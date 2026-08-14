@@ -1,9 +1,12 @@
 # JARVIS Architecture
 
-**Status:** Phase 1 (Foundation) implemented — incident model, state machine, fingerprinting,
-persistence with a tamper-evident history, the `[reliability]` config section and the
-`jarvis reliability` CLI. Phases 2–9 are still design only. See
-[`JARVIS_ROADMAP.md`](JARVIS_ROADMAP.md) for exactly what exists.
+**Status:** Phases 1–9 implemented. See [`JARVIS_ROADMAP.md`](JARVIS_ROADMAP.md) for exactly
+what exists, what is partial, and what is not built.
+
+**Not yet run against real infrastructure.** Integrations are tested against recorded HTTP fixtures
+and the browser probes against a local fixture site with real Chromium. No Vercel, Supabase or
+GitHub credentials have been used, and no live Claude Code session has driven the repair loop,
+because no target application is configured (§12).
 **Scope:** How an autonomous website-reliability engineer ("JARVIS") is built *on top of*
 OpenJarvis, reusing the existing primitives rather than forking or replacing them.
 
@@ -582,13 +585,18 @@ parsing, not the Node runner. Phase 6 must therefore begin with a decision:
 
 - **(a)** rewrite the runner against the current Claude Agent SDK, add `tsconfig.json` + a build step,
   and plumb permission mode / disallowed tools / working directory from Python; or
-- **(b)** drop the Node bridge and drive the `claude` CLI directly from Python in headless mode
-  (`claude -p --output-format stream-json`), which removes the bundled-runner build problem entirely.
+- **(b)** drop the Node bridge and drive the `claude` CLI directly from Python in headless mode,
+  which removes the bundled-runner build problem entirely.
 
-Recommendation: **(b) for JARVIS**, with (a) left to the upstream project. JARVIS needs a long-running,
-resumable, permission-constrained coding session in a specific working directory; the CLI's headless
-mode gives that with fewer moving parts, and it reuses whatever Claude Code entitlement the owner
-already has instead of requiring a separate metered API key.
+**Resolved: (b).** `reliability/code_agent.py` provides `ClaudeCliAgent`, which drives the `claude`
+CLI headlessly with working directory, allowed tools, disallowed tools and timeout supplied by
+JARVIS. `WebFetch`/`WebSearch` are disallowed by default so the agent cannot be talked into
+fetching an attacker-controlled URL by something it read in the evidence. The upstream
+`ClaudeCodeAgent` is left untouched — fixing it is a separate concern for the OpenJarvis project.
+
+Note that this path is **untested against a live Claude Code session**: the repair loop is exercised
+end to end with `FakeCodeAgent`, which is what makes the "claims success but verification fails"
+case testable in the first place.
 
 ---
 

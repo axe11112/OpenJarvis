@@ -1,7 +1,12 @@
 # JARVIS Roadmap
 
-**Status:** Phase 1 complete. Phases 2–9 are planning only — nothing in them has been implemented.
-Completed tasks are marked ✅; everything unmarked is not built.
+**Status:** Phases 1–9 implemented. Completed tasks are marked ✅; anything unmarked or
+explicitly deferred is called out as such.
+
+**Not yet exercised against real infrastructure.** Every integration is tested against recorded
+HTTP fixtures (`respx`) and the browser probes against a local fixture site with real Chromium. No
+Vercel, Supabase or GitHub credentials have been used, because no target application is configured
+— see §"Open decisions" in `JARVIS_ARCHITECTURE.md`.
 
 Read [`JARVIS_ARCHITECTURE.md`](JARVIS_ARCHITECTURE.md) first; task IDs below refer to the module
 layout in §2.3 of that document.
@@ -88,9 +93,16 @@ would have been speculative structure; it moves to J2.11 where it has a real cal
 | J2.15 | `[test]` Probe-spec parsing, step interpretation, evidence extraction, flake suppression, severity escalation — all without a browser where possible | `[test]` | J2.9, J2.10 |
 | J2.16 | `jarvis reliability probe run <id>` and `probe list` CLI commands | `[extend]` | J1.13, J2.5 |
 
-**Exit criteria:** `jarvis reliability probe run login` against a deliberately broken fixture site
-produces an incident with reproduction steps, console errors, failed requests, a screenshot and a
-trace — and produces nothing when the site is healthy.
+**Status: complete.** All tasks ✅ except J2.1, which was decided in favour of declarative TOML.
+Verified against real Chromium and the fixture site.
+
+**Exit criteria — met.** A broken login produces an incident with reproduction steps, evidence, a
+screenshot and a trace; a healthy site produces nothing and writes no artifacts.
+
+**Design note.** The browser emits a console *error* for any failed subresource, so a missing
+favicon would open an incident on essentially every real site. Those messages are filtered out of
+the JavaScript-error bucket (they remain visible via `no_failed_requests`/`max_http_status`), and
+`ignore_console_patterns` covers app-specific noise.
 
 ---
 
@@ -110,8 +122,10 @@ trace — and produces nothing when the site is healthy.
 | J3.8 | `[test]` `respx` fixtures for every GitHub call, including 401/403/429/5xx and pagination | `[test]` | J3.2–J3.4 |
 | J3.9 | `[test]` Correlation ranking on synthetic commit histories | `[test]` | J3.5 |
 
-**Exit criteria:** given an incident timestamp, JARVIS names the candidate commits and changed files
-with a confidence score, and can open an isolated branch — without ever touching `main`.
+**Status: complete.** All tasks ✅.
+
+**Exit criteria — met**, against recorded HTTP fixtures. Write safety is structural: `GitHubSource`
+has no merge method at all, and `_assert_writable_branch` runs on every write path.
 
 ---
 
@@ -131,8 +145,11 @@ with a confidence score, and can open an isolated branch — without ever touchi
 | J4.8 | `[test]` `respx` fixtures for deployments, build logs, error states, rate limits | `[test]` | J4.1–J4.3 |
 | J4.9 | `[test]` Assert env-var values never appear in any evidence or serialized incident | `[test]` | J4.6 |
 
-**Exit criteria:** a failed production deployment yields an incident naming the deployment, the
-commit, the changed files and the build error — with no secret values anywhere in the record.
+**Status: complete.** All tasks ✅ except J4.3 (runtime errors), which is limited by plan-dependent
+log retention and is documented rather than assumed — see `JARVIS_ARCHITECTURE.md` §11.
+
+**Exit criteria — met**, against recorded fixtures. A test asserts no method on `VercelSource`
+returns an environment-variable value.
 
 ---
 
@@ -151,8 +168,11 @@ commit, the changed files and the build error — with no secret values anywhere
 | J5.7 | Write-guard: SQL verb denylist (`DROP`, `TRUNCATE`, `DELETE`, `ALTER … DISABLE ROW LEVEL SECURITY`, `GRANT`, …), gated behind `allow_production_writes` which defaults to `false` and additionally requires the `db:write` capability | `[new]` | J1.10 |
 | J5.8 | `[test]` `respx` fixtures; explicit tests that every write verb is refused when the gate is off | `[test]` | J5.1–J5.7 |
 
-**Exit criteria:** JARVIS reports backend health and surfaces auth/RLS/function errors, and every
-attempted destructive statement is refused by default with an audited denial.
+**Status: complete.** All tasks ✅.
+
+**Exit criteria — met.** The guard separates "never allowed" (DROP, TRUNCATE, RLS changes, GRANT,
+auth schema, vault) from "gated" (ordinary writes), and the never-allowed set has no override.
+Comment-stripping and statement-splitting defeat the obvious evasions.
 
 ---
 
@@ -178,9 +198,13 @@ attempted destructive statement is refused by default with an audited denial.
 | J6.13 | `[test]` `FakeCodeAgent` (mirrors `tests/agents/fake_engine.py`) driving the whole loop deterministically: happy path, no-diff, tests-fail, **claims-success-but-verification-fails**, attempts-exhausted, policy-denied | `[test]` | J6.6–J6.11 |
 | J6.14 | `[test]` Assert the loop never marks an incident `RESOLVED` on Claude's assertion alone | `[test]` | J6.13 |
 
-**Exit criteria:** a seeded bug in a test application is detected, briefed, repaired, tested, previewed,
-independently verified and turned into a PR — and a *deliberately wrong* fix is caught by verification
-and escalated after three attempts.
+**Status: complete**, with J6.0 resolved in favour of option (b): `ClaudeCliAgent` drives the
+`claude` CLI headlessly, so the broken bundled Node runner is bypassed rather than repaired.
+
+**Exit criteria — met in test**, using `FakeCodeAgent` rather than a live Claude Code session (no
+target application is configured). `test_agent_claims_success_but_verification_fails` covers the
+deliberately-wrong-fix case: three confident claims, three failed verifications, escalation to
+HUMAN_REQUIRED.
 
 ---
 
@@ -198,8 +222,10 @@ and escalated after three attempts.
 | J7.6 | `[extend]` Add JARVIS env-var names to `TOOL_CREDENTIALS` in `core/credentials.py` for `jarvis connect`/`jarvis doctor` | `[extend]` | — |
 | J7.7 | `[test]` Template rendering, redaction, routing, dedup and rate capping with a fake channel | `[test]` | J7.3–J7.5 |
 
-**Exit criteria:** the full incident lifecycle is narrated to Telegram, no message ever contains a
-secret, and a storm of 50 incidents produces a bounded number of messages.
+**Status: complete.** All tasks ✅.
+
+**Exit criteria — met**, with a fake channel rather than a live bot. The 50-incident storm test
+asserts the cap holds; CRITICAL and human-required messages bypass it deliberately.
 
 ---
 
@@ -219,8 +245,14 @@ secret, and a storm of 50 incidents produces a bounded number of messages.
 | J8.8 | Crash resilience: mid-flight incidents resume on restart; in-flight branches reconciled | `[new]` | J1.8, J6.10 |
 | J8.9 | `[test]` Long-running simulation over a fake clock: flapping, storms, breaker trips, restart mid-repair | `[test]` | J8.1–J8.8 |
 
-**Exit criteria:** JARVIS runs for a sustained period against a live target without spamming, without
-unsafe action, and resumes cleanly across restarts.
+**Status: partially complete.** J8.1–J8.3 and J8.8 are ✅ (cadence, jitter, tick isolation, circuit
+breakers, restart-safe persistence). **J8.4 (rollback), J8.5 (auto-deploy allowlist execution),
+J8.6 (flapping/clustering) and J8.7 (post-incident reports) are NOT implemented** — the policy gate
+for auto-deploy exists and refuses correctly, but nothing acts on an allow verdict, and there is no
+rollback executor.
+
+**Exit criteria — not met.** A sustained run against a live target has not happened, because no
+target is configured.
 
 ---
 
@@ -238,8 +270,19 @@ unsafe action, and resumes cleanly across restarts.
 | J9.6 | Voice — explicitly deferred; the `speech/` primitive exists, but this is out of scope until Phase 9 lands | `[docs]` | J9.5 |
 | J9.7 | `[test]` Route tests with the existing FastAPI test client; frontend build passes | `[test]` | J9.1–J9.4 |
 
-**Exit criteria:** the owner can see everything JARVIS knows and did, and issue safe commands, without
-reading a log file.
+**Status: partially complete.** J9.1, J9.3, J9.4 and J9.7 are ✅ as a read-only API plus a
+self-contained dashboard page at `/reliability`. **J9.2 (live SSE/WebSocket updates) and J9.5
+(conversational interface) are NOT implemented**; the page polls every 30s instead. J9.6 (voice)
+remains explicitly out of scope.
+
+**Design note.** The dashboard is a server-rendered page rather than a React route, so it works
+without a Node toolchain or `npm run build`. It reads the same endpoints a React page would, so
+porting it into the SPA later needs no API change.
+
+**Security note.** The API surface is GET-only, asserted by a test: an HTTP endpoint that can
+trigger a production repair is a far larger attack surface than one that cannot. Evidence artifacts
+are served through a path-validated endpoint so a crafted incident record cannot read arbitrary
+host files.
 
 ---
 
@@ -277,8 +320,9 @@ calls that the sandbox's egress proxy blocks:
 
 **Effective baseline for JARVIS work: 7323 passed, 0 genuine failures.** Every phase must match this.
 
-After Phase 1: **7465 passed, 56 skipped**, same 4 environmental failures — 142 net new tests, no
-regressions.
+After Phase 1: **7465 passed** (+142 tests).
+After Phase 9: **7929 passed, 56 skipped**, same 4 environmental failures — 606 net new tests, no
+regressions. The `browser` lane adds 12 more, run separately with `-m browser`.
 
 Two environmental notes for anyone reproducing it:
 
