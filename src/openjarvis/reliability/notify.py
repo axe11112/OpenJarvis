@@ -20,7 +20,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from openjarvis.reliability.types import (
     Incident,
@@ -34,10 +34,12 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "ConsoleNotifier",
     "NotificationRouter",
+    "MultiNotifier",
     "Notifier",
     "TelegramNotifier",
     "render_alert",
     "render_human_required",
+    "render_recovered",
     "render_progress",
     "render_resolved",
     "render_rolled_back",
@@ -143,6 +145,40 @@ def render_resolved(
         ]
     if incident.resolution.pr_url:
         lines += ["", f"Pull request: {incident.resolution.pr_url}"]
+    return "\n".join(lines)
+
+
+def render_recovered(
+    incident: Incident,
+    *,
+    recovery_type: Any = None,
+    persona: bool = True,
+) -> str:
+    """Render a recovery notice.
+
+    Says plainly whether JARVIS did anything. Claiming a transient failure as a
+    fix would make JARVIS look more effective than it is, which is the kind of
+    flattery that gets a system trusted past its competence.
+    """
+    value = getattr(recovery_type, "value", str(recovery_type or "UNKNOWN"))
+    external = value == "RECOVERED_EXTERNALLY"
+    lines = [
+        "\U0001f7e2 JARVIS",
+        "",
+        _sir(persona, f"Incident {incident.id} recovered."),
+        "",
+        f"Component: {incident.component}",
+        f"Severity: {incident.severity.value}",
+        f"Occurrences: {incident.occurrences}",
+        "",
+        (
+            "No repair was required — the failure stopped reproducing on its own."
+            if external
+            else "The verified repair holds."
+        ),
+        "",
+        "Production: UNCHANGED",
+    ]
     return "\n".join(lines)
 
 
@@ -277,6 +313,45 @@ class TelegramNotifier(Notifier):
             return False
 
 
+class MultiNotifier(Notifier):
+    """Fans a message out to several transports.
+
+    Delivery is best-effort per transport: one provider being down must not
+    stop the others, and the result is ``True`` when *any* of them delivered.
+    An escalation the owner never sees is the same as no escalation.
+
+    **On SMS and voice.** The brief for this phase asks that these remain
+    possible without being invented. They are: a provider only has to implement
+    :meth:`Notifier.send`. None ships here, because every SMS and voice gateway
+    worth relying on is a paid third-party service, and shipping a fake one
+    would be worse than shipping nothing — it would look like coverage. See
+    ``docs/JARVIS_RELIABILITY.md``.
+    """
+
+    notifier_id = "multi"
+
+    def __init__(self, notifiers: Sequence[Notifier]) -> None:
+        self._notifiers = list(notifiers)
+
+    def send(self, message: str, *, severity: Severity = Severity.MEDIUM) -> bool:
+        """Deliver through every transport, reporting whether any succeeded."""
+        delivered = False
+        for notifier in self._notifiers:
+            try:
+                delivered = bool(notifier.send(message, severity=severity)) or delivered
+            except Exception:
+                logger.exception(
+                    "notifier %s failed; continuing",
+                    getattr(notifier, "notifier_id", "unknown"),
+                )
+        return delivered
+
+    @property
+    def notifiers(self) -> List[Notifier]:
+        """The underlying transports."""
+        return list(self._notifiers)
+
+
 # ---------------------------------------------------------------------------
 # Routing
 # ---------------------------------------------------------------------------
@@ -392,6 +467,15 @@ class NotificationRouter:
                 attempt=attempt,
                 verification=verification,
                 persona=self.persona,
+            ),
+            severity=incident.severity,
+        )
+
+    def recovered(self, incident: Incident, *, recovery_type: Any = None) -> bool:
+        """Notify that an incident cleared, saying whether JARVIS did it."""
+        return self.notify(
+            render_recovered(
+                incident, recovery_type=recovery_type, persona=self.persona
             ),
             severity=incident.severity,
         )

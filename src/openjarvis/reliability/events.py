@@ -39,7 +39,44 @@ RELIABILITY_VERIFICATION = "reliability_verification"
 #: A safety policy refused an action.
 RELIABILITY_POLICY_DENIED = "reliability_policy_denied"
 
+#: The 24/7 watcher started.
+RELIABILITY_WATCH_STARTED = "reliability_watch_started"
+
+#: The watcher stopped, whether cleanly or by emergency stop.
+RELIABILITY_WATCH_STOPPED = "reliability_watch_stopped"
+
+#: A repeat failure was folded into an existing incident rather than opening a
+#: new one.  Recorded so "we saw this 400 times" is auditable.
+RELIABILITY_INCIDENT_DEDUPED = "reliability_incident_deduped"
+
+#: A check was found to be alternating between pass and fail.
+RELIABILITY_FLAPPING_DETECTED = "reliability_flapping_detected"
+
+#: An incident was found mid-repair after a restart and parked for a human.
+RELIABILITY_RECOVERY_REQUIRED = "reliability_recovery_required"
+
+#: A failure stopped reproducing without JARVIS having changed anything.
+RELIABILITY_RECOVERED_EXTERNALLY = "reliability_recovered_externally"
+
+#: A pull request was opened for a verified repair.
+RELIABILITY_PR_CREATED = "reliability_pr_created"
+
+#: An incident was handed to a human.
+RELIABILITY_HUMAN_REQUIRED = "reliability_human_required"
+
+#: A post-incident report was generated.
+RELIABILITY_REPORT_GENERATED = "reliability_report_generated"
+
 __all__ = [
+    "RELIABILITY_FLAPPING_DETECTED",
+    "RELIABILITY_HUMAN_REQUIRED",
+    "RELIABILITY_INCIDENT_DEDUPED",
+    "RELIABILITY_PR_CREATED",
+    "RELIABILITY_RECOVERED_EXTERNALLY",
+    "RELIABILITY_RECOVERY_REQUIRED",
+    "RELIABILITY_REPORT_GENERATED",
+    "RELIABILITY_WATCH_STARTED",
+    "RELIABILITY_WATCH_STOPPED",
     "RELIABILITY_INCIDENT_OPENED",
     "RELIABILITY_INCIDENT_RECURRENCE",
     "RELIABILITY_INCIDENT_TRANSITION",

@@ -1,6 +1,6 @@
 # JARVIS Roadmap
 
-**Status:** Phases 1–10 and 12 implemented. Completed tasks are marked ✅; anything unmarked or
+**Status:** Phases 1–10, 12 and 14 implemented. Completed tasks are marked ✅; anything unmarked or
 explicitly deferred is called out as such.
 
 **Partially exercised against real infrastructure.** As of Phase 10, **GitHub is the only
@@ -396,6 +396,62 @@ remains barred from automatic deployment. This is called out in
 
 ---
 
+## Phase 14 — 24/7 autonomous monitoring and repair
+
+Turn the repair pipeline into something that can run unattended for weeks. The
+work is almost entirely about **refusals**: an autonomous system earns its
+autonomy by what it declines to do.
+
+| ID | Task | Type | Status |
+|---|---|---|---|
+| J14.1 | `watch.py` — startup safety gate, crash recovery, repair admission, emergency stop | `[new]` | ✅ |
+| J14.2 | `flapping.py` — pass/fail alternation detection over a sliding window | `[new]` | ✅ |
+| J14.3 | `severity.py` — deterministic severity rules; the declared severity is a floor, never a ceiling | `[new]` | ✅ |
+| J14.4 | `escalation.py` — bounded reminders for unresolved CRITICAL incidents | `[new]` | ✅ |
+| J14.5 | `report.py` — post-incident reports built from the record alone | `[new]` | ✅ |
+| J14.6 | `RECOVERY_REQUIRED` state; `RecoveryType` on `Resolution` | `[extend]` | ✅ |
+| J14.7 | External-recovery detection — `RECOVERED_EXTERNALLY`, no repair | `[extend]` | ✅ |
+| J14.8 | Repair admission wired into the monitor; fingerprint-keyed cooldowns | `[extend]` | ✅ |
+| J14.9 | Pre-pull-request security sweep | `[extend]` | ✅ |
+| J14.10 | `MultiNotifier`, recovery notices, escalation | `[extend]` | ✅ |
+| J14.11 | CLI: `incidents`, `repair`, `stop`, `report`; `watch` rewired | `[extend]` | ✅ |
+| J14.12 | `[reliability.watch]`, `[reliability.flapping]`, `[reliability.notification]` | `[extend]` | ✅ |
+| J14.13 | Dashboard: watch state, flapping, recovery-required, report endpoint | `[extend]` | ✅ |
+| J14.14 | Four controlled end-to-end scenarios | `[test]` | ✅ |
+| J14.15 | [`JARVIS_RELIABILITY.md`](JARVIS_RELIABILITY.md) | `[docs]` | ✅ |
+| J14.16 | SMS / voice notification providers | `[decision]` | **not implemented, deliberately** |
+| J14.17 | Run the loop against live infrastructure with the real `claude` CLI | `[test]` | **not done — needs live infrastructure** |
+
+**Status: complete as implementation; the live rehearsal still remains.**
+
+**The defect this phase found.** Writing the sustained-outage scenario surfaced a
+serious cost bug: a verified repair opens a pull request, but nothing merges
+automatically, so production stays broken and the probe keeps failing. Each
+failure was a genuinely new incident, so each one was repaired again. **One
+outage produced six pull requests in six ticks.** The repair gate now holds a
+cooldown keyed on the *fingerprint* after any repair that opened a pull request.
+Six became one.
+
+This is the second phase running in which the end-to-end test found something no
+amount of reading would have: the pattern is worth keeping.
+
+**On SMS and voice (J14.16).** Not implemented, and deliberately so. Every SMS
+and voice gateway worth relying on is a paid third-party service; shipping a stub
+would look like coverage while providing none. The `Notifier` interface is the
+extension point — a provider only has to implement `send`.
+
+**What the fixture proves.** `tests/reliability/test_watch_e2e.py` drives the
+real monitor, detector, store, git worktrees and project test suite through four
+sequences: successful repair to pull request; wrong fix ×3 to `HUMAN_REQUIRED`;
+fail→pass to `RECOVERED_EXTERNALLY` with no repair; and alternation to `FLAPPING`
+with no repair. In every one, the default branch is byte-identical afterwards.
+
+**What it does not prove.** Unchanged from Phase 12: the coding agent is scripted
+rather than the real `claude` CLI, and the "preview deployment" is the worktree
+rather than a Vercel build reached over HTTP.
+
+---
+
 ## Cross-cutting, every phase
 
 - No existing test removed or weakened.
@@ -436,6 +492,8 @@ regressions. The `browser` lane adds 12 more, run separately with `-m browser`.
 After Phase 10: **8031 passed, 56 skipped**, same 4 environmental failures — 708 net new tests, no
 regressions.
 After Phase 12: **8177 passed, 56 skipped**, same 4 environmental failures — 146 further tests, no
+regressions.
+After Phase 14: **8295 passed, 56 skipped**, same 4 environmental failures — 118 further tests, no
 regressions.
 
 Running the suite **unmarked** (without `-m "not live and not cloud and not hub"`) adds 20 further

@@ -1561,6 +1561,56 @@ class ReliabilityPolicyConfig:
 
 
 @dataclass(slots=True)
+class ReliabilityWatchConfig:
+    """The 24/7 supervisor.
+
+    ``enabled`` gates unattended operation; the watcher can still be started
+    explicitly with ``jarvis reliability watch`` for a supervised session.
+    """
+
+    enabled: bool = False
+    interval_seconds: int = 60
+    #: One repair at a time. Two coding agents in two worktrees producing two
+    #: pull requests for the same root cause is worse than a slower queue.
+    max_concurrent_repairs: int = 1
+    #: Wait this long before retrying a repair for an incident that just failed.
+    cooldown_seconds: int = 300
+    #: Park interrupted repairs on startup instead of resuming them.
+    recover_on_start: bool = True
+
+
+@dataclass(slots=True)
+class ReliabilityFlappingConfig:
+    """Detection of checks that alternate between pass and fail."""
+
+    enabled: bool = True
+    #: How many recent results to remember per probe.
+    window: int = 10
+    #: Pass->fail transitions inside the window that make it flapping. Counting
+    #: transitions rather than failures is deliberate: a long run of failures is
+    #: an outage and belongs on the repair path.
+    failure_threshold: int = 3
+    #: Never call something flapping before there is enough history to say so.
+    min_samples: int = 4
+
+
+@dataclass(slots=True)
+class ReliabilityNotificationConfig:
+    """Owner notification escalation."""
+
+    enabled: bool = False
+    #: Severity floor for routine notifications.
+    min_severity: str = "MEDIUM"
+    #: How long a CRITICAL incident may stay unresolved before JARVIS repeats
+    #: itself. 0 disables the reminder.
+    critical_escalation_minutes: int = 5
+    #: Providers to deliver through, in order. Only "telegram" and "console" are
+    #: implemented; SMS and voice need an external paid provider and are
+    #: deliberately absent (see docs/JARVIS_RELIABILITY.md).
+    providers: List[str] = field(default_factory=lambda: ["telegram"])
+
+
+@dataclass(slots=True)
 class ReliabilityNotifyConfig:
     """Owner notifications."""
 
@@ -1593,6 +1643,13 @@ class ReliabilityConfig:
     repair: ReliabilityRepairConfig = field(default_factory=ReliabilityRepairConfig)
     policy: ReliabilityPolicyConfig = field(default_factory=ReliabilityPolicyConfig)
     notify: ReliabilityNotifyConfig = field(default_factory=ReliabilityNotifyConfig)
+    watch: ReliabilityWatchConfig = field(default_factory=ReliabilityWatchConfig)
+    flapping: ReliabilityFlappingConfig = field(
+        default_factory=ReliabilityFlappingConfig
+    )
+    notification: ReliabilityNotificationConfig = field(
+        default_factory=ReliabilityNotificationConfig
+    )
 
 
 @dataclass(slots=True)

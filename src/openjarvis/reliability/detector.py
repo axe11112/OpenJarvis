@@ -18,22 +18,26 @@ import logging
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
-from openjarvis.reliability.events import RELIABILITY_INCIDENT_RECURRENCE
-from openjarvis.reliability.fingerprint import fingerprint
-from openjarvis.reliability.probes.executor import (
-    ConfirmationTracker,
-    escalate_severity,
+from openjarvis.reliability.events import (
+    RELIABILITY_INCIDENT_DEDUPED,
+    RELIABILITY_INCIDENT_RECURRENCE,
+    RELIABILITY_RECOVERED_EXTERNALLY,
 )
+from openjarvis.reliability.fingerprint import fingerprint
+from openjarvis.reliability.probes.executor import ConfirmationTracker
 from openjarvis.reliability.probes.spec import ProbeSpec
+from openjarvis.reliability.severity import classify
 from openjarvis.reliability.types import (
     Evidence,
     EvidenceKind,
     Incident,
     IncidentState,
     ProbeResult,
+    RecoveryType,
     Severity,
     Signal,
     TrustLevel,
+    now_iso,
 )
 
 logger = logging.getLogger(__name__)
@@ -121,7 +125,12 @@ class Detector:
                 reason=f"awaiting confirmation ({count}/{required})",
             )
 
-        severity = escalate_severity(spec, result)
+        # Severity is decided by deterministic rules over what was observed,
+        # never by a model, and never below what the operator declared.
+        classification = classify(
+            component=spec.component, result=result, declared=spec.severity
+        )
+        severity = classification.severity
         finger = fingerprint(
             component=spec.component,
             failure_kind=result.failure_kind,
@@ -131,11 +140,18 @@ class Detector:
 
         existing = self._store.find_by_fingerprint(finger)
         if existing is not None:
+            # One active incident per fingerprint. A homepage that fails every
+            # minute for an hour is one problem, not sixty.
             self._store.record_occurrence(existing)
             for item in result.evidence:
                 self._store.add_evidence(existing, item)
             self._publish(RELIABILITY_INCIDENT_RECURRENCE, existing)
-            return Detection(incident=existing, recurred=True)
+            self._publish(RELIABILITY_INCIDENT_DEDUPED, existing)
+            return Detection(
+                incident=existing,
+                recurred=True,
+                reason=f"occurrence {existing.occurrences} of a known failure",
+            )
 
         incident = Incident(
             fingerprint=finger,
@@ -153,6 +169,7 @@ class Detector:
                 "failure_kind": result.failure_kind,
                 "final_url": result.final_url,
                 "declared_severity": spec.severity.value,
+                "severity_rule": classification.to_dict(),
             },
         )
         for item in result.evidence:
@@ -178,22 +195,53 @@ class Detector:
                 continue
             if not incident.can_transition_to(IncidentState.RESOLVED):
                 continue
+            # Recovering without a JARVIS repair is a different fact from
+            # JARVIS having fixed it, and is recorded as such: otherwise JARVIS
+            # takes credit for every transient failure that cleared itself, and
+            # its real effectiveness becomes impossible to measure.
+            repaired = any(a.verified for a in incident.attempts)
+            recovery = (
+                RecoveryType.VERIFIED_REPAIR
+                if repaired
+                else RecoveryType.RECOVERED_EXTERNALLY
+            )
+            note = "Probe passed again; the failure no longer reproduces " + (
+                "after a verified JARVIS repair."
+                if repaired
+                else (
+                    "and no JARVIS repair was involved: it was fixed "
+                    "elsewhere, or was transient."
+                )
+            )
             self._store.add_evidence(
                 incident,
                 Evidence(
                     kind=EvidenceKind.NOTE,
-                    summary="Probe passed again; the failure no longer reproduces.",
+                    summary=note,
                     source="detector",
                     trust=TrustLevel.TRUSTED,
                 ),
             )
+            incident.resolution.recovery_type = recovery
+            incident.resolution.resolved_at = now_iso()
+            self._store.save(incident)
             self._store.transition(
                 incident,
                 IncidentState.RESOLVED,
-                reason="the probe passed again; the failure no longer reproduces",
+                reason=(
+                    "the probe passed again; "
+                    + (
+                        "the repair holds"
+                        if repaired
+                        else "recovered externally, no repair was required"
+                    )
+                ),
             )
-            logger.info("Incident %s self-resolved", incident.id)
-            return Detection(incident=incident, recovered=True)
+            logger.info("Incident %s resolved (%s)", incident.id, recovery.value)
+            if not repaired:
+                self._publish(RELIABILITY_RECOVERED_EXTERNALLY, incident)
+            self._notify_recovered(incident, recovery)
+            return Detection(incident=incident, recovered=True, reason=recovery.value)
         return Detection()
 
     # -- infrastructure signals -------------------------------------------
@@ -267,6 +315,17 @@ class Detector:
         """
         observed = result.error or "the workflow did not complete"
         return f"Probe '{spec.id}' did not pass. Observed: {observed}"
+
+    def _notify_recovered(self, incident: Incident, recovery: "RecoveryType") -> None:
+        """Tell the owner an incident cleared, and whether JARVIS did it."""
+        if self._notifier is None:
+            return
+        try:
+            self._notifier.recovered(incident, recovery_type=recovery)
+        except AttributeError:
+            pass
+        except Exception:
+            logger.exception("could not send a recovery notice for %s", incident.id)
 
     def _notify_alert(self, incident: Incident) -> None:
         if self._notifier is None:

@@ -8,7 +8,9 @@ opt-in flags, all off by default, and the diagnostic prints their state on every
 run so you can confirm it.
 
 Companion documents: [`JARVIS_ARCHITECTURE.md`](JARVIS_ARCHITECTURE.md) ·
-[`JARVIS_SECURITY.md`](JARVIS_SECURITY.md) · [`JARVIS_ROADMAP.md`](JARVIS_ROADMAP.md)
+[`JARVIS_SECURITY.md`](JARVIS_SECURITY.md) · [`JARVIS_ROADMAP.md`](JARVIS_ROADMAP.md) ·
+[`JARVIS_REPAIR_LOOP.md`](JARVIS_REPAIR_LOOP.md) ·
+[`JARVIS_RELIABILITY.md`](JARVIS_RELIABILITY.md)
 
 ---
 
@@ -225,6 +227,10 @@ failures only, and verifies the audit chain.
 ### Other commands
 
 ```bash
+jarvis reliability watch                  # the 24/7 loop (see JARVIS_RELIABILITY.md)
+jarvis reliability incidents              # incidents plus the safety posture
+jarvis reliability report <id>            # post-incident report
+jarvis reliability stop                   # emergency stop
 jarvis reliability notify-test            # one test message
 jarvis reliability probe list             # what is configured
 jarvis reliability probe run <id>         # run one probe now

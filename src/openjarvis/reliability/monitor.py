@@ -46,6 +46,8 @@ class MonitorStats:
     incidents_recovered: int = 0
     recurrences: int = 0
     suppressed: int = 0
+    flapping: int = 0
+    repairs_deferred: int = 0
 
     def to_dict(self) -> Dict[str, int]:
         """Serialize to a plain dict."""
@@ -56,6 +58,8 @@ class MonitorStats:
             "incidents_recovered": self.incidents_recovered,
             "recurrences": self.recurrences,
             "suppressed": self.suppressed,
+            "flapping": self.flapping,
+            "repairs_deferred": self.repairs_deferred,
         }
 
 
@@ -94,6 +98,11 @@ class ReliabilityMonitor:
     repair_loop:
         Optional repair loop.  When absent, JARVIS monitors and notifies but
         never modifies code.
+    supervisor:
+        Optional :class:`~openjarvis.reliability.watch.WatchSupervisor`.  When
+        present it decides whether a repair may start at all — concurrency,
+        cooldown, flapping and the emergency stop all live there, so that the
+        monitor stays a scheduler rather than growing a policy engine.
     clock:
         Injected for tests.
     """
@@ -109,6 +118,7 @@ class ReliabilityMonitor:
         repair_loop: Any = None,
         notifier: Any = None,
         bus: Any = None,
+        supervisor: Any = None,
         clock: Callable[[], float] = time.monotonic,
         jitter: Callable[[], float] = random.random,
     ) -> None:
@@ -117,6 +127,7 @@ class ReliabilityMonitor:
         self._repair_loop = repair_loop
         self._notifier = notifier
         self._bus = bus
+        self._supervisor = supervisor
         self._clock = clock
         self.stats = MonitorStats()
         self._specs: Dict[str, ProbeSpec] = {}
@@ -238,10 +249,34 @@ class ReliabilityMonitor:
 
     def _run_probe(self, spec: ProbeSpec) -> None:
         result = self._executor.run(spec)
+        verdict = None
+        if self._supervisor is not None:
+            verdict = self._supervisor.record_result(spec.id, failed=not result.success)
         detection = self._detector.from_probe(spec, result)
         self._account(detection)
-        if detection.opened and detection.incident is not None:
-            self._maybe_repair(detection.incident, spec)
+        incident = detection.incident
+        if incident is None:
+            return
+
+        # A check that alternates is intermittent, not broken. Sending it to a
+        # coding agent spends a Claude session chasing a failure that has
+        # already cleared, and verification then "passes" for the wrong reason.
+        if (
+            verdict is not None
+            and verdict.flapping
+            and (detection.opened or detection.recurred)
+        ):
+            self.stats.flapping += 1
+            if self._supervisor.escalate_flapping(incident, verdict):
+                logger.warning(
+                    "probe %s is flapping; escalating %s instead of repairing",
+                    spec.id,
+                    incident.id,
+                )
+            return
+
+        if detection.opened:
+            self._maybe_repair(incident, spec)
 
     def _poll_source(self, source: Any) -> None:
         signals = source.poll()
@@ -259,14 +294,43 @@ class ReliabilityMonitor:
             self.stats.suppressed += 1
 
     def _maybe_repair(self, incident: Any, spec: ProbeSpec) -> None:
-        """Hand a fresh incident to the repair loop, if one is configured."""
+        """Hand a fresh incident to the repair loop, if one is configured.
+
+        Admission is the supervisor's decision, not this method's: concurrency,
+        cooldown after a failed attempt, and the emergency stop are operational
+        state that outlives any one tick.
+        """
         if self._repair_loop is None:
             return
+
+        gate = getattr(self._supervisor, "gate", None)
+        fingerprint = getattr(incident, "fingerprint", "")
+        if gate is not None:
+            allowed, reason = gate.may_start(incident.id, fingerprint=fingerprint)
+            if not allowed:
+                logger.info("not repairing %s: %s", incident.id, reason)
+                self.stats.repairs_deferred += 1
+                return
+            if not gate.start(incident.id, fingerprint=fingerprint):
+                self.stats.repairs_deferred += 1
+                return
+
+        outcome = None
         try:
             outcome = self._repair_loop.run(incident, spec)
         except Exception:
             logger.exception("repair loop raised for %s", incident.id)
             return
+        finally:
+            if gate is not None:
+                gate.finish(
+                    incident.id,
+                    fingerprint=fingerprint,
+                    succeeded=bool(outcome is not None and outcome.resolved),
+                    opened_pull_request=bool(
+                        outcome is not None and outcome.pull_request_url
+                    ),
+                )
         if self._notifier is None:
             return
         try:

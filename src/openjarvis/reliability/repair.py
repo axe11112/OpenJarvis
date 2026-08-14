@@ -33,13 +33,19 @@ from openjarvis.reliability.briefing import (
 from openjarvis.reliability.checks import CheckSuite, CheckSuiteResult
 from openjarvis.reliability.code_agent import CodeAgent, CodeAgentError
 from openjarvis.reliability.events import (
+    RELIABILITY_PR_CREATED,
     RELIABILITY_REPAIR_ATTEMPT_END,
     RELIABILITY_REPAIR_ATTEMPT_START,
     RELIABILITY_VERIFICATION,
 )
 from openjarvis.reliability.policy import SafetyPolicy
 from openjarvis.reliability.probes.spec import ProbeSpec
-from openjarvis.reliability.scope import ScopeLimits, assess_scope, find_test_files
+from openjarvis.reliability.scope import (
+    ScopeLimits,
+    ScopeVerdict,
+    assess_scope,
+    find_test_files,
+)
 from openjarvis.reliability.types import (
     Evidence,
     EvidenceKind,
@@ -450,7 +456,33 @@ class RepairLoop:
         attempt: RepairAttempt,
         verification: Optional[VerificationResult],
     ) -> RepairOutcome:
-        """Handle a verified repair: PR by default, deploy only if permitted."""
+        """Handle a verified repair: PR by default, deploy only if permitted.
+
+        A final security sweep runs before the pull request is opened. It
+        re-checks what was already checked earlier in the attempt, deliberately:
+        the earlier check ran before the commit, and this is the last moment
+        before the change becomes visible outside this machine. Re-checking a
+        few globs is cheap; publishing a branch containing a credential is not.
+        """
+        sweep = self._security_sweep(incident, attempt)
+        if not sweep.allowed:
+            self._add_note(
+                incident,
+                "Pre-PR security check failed",
+                content=sweep.reason,
+            )
+            self._escalate(
+                incident, f"the pre-pull-request security check failed: {sweep.reason}"
+            )
+            return RepairOutcome(
+                resolved=False,
+                attempts=incident.attempts_used,
+                final_state=incident.state,
+                reason=f"the pre-pull-request security check failed: {sweep.reason}",
+                branch=attempt.branch,
+                verification=verification,
+            )
+
         deploy = self.policy.may_deploy(
             incident,
             verification,
@@ -468,6 +500,12 @@ class RepairLoop:
                     labels=["jarvis"],
                 )
                 pull_request_url = created.get("url", "")
+                self._publish(
+                    RELIABILITY_PR_CREATED,
+                    incident,
+                    url=pull_request_url,
+                    branch=attempt.branch,
+                )
             except Exception as exc:
                 logger.warning("could not open a pull request: %s", exc)
 
@@ -520,6 +558,48 @@ class RepairLoop:
             attempts=incident.attempts_used,
             max_attempts=self.policy.max_attempts,
         )
+
+    def _security_sweep(
+        self, incident: Incident, attempt: RepairAttempt
+    ) -> ScopeVerdict:
+        """Last check before anything leaves the machine.
+
+        Four questions, all of which must be answerable from what JARVIS already
+        recorded rather than from the agent's account: does the diff touch
+        anything forbidden, does the branch name identify this incident, does
+        any recorded text still contain a credential, and is the branch
+        something other than the default branch.
+        """
+        verdict = assess_scope(
+            attempt.changed_files,
+            limits=self.scope_limits,
+            lines_changed=attempt.lines_changed_total,
+            protected_paths=self.protected_paths,
+        )
+
+        extra: List[str] = []
+
+        expected_branch = self._branch_name(incident)
+        if attempt.branch != expected_branch:
+            extra.append(
+                f"the branch is '{attempt.branch}', expected '{expected_branch}'"
+            )
+        if attempt.branch == self.base_branch:
+            extra.append("the repair branch is the default branch")
+
+        # The claim is redacted on the way in; if a secret is still visible here
+        # the redaction failed and the pull request must not be opened.
+        for label, text in (
+            ("the agent's summary", attempt.claim),
+            ("the check summary", attempt.test_summary),
+        ):
+            if text and text != redact_secrets(text):
+                extra.append(f"a credential is still present in {label}")
+
+        if extra:
+            verdict.allowed = False
+            verdict.reasons.extend(extra)
+        return verdict
 
     # -- attempt helpers --------------------------------------------------
 

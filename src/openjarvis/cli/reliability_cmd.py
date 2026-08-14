@@ -176,11 +176,39 @@ def _build_policy(config: Any) -> Any:
     )
 
 
+def _stop_flag_path(config: Any) -> Any:
+    """Where the emergency stop flag lives.
+
+    A file rather than a signal or a socket: it survives a restart, which is the
+    behaviour an operator wants from a stop they pulled in a panic. JARVIS must
+    not quietly come back on because the host rebooted.
+    """
+    from pathlib import Path
+
+    from openjarvis.core.config import get_config_dir
+
+    configured = config.reliability.db_path
+    if configured:
+        return Path(configured).expanduser().parent / "STOPPED"
+    return get_config_dir() / "reliability" / "STOPPED"
+
+
 def _build_monitor(config: Any, store: Any) -> Any:
     """Assemble the full monitoring stack from config."""
+    return _build_supervised_monitor(config, store)[0]
+
+
+def _build_supervised_monitor(config: Any, store: Any) -> tuple:
+    """Build the monitor and its supervisor together.
+
+    They are built as a pair because each needs the other: the supervisor gates
+    the monitor's repairs, and the supervisor reports the monitor's health.
+    """
     from openjarvis.reliability.detector import Detector
+    from openjarvis.reliability.flapping import FlappingDetector
     from openjarvis.reliability.monitor import ReliabilityMonitor
     from openjarvis.reliability.probes.spec import load_probes
+    from openjarvis.reliability.watch import RepairGate, WatchSupervisor
 
     rc = config.reliability
     notifier = _build_notifier(config)
@@ -192,14 +220,34 @@ def _build_monitor(config: Any, store: Any) -> Any:
         environment=rc.site.environment,
         notifier=notifier,
     )
-    return ReliabilityMonitor(
+    supervisor = WatchSupervisor(
+        monitor=None,  # set below, once the monitor exists
+        store=store,
+        gate=RepairGate(
+            max_concurrent=rc.watch.max_concurrent_repairs,
+            cooldown_seconds=float(rc.watch.cooldown_seconds),
+        ),
+        flapping=FlappingDetector(
+            window=rc.flapping.window,
+            failure_threshold=rc.flapping.failure_threshold,
+            min_samples=rc.flapping.min_samples,
+        )
+        if rc.flapping.enabled
+        else FlappingDetector(window=2, failure_threshold=10**6, min_samples=10**6),
+        notifier=notifier,
+        interval_seconds=float(rc.watch.interval_seconds),
+    )
+    monitor = ReliabilityMonitor(
         detector=detector,
         executor=_build_executor(config),
         specs=specs,
         sources=sources,
         repair_loop=_build_repair_loop(config, store, sources),
         notifier=notifier,
+        supervisor=supervisor,
     )
+    supervisor.monitor = monitor
+    return monitor, supervisor
 
 
 def _build_repair_loop(config: Any, store: Any, sources: list) -> Any:
@@ -364,7 +412,11 @@ def reliability_status() -> None:
     "--poll-interval", default=5.0, show_default=True, help="Seconds between ticks."
 )
 def reliability_watch(once: bool, poll_interval: float) -> None:
-    """Run the monitoring loop in the foreground."""
+    """Run the 24/7 monitoring loop in the foreground.
+
+    Refuses to start in a configuration where automatic repair could reach
+    production. Prints every safety interlock before the first check.
+    """
     console = Console()
     config = _load_config()
     rc = config.reliability
@@ -373,9 +425,35 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
         console.print("[red]No site configured; set [reliability.site] base_url.[/red]")
         raise SystemExit(1)
 
+    from openjarvis.reliability.watch import (
+        UnsafeConfigurationError,
+        assert_safe_to_start,
+        startup_banner,
+    )
+
+    stop_flag = _stop_flag_path(config)
+    if stop_flag.exists():
+        console.print(
+            "[bold red]JARVIS is stopped.[/bold red]\n\n"
+            "An emergency stop is in effect. Nothing has been lost — incidents, "
+            "evidence and audit records are intact.\n"
+            f"Remove {escape(str(stop_flag))} to start again."
+        )
+        raise SystemExit(3)
+
+    # Before anything else: refuse to run in a configuration that could reach
+    # production. A dangerous combination is best discovered here, not at 3am.
+    try:
+        assert_safe_to_start(config)
+    except UnsafeConfigurationError as exc:
+        console.print(f"[bold red]{escape(str(exc))}[/bold red]")
+        raise SystemExit(2) from exc
+
+    console.print(escape(startup_banner(config)))
+
     store = _get_store(config)
     try:
-        monitor = _build_monitor(config, store)
+        monitor, supervisor = _build_supervised_monitor(config, store)
         if not monitor.checks:
             console.print(
                 "[yellow]Nothing to monitor: no enabled probes and no enabled "
@@ -387,30 +465,217 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
             f"JARVIS monitoring {escape(rc.site.base_url)} "
             f"({len(monitor.checks)} check(s))."
         )
-        if rc.repair.enabled:
+
+        # Crash recovery: park anything that was mid-repair when we last
+        # stopped. Nothing is resumed automatically.
+        parked = supervisor.recover_interrupted_repairs()
+        for incident in parked:
             console.print(
-                f"[yellow]Automated repair is ENABLED "
-                f"(deploy_mode={escape(rc.policy.deploy_mode)}).[/yellow]"
+                f"[yellow]{escape(incident.id)} was interrupted mid-repair and "
+                "now needs manual recovery (RECOVERY_REQUIRED).[/yellow]"
             )
-        else:
-            console.print("[dim]Automated repair is disabled; monitoring only.[/dim]")
 
         if once:
             ran = monitor.tick()
             console.print(f"Ran {ran} check(s).")
         else:
             try:
-                monitor.run_forever(poll_interval=poll_interval)
+                supervisor.run_forever()
             except KeyboardInterrupt:
                 console.print("\nStopped.")
+                supervisor.stop()
 
         stats = monitor.health()
         console.print(
             f"Incidents opened: {stats['incidents_opened']} · "
             f"recovered: {stats['incidents_recovered']} · "
             f"recurrences: {stats['recurrences']} · "
-            f"suppressed: {stats['suppressed']}"
+            f"suppressed: {stats['suppressed']} · "
+            f"flapping: {stats['flapping']} · "
+            f"repairs deferred: {stats['repairs_deferred']}"
         )
+    finally:
+        store.close()
+
+
+@reliability.command("incidents")
+@click.option("--open", "open_only", is_flag=True, help="Only unresolved incidents.")
+@click.option("--limit", default=20, show_default=True, help="How many to show.")
+def reliability_incidents(open_only: bool, limit: int) -> None:
+    """Show incidents alongside the state of monitoring and repair.
+
+    The same data as ``incident list``, plus the safety context a human needs
+    to act on it: is monitoring running, is repair armed, can anything reach
+    production.
+    """
+    console = Console()
+    config = _load_config()
+    rc = config.reliability
+    store = _get_store(config)
+    try:
+        header = Table(title="JARVIS", show_header=False, box=None)
+        header.add_row("Monitoring", "armed" if rc.watch.enabled else "manual")
+        header.add_row("Automatic repair", "ON" if rc.repair.enabled else "OFF")
+        header.add_row("Production deployment", "OFF")
+        header.add_row("Automatic merge", "OFF")
+        header.add_row("Deploy mode", escape(rc.policy.deploy_mode))
+        console.print(header)
+
+        incidents = store.list(open_only=open_only, limit=limit)
+        if not incidents:
+            console.print("\nNo incidents found.")
+            return
+
+        table = Table(title="Incidents")
+        for column in ("ID", "Severity", "State", "Component", "Seen", "Title"):
+            table.add_column(column)
+        for incident in incidents:
+            table.add_row(
+                incident.id,
+                _severity_text(incident.severity.value),
+                _state_text(incident.state.value),
+                escape(incident.component),
+                str(incident.occurrences),
+                escape(incident.title[:60]),
+            )
+        console.print(table)
+
+        needs_recovery = [i for i in incidents if i.state.value == "RECOVERY_REQUIRED"]
+        if needs_recovery:
+            console.print(
+                "\n[yellow]"
+                + escape(
+                    f"{len(needs_recovery)} incident(s) were interrupted mid-repair "
+                    "and will NOT resume automatically: "
+                    + ", ".join(i.id for i in needs_recovery)
+                )
+                + "[/yellow]"
+            )
+    finally:
+        store.close()
+
+
+@reliability.command("repair")
+@click.argument("incident_id")
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Skip the confirmation prompt.",
+)
+def reliability_repair(incident_id: str, yes: bool) -> None:
+    """Run one repair attempt for an incident, explicitly.
+
+    This is the deliberate counterpart to autonomous repair: it is how an owner
+    resumes an incident parked in RECOVERY_REQUIRED, or repairs one that policy
+    would not have picked up on its own. It still cannot merge, deploy, or push
+    to the default branch — those refusals live in the policy, not in this
+    command.
+    """
+    console = Console()
+    config = _load_config()
+    rc = config.reliability
+
+    if not rc.repair.enabled:
+        console.print(
+            "[red]Automated repair is disabled. Set [reliability.repair] "
+            "enabled = true to allow it.[/red]"
+        )
+        raise SystemExit(1)
+
+    store = _get_store(config)
+    try:
+        incident = store.get(incident_id)
+        if incident is None:
+            console.print(f"[red]No such incident: {escape(incident_id)}[/red]")
+            raise SystemExit(1)
+
+        from openjarvis.reliability.probes.spec import load_probes
+
+        spec = next(
+            (s for s in load_probes(_probe_dir(config)) if s.id == incident.probe_id),
+            None,
+        )
+        if spec is None:
+            console.print(
+                f"[red]No probe spec '{escape(incident.probe_id)}' for "
+                f"{escape(incident.id)}. Verification re-runs the probe that "
+                "detected the failure, so a repair cannot be verified without "
+                "it.[/red]"
+            )
+            raise SystemExit(1)
+
+        console.print(f"Incident: {escape(incident.id)} — {escape(incident.title)}")
+        console.print(f"State: {_state_text(incident.state.value)}")
+        console.print("Endpoint: a pull request. Production is never modified.")
+        if not yes and not click.confirm("Start a repair attempt?", default=False):
+            console.print("Cancelled.")
+            return
+
+        sources = _build_sources(config)
+        loop = _build_repair_loop(config, store, sources)
+        if loop is None:
+            console.print("[red]Could not build the repair loop.[/red]")
+            raise SystemExit(1)
+
+        outcome = loop.run(incident, spec)
+        console.print(
+            f"\nResolved: {'yes' if outcome.resolved else 'no'} · "
+            f"attempts: {outcome.attempts} · state: {outcome.final_state.value}"
+        )
+        if outcome.reason:
+            console.print(f"Reason: {escape(outcome.reason)}")
+        if outcome.pull_request_url:
+            console.print(f"Pull request: {escape(outcome.pull_request_url)}")
+        raise SystemExit(0 if outcome.resolved else 1)
+    finally:
+        store.close()
+
+
+@reliability.command("stop")
+def reliability_stop() -> None:
+    """Emergency stop: block new monitoring cycles and new repairs.
+
+    Deliberately non-destructive. Incidents, evidence, audit records, branches
+    and worktrees are all left exactly as they are — stopping must be a safe
+    thing to do in a panic, which means it must never delete anything.
+    """
+    console = Console()
+    config = _load_config()
+    path = _stop_flag_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"stopped_at={__import__('datetime').datetime.now().isoformat()}\n")
+    console.print(
+        "JARVIS STOPPED\n\n"
+        "Monitoring:   OFF\n"
+        "New repairs:  BLOCKED\n"
+        "Production:   UNCHANGED\n\n"
+        "Incidents, evidence, branches and audit records are untouched.\n"
+        f"Remove {escape(str(path))} to allow JARVIS to start again."
+    )
+
+
+@reliability.command("report")
+@click.argument("incident_id")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+def reliability_report(incident_id: str, as_json: bool) -> None:
+    """Print the post-incident report for an incident."""
+    import json as _json
+
+    from openjarvis.reliability.report import build_report
+
+    console = Console()
+    config = _load_config()
+    store = _get_store(config)
+    try:
+        incident = store.get(incident_id)
+        if incident is None:
+            console.print(f"[red]No such incident: {escape(incident_id)}[/red]")
+            raise SystemExit(1)
+        report = build_report(incident)
+        if as_json:
+            click.echo(_json.dumps(report.to_dict(), indent=2))
+        else:
+            console.print(escape(report.render()))
     finally:
         store.close()
 

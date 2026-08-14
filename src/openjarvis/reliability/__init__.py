@@ -21,13 +21,17 @@ from openjarvis.reliability.code_agent import CodeAgent, CodeAgentResult
 from openjarvis.reliability.correlate import correlate
 from openjarvis.reliability.detector import Detection, Detector
 from openjarvis.reliability.diagnostic import DiagnosticReport, LiveDiagnostic
+from openjarvis.reliability.escalation import EscalationPolicy, EscalationTracker
 from openjarvis.reliability.fingerprint import fingerprint, normalize_error
+from openjarvis.reliability.flapping import FlappingDetector, FlappingVerdict
 from openjarvis.reliability.health import CheckResult, HealthState
 from openjarvis.reliability.monitor import ReliabilityMonitor
 from openjarvis.reliability.notify import NotificationRouter, Notifier
 from openjarvis.reliability.policy import Decision, SafetyPolicy
 from openjarvis.reliability.repair import RepairLoop, RepairOutcome
+from openjarvis.reliability.report import IncidentReport, build_report
 from openjarvis.reliability.scope import ScopeLimits, ScopeVerdict, assess_scope
+from openjarvis.reliability.severity import Classification, classify
 from openjarvis.reliability.store import IncidentStore
 from openjarvis.reliability.target import (
     TargetConfig,
@@ -43,6 +47,7 @@ from openjarvis.reliability.types import (
     IncidentTransition,
     InvalidTransitionError,
     ProbeResult,
+    RecoveryType,
     RepairAttempt,
     Resolution,
     Severity,
@@ -51,9 +56,30 @@ from openjarvis.reliability.types import (
     VerificationResult,
 )
 from openjarvis.reliability.verify import Verifier
+from openjarvis.reliability.watch import (
+    RepairGate,
+    UnsafeConfigurationError,
+    WatchSupervisor,
+    assert_safe_to_start,
+    startup_banner,
+)
 from openjarvis.reliability.workspace import RepairWorkspace, WorkspaceError, Worktree
 
 __all__ = [
+    "startup_banner",
+    "classify",
+    "build_report",
+    "assert_safe_to_start",
+    "WatchSupervisor",
+    "UnsafeConfigurationError",
+    "RepairGate",
+    "RecoveryType",
+    "IncidentReport",
+    "FlappingVerdict",
+    "FlappingDetector",
+    "EscalationTracker",
+    "EscalationPolicy",
+    "Classification",
     "assess_scope",
     "Worktree",
     "WorkspaceError",

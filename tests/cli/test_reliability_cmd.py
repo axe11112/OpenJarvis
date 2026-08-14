@@ -335,3 +335,140 @@ class TestAnalyzeCommand:
         assert result.exit_code == 0
         assert "Do NOT modify any file." in result.output
         assert "Root cause" in result.output
+
+
+class TestWatchStartupSafety:
+    """§21: refuse to start in a configuration that could reach production."""
+
+    def test_help(self):
+        result = CliRunner().invoke(cli, ["reliability", "watch", "--help"])
+        assert result.exit_code == 0
+        assert "24/7" in result.output
+
+    def test_refuses_repair_plus_default_branch_push(self, wired):
+        config, _ = wired
+        config.reliability.site.base_url = "https://example.test"
+        config.reliability.repair.enabled = True
+        config.reliability.repair.workspace = "/tmp/checkout"
+        config.reliability.policy.allow_push_to_default_branch = True
+
+        result = CliRunner().invoke(cli, ["reliability", "watch", "--once"])
+
+        assert result.exit_code == 2
+        assert "refuses to start" in result.output
+
+    def test_refuses_repair_plus_auto_deploy(self, wired):
+        config, _ = wired
+        config.reliability.site.base_url = "https://example.test"
+        config.reliability.repair.enabled = True
+        config.reliability.repair.workspace = "/tmp/checkout"
+        config.reliability.policy.deploy_mode = "auto_deploy_allowlisted"
+
+        result = CliRunner().invoke(cli, ["reliability", "watch", "--once"])
+
+        assert result.exit_code == 2
+        assert "production" in result.output
+
+    def test_safe_configuration_prints_the_interlocks(self, wired):
+        config, _ = wired
+        config.reliability.site.base_url = "https://example.test"
+        result = CliRunner().invoke(cli, ["reliability", "watch", "--once"])
+        # No probes are configured, so it exits 1 — but only after the banner.
+        assert "Production deployment" in result.output
+        assert "Automatic PR merge" in result.output
+
+
+class TestStopCommand:
+    """§35: a safe emergency stop."""
+
+    def test_stop_reports_what_it_did(self, wired):
+        result = CliRunner().invoke(cli, ["reliability", "stop"])
+        assert result.exit_code == 0
+        assert "JARVIS STOPPED" in result.output
+        assert "Production:   UNCHANGED" in result.output
+
+    def test_stop_does_not_delete_incidents(self, wired):
+        _, store = wired
+        incident = store.create(_incident())
+        CliRunner().invoke(cli, ["reliability", "stop"])
+        assert store.get(incident.id) is not None
+        assert store.verify_chain() == (True, None)
+
+    def test_watch_refuses_to_start_while_stopped(self, wired):
+        config, _ = wired
+        config.reliability.site.base_url = "https://example.test"
+        CliRunner().invoke(cli, ["reliability", "stop"])
+
+        result = CliRunner().invoke(cli, ["reliability", "watch", "--once"])
+
+        assert result.exit_code == 3
+        assert "JARVIS is stopped" in result.output
+
+
+class TestIncidentsCommand:
+    def test_reports_the_safety_posture(self, wired):
+        result = CliRunner().invoke(cli, ["reliability", "incidents"])
+        assert result.exit_code == 0
+        assert "Production deployment" in result.output
+        assert "Automatic merge" in result.output
+
+    def test_lists_incidents(self, wired):
+        _, store = wired
+        store.create(_incident())
+        result = CliRunner().invoke(cli, ["reliability", "incidents"])
+        assert "INC-00001" in result.output
+
+    def test_flags_incidents_needing_recovery(self, wired):
+        _, store = wired
+        incident = store.create(_incident())
+        for step in (
+            IncidentState.INVESTIGATING,
+            IncidentState.REPRODUCING,
+            IncidentState.FIXING,
+        ):
+            store.transition(incident, step)
+        store.transition(incident, IncidentState.RECOVERY_REQUIRED)
+
+        result = CliRunner().invoke(cli, ["reliability", "incidents"])
+
+        assert "will NOT resume automatically" in result.output
+
+
+class TestRepairCommand:
+    def test_refused_when_repair_is_disabled(self, wired):
+        result = CliRunner().invoke(cli, ["reliability", "repair", "INC-00001"])
+        assert result.exit_code == 1
+        assert "disabled" in result.output
+
+    def test_missing_incident_is_an_error(self, wired):
+        config, _ = wired
+        config.reliability.repair.enabled = True
+        result = CliRunner().invoke(cli, ["reliability", "repair", "INC-99999"])
+        assert result.exit_code == 1
+        assert "No such incident" in result.output
+
+
+class TestReportCommand:
+    def test_missing_incident_is_an_error(self, wired):
+        result = CliRunner().invoke(cli, ["reliability", "report", "INC-99999"])
+        assert result.exit_code == 1
+
+    def test_renders_a_report(self, wired):
+        _, store = wired
+        incident = store.create(_incident())
+        result = CliRunner().invoke(cli, ["reliability", "report", incident.id])
+        assert result.exit_code == 0
+        assert "INCIDENT REPORT" in result.output
+        assert "Not performed" in result.output
+
+    def test_json_output_is_parseable(self, wired):
+        import json
+
+        _, store = wired
+        incident = store.create(_incident())
+        result = CliRunner().invoke(
+            cli, ["reliability", "report", incident.id, "--json"]
+        )
+        payload = json.loads(result.output)
+        assert payload["incident_id"] == incident.id
+        assert payload["production_deployed"] is False

@@ -132,7 +132,33 @@ def get_health() -> Dict[str, Any]:
             "deploy_mode": rc.policy.deploy_mode,
             "repair_enabled": rc.repair.enabled,
             "max_attempts": rc.repair.max_attempts,
+            # Reported rather than assumed, so a reader of the dashboard does
+            # not have to infer the answer to the question they actually have.
+            "production_deployment": "OFF",
+            "automatic_merge": "OFF",
+            "default_branch_push": (
+                "ON" if rc.policy.allow_push_to_default_branch else "OFF"
+            ),
+            "supabase_writes": ("ON" if rc.supabase.allow_production_writes else "OFF"),
         },
+        "watch": {
+            "enabled": rc.watch.enabled,
+            "interval_seconds": rc.watch.interval_seconds,
+            "max_concurrent_repairs": rc.watch.max_concurrent_repairs,
+            "cooldown_seconds": rc.watch.cooldown_seconds,
+            "flapping_window": rc.flapping.window,
+            "flapping_threshold": rc.flapping.failure_threshold,
+        },
+        "recovery_required": [
+            incident.id
+            for incident in open_incidents
+            if incident.state is IncidentState.RECOVERY_REQUIRED
+        ],
+        "flapping": [
+            incident.id
+            for incident in open_incidents
+            if incident.metadata.get("flapping")
+        ],
         "audit_chain_intact": store.verify_chain()[0],
     }
 
@@ -310,3 +336,21 @@ def list_repairs(limit: int = Query(20, ge=1, le=200)) -> Dict[str, Any]:
             )
     repairs.sort(key=lambda r: r["started_at"], reverse=True)
     return {"repairs": repairs[:limit], "count": len(repairs)}
+
+
+@router.get("/incidents/{incident_id}/report")
+def get_incident_report(incident_id: str) -> Dict[str, Any]:
+    """Post-incident report, built from the incident record alone.
+
+    GET-only, like every route here: an HTTP endpoint that can trigger a
+    production repair is a far larger attack surface than one that cannot.
+    """
+    from fastapi import HTTPException
+
+    from openjarvis.reliability.report import build_report
+
+    store = _get_store()
+    incident = store.get(incident_id)
+    if incident is None:
+        raise HTTPException(status_code=404, detail="no such incident")
+    return build_report(incident).to_dict()

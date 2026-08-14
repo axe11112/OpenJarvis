@@ -10,7 +10,8 @@ without touching production.
 > been run against live infrastructure. Section 13 is explicit about what that
 > leaves unproven.
 
-Companion documents: [`JARVIS_ARCHITECTURE.md`](JARVIS_ARCHITECTURE.md) ·
+Companion documents: [`JARVIS_RELIABILITY.md`](JARVIS_RELIABILITY.md) (the 24/7
+loop that drives this one) · [`JARVIS_ARCHITECTURE.md`](JARVIS_ARCHITECTURE.md) ·
 [`JARVIS_SECURITY.md`](JARVIS_SECURITY.md) ·
 [`JARVIS_LIVE_SETUP.md`](JARVIS_LIVE_SETUP.md)
 
@@ -402,6 +403,10 @@ build_command = "npm run build"
 jarvis reliability doctor          # confirm the interlocks read as you expect
 jarvis reliability watch           # start monitoring with repair armed
 ```
+
+`watch` refuses to start (exit 2) if this configuration could reach production —
+for instance if `allow_push_to_default_branch` or a permissive `deploy_mode` were
+left on. See [`JARVIS_RELIABILITY.md`](JARVIS_RELIABILITY.md) §3.
 
 `deploy_mode` stays `pr_only` and `allow_push_to_default_branch` stays `false`.
 Enabling repair grants JARVIS the ability to *propose* a fix. It grants nothing

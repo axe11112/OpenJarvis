@@ -26,6 +26,7 @@ __all__ = [
     "LEGAL_TRANSITIONS",
     "ProbeResult",
     "RepairAttempt",
+    "RecoveryType",
     "Resolution",
     "Severity",
     "Signal",
@@ -112,6 +113,12 @@ class IncidentState(str, Enum):
     FAILED = "FAILED"
     HUMAN_REQUIRED = "HUMAN_REQUIRED"
     ROLLED_BACK = "ROLLED_BACK"
+    #: JARVIS was interrupted mid-repair — a crash, a restart, a kill.  The
+    #: incident is parked here rather than resumed: a process that died during
+    #: FIXING may have left a worktree, a branch, or a half-applied change, and
+    #: starting a second coding agent on top of that is how one outage becomes
+    #: two.  Only a human moves an incident out of this state.
+    RECOVERY_REQUIRED = "RECOVERY_REQUIRED"
 
     @classmethod
     def parse(cls, value: Any) -> "IncidentState":
@@ -136,6 +143,7 @@ TERMINAL_STATES: FrozenSet[IncidentState] = frozenset(
         IncidentState.FAILED,
         IncidentState.HUMAN_REQUIRED,
         IncidentState.ROLLED_BACK,
+        IncidentState.RECOVERY_REQUIRED,
     }
 )
 
@@ -172,6 +180,7 @@ LEGAL_TRANSITIONS: Dict[IncidentState, FrozenSet[IncidentState]] = {
         {
             IncidentState.TESTING,
             IncidentState.HUMAN_REQUIRED,
+            IncidentState.RECOVERY_REQUIRED,  # JARVIS was interrupted mid-repair
             IncidentState.FAILED,
         }
     ),
@@ -180,6 +189,7 @@ LEGAL_TRANSITIONS: Dict[IncidentState, FrozenSet[IncidentState]] = {
             IncidentState.VERIFYING,
             IncidentState.FIXING,  # tests failed — next repair attempt
             IncidentState.HUMAN_REQUIRED,
+            IncidentState.RECOVERY_REQUIRED,
             IncidentState.FAILED,
         }
     ),
@@ -188,6 +198,7 @@ LEGAL_TRANSITIONS: Dict[IncidentState, FrozenSet[IncidentState]] = {
             IncidentState.RESOLVED,  # the ONLY automatic path to RESOLVED
             IncidentState.FIXING,  # verification failed — next repair attempt
             IncidentState.HUMAN_REQUIRED,
+            IncidentState.RECOVERY_REQUIRED,
             IncidentState.FAILED,
         }
     ),
@@ -204,6 +215,17 @@ LEGAL_TRANSITIONS: Dict[IncidentState, FrozenSet[IncidentState]] = {
     ),
     IncidentState.ROLLED_BACK: frozenset(
         {IncidentState.HUMAN_REQUIRED, IncidentState.RESOLVED}
+    ),
+    #: Deliberately NOT back to FIXING.  Resuming an interrupted repair is a
+    #: decision a human makes explicitly; the route out is INVESTIGATING, which
+    #: starts the pipeline again from the beginning with fresh evidence.
+    IncidentState.RECOVERY_REQUIRED: frozenset(
+        {
+            IncidentState.INVESTIGATING,
+            IncidentState.HUMAN_REQUIRED,
+            IncidentState.RESOLVED,
+            IncidentState.FAILED,
+        }
     ),
 }
 
@@ -660,6 +682,27 @@ class Correlation:
         )
 
 
+class RecoveryType(str, Enum):
+    """How an incident stopped being a problem.
+
+    The distinction is not cosmetic.  "JARVIS proposed a fix that a human
+    merged" and "the failure went away while we were looking at it" are
+    different facts about the system, and conflating them would let JARVIS take
+    credit for recoveries it had nothing to do with — which in turn would make
+    its own effectiveness impossible to measure.
+    """
+
+    #: Independent verification passed after a JARVIS repair.
+    VERIFIED_REPAIR = "VERIFIED_REPAIR"
+    #: The probe passed again without JARVIS changing anything: someone else
+    #: deployed a fix, or the cause was transient.
+    RECOVERED_EXTERNALLY = "RECOVERED_EXTERNALLY"
+    #: A human closed it.
+    HUMAN_RESOLVED = "HUMAN_RESOLVED"
+    #: Not resolved, or resolved before this field existed.
+    UNKNOWN = "UNKNOWN"
+
+
 @dataclass(slots=True)
 class Resolution:
     """How an incident ended."""
@@ -669,6 +712,8 @@ class Resolution:
     pr_url: str = ""
     deployed_at: str = ""
     attempts_used: int = 0
+    recovery_type: RecoveryType = RecoveryType.UNKNOWN
+    resolved_at: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to a plain dict."""
@@ -678,17 +723,26 @@ class Resolution:
             "pr_url": self.pr_url,
             "deployed_at": self.deployed_at,
             "attempts_used": self.attempts_used,
+            "recovery_type": self.recovery_type.value,
+            "resolved_at": self.resolved_at,
         }
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Resolution":
         """Deserialize from a plain dict."""
+        raw = d.get("recovery_type") or RecoveryType.UNKNOWN.value
+        try:
+            recovery = RecoveryType(str(raw).upper())
+        except ValueError:
+            recovery = RecoveryType.UNKNOWN
         return cls(
             root_cause=d.get("root_cause", ""),
             fix_summary=d.get("fix_summary", ""),
             pr_url=d.get("pr_url", ""),
             deployed_at=d.get("deployed_at", ""),
             attempts_used=int(d.get("attempts_used", 0) or 0),
+            recovery_type=recovery,
+            resolved_at=d.get("resolved_at", ""),
         )
 
 
