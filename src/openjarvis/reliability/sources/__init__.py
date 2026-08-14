@@ -17,6 +17,7 @@ from openjarvis.reliability.sources.github import (
     UnsafeBranchError,
     is_protected_path,
 )
+from openjarvis.reliability.sources.vercel import VercelSource
 
 __all__ = [
     "BaseSignalSource",
@@ -28,6 +29,7 @@ __all__ = [
     "ResilientClient",
     "SourceHealth",
     "UnsafeBranchError",
+    "VercelSource",
     "is_protected_path",
     "resolve_token",
 ]
