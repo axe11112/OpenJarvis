@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 140" width="120" height="140">
+  <title>Wiz</title>
+  <path d="M60 74 C34 78 24 100 22 134 L98 134 C96 100 86 78 60 74 Z" fill="#3b5bdb"/>
+  <path d="M22 134 L98 134 L96 126 L24 126 Z" fill="#2743a8"/>
+  <path d="M42 60 C42 92 52 104 60 104 C68 104 78 92 78 60 Z" fill="#e6ecfb"/>
+  <circle cx="60" cy="52" r="19" fill="#f2d9c0"/>
+  <circle cx="53" cy="50" r="2.6" fill="#1a2338"/>
+  <circle cx="67" cy="50" r="2.6" fill="#1a2338"/>
+  <path d="M60 2 C52 18 38 34 26 38 L94 38 C82 34 68 18 60 2 Z" fill="#2f4bc4"/>
+  <ellipse cx="60" cy="39" rx="38" ry="8" fill="#2743a8"/>
+  <path d="M34 36 L86 36 L84 42 L36 42 Z" fill="#1c3390"/>
+  <path d="M52 20 l1.8 4 4 1.8 -4 1.8 -1.8 4 -1.8 -4 -4 -1.8 4 -1.8 Z" fill="#ffd166"/>
+  <path d="M68 28 l1.4 3.2 3.2 1.4 -3.2 1.4 -1.4 3.2 -1.4 -3.2 -3.2 -1.4 3.2 -1.4 Z" fill="#ffd166"/>
+  <rect x="96" y="52" width="5" height="82" rx="2.5" fill="#8b5e34"/>
+  <circle cx="98.5" cy="46" r="11" fill="#93c5fd"/>
+</svg>

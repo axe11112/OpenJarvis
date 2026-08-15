@@ -208,18 +208,13 @@ def _build_policy(config: Any) -> Any:
 def _stop_flag_path(config: Any) -> Any:
     """Where the emergency stop flag lives.
 
-    A file rather than a signal or a socket: it survives a restart, which is the
-    behaviour an operator wants from a stop they pulled in a panic. JARVIS must
-    not quietly come back on because the host rebooted.
+    Delegates to :func:`openjarvis.reliability.watch.stop_flag_path` so the CLI,
+    the watcher and the Control Center can never disagree about which file an
+    emergency stop is written to.
     """
-    from pathlib import Path
+    from openjarvis.reliability.watch import stop_flag_path
 
-    from openjarvis.core.config import get_config_dir
-
-    configured = config.reliability.db_path
-    if configured:
-        return Path(configured).expanduser().parent / "STOPPED"
-    return get_config_dir() / "reliability" / "STOPPED"
+    return stop_flag_path(config)
 
 
 def _build_monitor(config: Any, store: Any) -> Any:
@@ -1610,3 +1605,318 @@ def reliability_analyze(incident_id: str, out: str, invoke: bool) -> None:
                 f"analysis: {escape(', '.join(result.changed_files))}[/bold red]"
             )
             raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
+# Control Center
+# ---------------------------------------------------------------------------
+
+
+@reliability.command("dashboard")
+@click.option("--host", default="127.0.0.1", show_default=True, help="Bind address.")
+@click.option("--port", default=8765, show_default=True, help="Port to listen on.")
+@click.option(
+    "--open/--no-open",
+    "open_browser",
+    default=False,
+    show_default=True,
+    help="Open the Control Center in the default browser once it is serving.",
+)
+@click.option(
+    "--probe-verification",
+    type=click.Choice(["none", "http", "all"]),
+    default="http",
+    show_default=True,
+    help=(
+        "How much of the probe fleet the dashboard runs itself for a real "
+        "verdict. 'none' is purely observational. 'http' runs the single-request "
+        "probes, which otherwise leave no trace to read. 'all' also drives the "
+        "browser probes, alongside the watcher's. No mode opens an incident."
+    ),
+)
+@click.option(
+    "--watcher-control/--no-watcher-control",
+    default=True,
+    show_default=True,
+    help="Offer Start/Restart buttons for the launchd watcher service.",
+)
+@click.option(
+    "--auto-recover/--no-auto-recover",
+    default=True,
+    show_default=True,
+    help=(
+        "Ask launchd to start the watcher when the dashboard finds it "
+        "unexpectedly offline. Never overrides an emergency stop."
+    ),
+)
+def reliability_dashboard(
+    host: str,
+    port: int,
+    open_browser: bool,
+    probe_verification: str,
+    watcher_control: bool,
+    auto_recover: bool,
+) -> None:
+    """Serve the JARVIS Control Center on localhost.
+
+    A read-only view of the running reliability system: incidents, probes,
+    integration health and every safety interlock, refreshed automatically.
+    It reads the same incident database the watcher writes, so it is safe to
+    run alongside ``jarvis reliability watch``.
+
+    Nothing here can repair, deploy, merge or modify an incident. The only
+    actions it offers are asking launchd to start or restart the watcher
+    service, and both are refused while an emergency stop is engaged.
+    """
+    from openjarvis.reliability.dashboard.server import ControlCenterServer
+    from openjarvis.reliability.dashboard.service import DashboardService
+
+    console = Console()
+    config = _load_config()
+    store = _get_store(config)
+
+    service = DashboardService(
+        config,
+        store=store,
+        probe_verification=probe_verification,
+        auto_recover=auto_recover,
+    )
+    try:
+        server = ControlCenterServer(
+            service,
+            host=host,
+            port=port,
+            allow_watcher_control=watcher_control,
+        )
+    except ValueError as exc:
+        service.close()
+        console.print(f"[bold red]{escape(str(exc))}[/bold red]")
+        raise SystemExit(2) from exc
+
+    console.print()
+    console.print("[bold]JARVIS Control Center[/bold]")
+    console.print(f"[bold cyan]{escape(server.url)}[/bold cyan]")
+    console.print()
+    rc = config.reliability
+    console.print(
+        f"[dim]Target        "
+        f"{escape(rc.site.base_url or 'not configured')}[/dim]"
+    )
+    console.print("[dim]Mode          read-only · loopback only[/dim]")
+    console.print(
+        f"[dim]Refresh       every {service.cycle_seconds:.0f}s · probe "
+        f"verification {probe_verification}[/dim]"
+    )
+    console.print(
+        f"[dim]Repair        {'ON' if rc.repair.enabled else 'OFF'} · "
+        f"deploy {rc.policy.deploy_mode} · "
+        f"default-branch push "
+        f"{'ON' if rc.policy.allow_push_to_default_branch else 'OFF'} · "
+        f"Supabase writes "
+        f"{'ON' if rc.supabase.allow_production_writes else 'OFF'}[/dim]"
+    )
+    console.print("\n[dim]Ctrl-C to stop.[/dim]\n")
+
+    service.start()
+    if open_browser:
+        import webbrowser
+
+        webbrowser.open(server.url)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        console.print("\nStopped.")
+    finally:
+        server.shutdown()
+        service.close()
+
+
+# ---------------------------------------------------------------------------
+# launchd service
+# ---------------------------------------------------------------------------
+
+
+def _supervisor(config: Any) -> Any:
+    """Build the launchd supervisor for the watcher service."""
+    from openjarvis.reliability.dashboard.supervisor import LaunchdSupervisor
+
+    return LaunchdSupervisor(config)
+
+
+@reliability.group("service")
+def service_group() -> None:
+    """Supervise the watcher with launchd, so it survives a reboot (macOS).
+
+    JARVIS should not depend on a terminal window staying open. These commands
+    install a LaunchAgent that starts the watcher at login, restarts it if it
+    crashes, and — deliberately — does *not* restart it when an emergency stop
+    has been engaged.
+    """
+
+
+@service_group.command("install")
+@click.option(
+    "--working-directory",
+    default="",
+    help="Directory the watcher runs in. Defaults to the current directory.",
+)
+@click.option(
+    "--capture-env/--no-capture-env",
+    default=True,
+    show_default=True,
+    help=(
+        "Copy the credential environment variables named by the configuration "
+        "into a 0600 file the wrapper sources. Values never enter the plist."
+    ),
+)
+@click.option(
+    "--load/--no-load",
+    default=True,
+    show_default=True,
+    help="Load it into launchd now.",
+)
+def service_install(
+    working_directory: str, capture_env: bool, load: bool
+) -> None:
+    """Install the LaunchAgent that supervises the watcher."""
+    from pathlib import Path
+
+    console = Console()
+    config = _load_config()
+    supervisor = _supervisor(config)
+
+    if not supervisor.supported():
+        console.print(
+            "[red]launchd supervision needs macOS with launchctl. On other "
+            "platforms use systemd (see deploy/) or run the watcher yourself."
+            "[/red]"
+        )
+        raise SystemExit(2)
+
+    workdir = Path(working_directory).expanduser() if working_directory else Path.cwd()
+    if not workdir.is_dir():
+        console.print(f"[red]No such directory: {escape(str(workdir))}[/red]")
+        raise SystemExit(1)
+
+    report = supervisor.install(
+        working_directory=workdir, capture_env=capture_env, load=load
+    )
+
+    table = Table(title="JARVIS watcher service", show_header=False, box=None)
+    table.add_column("key", style="dim")
+    table.add_column("value")
+    table.add_row("Label", supervisor.label)
+    table.add_row("LaunchAgent", escape(report["plist"]))
+    table.add_row("Wrapper", escape(report["wrapper"]))
+    table.add_row("Working directory", escape(report["working_directory"]))
+    table.add_row("Environment file", escape(report["env_file"]) + " (0600)")
+    table.add_row("stdout", escape(report["stdout_log"]))
+    table.add_row("stderr", escape(report["stderr_log"]))
+    table.add_row(
+        "Loaded",
+        "[green]yes[/]"
+        if report["loaded"]
+        else f"[yellow]{escape(report['message'])}[/]",
+    )
+    console.print(table)
+
+    captured = report["captured_env_names"]
+    console.print()
+    if captured:
+        # Names only. This command never prints, logs or returns a value.
+        console.print(
+            "Captured "
+            + escape(", ".join(captured))
+            + " into the environment file (values not shown)."
+        )
+    else:
+        console.print(
+            "[yellow]No credential values were captured.[/yellow] Fill in "
+            f"{escape(report['env_file'])} before the watcher will have access "
+            "to GitHub, Vercel, Supabase or Telegram."
+        )
+    console.print(
+        "\n[dim]An emergency stop is honoured: while the STOPPED flag exists "
+        "the wrapper exits cleanly and launchd will not restart it.[/dim]"
+    )
+
+
+@service_group.command("uninstall")
+def service_uninstall() -> None:
+    """Unload and remove the LaunchAgent. Leaves the environment file alone."""
+    console = Console()
+    supervisor = _supervisor(_load_config())
+    report = supervisor.uninstall()
+    console.print(
+        f"Unloaded: {report['unloaded']} · plist removed: {report['plist_removed']}"
+    )
+    console.print(
+        f"[dim]Kept {escape(report['env_file_kept'])} "
+        "(it holds credentials).[/dim]"
+    )
+
+
+@service_group.command("status")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+def service_status(as_json: bool) -> None:
+    """Report whether the supervised watcher is running."""
+    import json as json_module
+
+    console = Console()
+    supervisor = _supervisor(_load_config())
+    state = supervisor.status()
+
+    if as_json:
+        click.echo(json_module.dumps(state.to_dict(), indent=2))
+        return
+
+    colour = {
+        "ONLINE": "green",
+        "STARTING": "cyan",
+        "OFFLINE": "red",
+        "ERROR": "bold red",
+        "STOPPED_BY_OPERATOR": "yellow",
+    }.get(state.status.value, "white")
+    console.print(f"Watcher: [{colour}]{state.status.value}[/]")
+    if state.detail:
+        console.print(f"  {escape(state.detail)}")
+    if state.pid:
+        console.print(f"  pid {state.pid}")
+    console.print(f"  logs: {escape(state.stdout_log)}")
+    console.print(f"        {escape(state.stderr_log)}")
+
+
+@service_group.command("start")
+def service_start() -> None:
+    """Ask launchd to start the watcher."""
+    console = Console()
+    ok, message = _supervisor(_load_config()).start()
+    console.print(("[green]" if ok else "[red]") + escape(message) + "[/]")
+    if not ok:
+        raise SystemExit(1)
+
+
+@service_group.command("restart")
+def service_restart() -> None:
+    """Ask launchd to restart the watcher."""
+    console = Console()
+    ok, message = _supervisor(_load_config()).restart()
+    console.print(("[green]" if ok else "[red]") + escape(message) + "[/]")
+    if not ok:
+        raise SystemExit(1)
+
+
+@service_group.command("logs")
+@click.option(
+    "--stream",
+    type=click.Choice(["stdout", "stderr"]),
+    default="stderr",
+    show_default=True,
+)
+@click.option("--lines", default=60, show_default=True, help="How many lines to show.")
+def service_logs(stream: str, lines: int) -> None:
+    """Show the tail of a supervised watcher log, redacted."""
+    console = Console()
+    text = _supervisor(_load_config()).tail_log(stream=stream, lines=lines)
+    console.print(escape(text) if text else "[dim]No output recorded yet.[/dim]")

@@ -32,6 +32,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from openjarvis.reliability.events import (
@@ -59,6 +60,7 @@ __all__ = [
     "WatchSupervisor",
     "assert_safe_to_start",
     "startup_banner",
+    "stop_flag_path",
 ]
 
 #: States that mean a repair was in flight when the process stopped.
@@ -81,6 +83,27 @@ class UnsafeConfigurationError(RuntimeError):
 # ---------------------------------------------------------------------------
 # Startup safety
 # ---------------------------------------------------------------------------
+
+
+def stop_flag_path(config: Any) -> "Path":
+    """Where the emergency stop flag lives.
+
+    A file rather than a signal or a socket: it survives a restart, which is the
+    behaviour an operator wants from a stop they pulled in a panic. JARVIS must
+    not quietly come back on because the host rebooted.
+
+    Defined here, next to the gate that honours it, so that every reader —
+    ``jarvis reliability watch``, ``jarvis reliability stop`` and the Control
+    Center — resolves the same file. A dashboard that computed this path
+    independently could report "not engaged" while a stop was in force, which is
+    the one thing a stop indicator must never do.
+    """
+    from openjarvis.core.paths import get_config_dir
+
+    configured = getattr(config.reliability, "db_path", "")
+    if configured:
+        return Path(configured).expanduser().parent / "STOPPED"
+    return get_config_dir() / "reliability" / "STOPPED"
 
 
 def assert_safe_to_start(config: Any) -> None:

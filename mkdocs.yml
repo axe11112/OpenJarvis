@@ -182,6 +182,7 @@ nav:
       - Live Setup: JARVIS_LIVE_SETUP.md
       - Repair Loop: JARVIS_REPAIR_LOOP.md
       - 24/7 Reliability: JARVIS_RELIABILITY.md
+      - Control Center: JARVIS_CONTROL_CENTER.md
   - API Reference: api-reference/
   - User Guide:
       - CLI: user-guide/cli.md
