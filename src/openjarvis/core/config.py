@@ -1483,6 +1483,21 @@ class ReliabilityGitHubConfig:
     #: separately means the operator does not have to widen the main one.
     #: Empty means "use token_env".
     actions_token_env: str = ""
+    #: Whether GitHub Actions is part of this target's health picture.
+    #:
+    #: Defaults to true because for most repositories a red CI is a real
+    #: signal.  Set false when the target deliberately does not use Actions —
+    #: no minutes on the plan, CI hosted elsewhere, or workflows switched off.
+    #: On such a repository the Actions API answers truthfully that there is
+    #: nothing there or that the last runs failed months ago, and JARVIS would
+    #: report a healthy target as degraded forever.
+    #:
+    #: This is a statement about the *target's architecture*, not about
+    #: permissions: when false, JARVIS makes no Actions API call at all, and
+    #: records the absence as a deliberate configuration rather than as a blind
+    #: spot.  Everything else GitHub-related — reachability, commits, branches,
+    #: pull requests — is unaffected.
+    monitor_actions: bool = True
     base_branch: str = "main"
     branch_prefix: str = "jarvis/incident-"
     poll_interval_seconds: int = 300

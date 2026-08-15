@@ -315,17 +315,32 @@ class LiveDiagnostic:
                 remediation=scope_hint,
             )
         )
-        result.add(
-            _capability(
-                "actions",
-                lambda: source.list_workflow_runs(limit=10),
-                describe=self._describe_runs,
-                remediation=(
-                    "The token needs the Actions:read permission "
-                    f"(${rc.github.token_env})."
-                ),
+        # Same reasoning as write_access below: something the target is
+        # correct not to have must be recorded as a fact, not as an
+        # unverified capability. A repository that deliberately runs no
+        # Actions — no minutes on the plan, CI hosted elsewhere, workflows
+        # switched off — would otherwise sit at DEGRADED forever, either
+        # because the API truthfully reports nothing or because the newest
+        # run it can find failed long before Actions was turned off. Neither
+        # says anything about whether the site works, and a permanent amber
+        # light is how an owner learns to stop reading the dashboard.
+        #
+        # Not a blind spot either: a blind spot is something JARVIS wanted to
+        # see and could not. This is something it was told not to look at.
+        if not rc.github.monitor_actions:
+            result.facts["actions"] = "not monitored (disabled for this target)"
+        else:
+            result.add(
+                _capability(
+                    "actions",
+                    lambda: source.list_workflow_runs(limit=10),
+                    describe=self._describe_runs,
+                    remediation=(
+                        "The token needs the Actions:read permission "
+                        f"(${rc.github.token_env})."
+                    ),
+                )
             )
-        )
 
         # Write access is only *needed* once automated repair is enabled. Until
         # then a read-only token is the correct configuration, and reporting the
@@ -361,10 +376,17 @@ class LiveDiagnostic:
                 write.state = HealthState.FAILED
 
         result.derive_state()
-        result.facts = {
-            "repository": self.target.repository,
-            "default_branch": self.target.branch,
-        }
+        # update, not reassign: the branches above deliberately record facts
+        # ("actions: not monitored", "write_access: not required") to explain a
+        # capability that is absent on purpose. Replacing the dict here threw
+        # those away, so the explanation never reached the operator and the gap
+        # looked unexplained — the opposite of what recording them was for.
+        result.facts.update(
+            {
+                "repository": self.target.repository,
+                "default_branch": self.target.branch,
+            }
+        )
         if commits:
             result.facts["latest_commit"] = commits[0]["sha"]
         result.summary = self._summarize(result)
@@ -870,6 +892,7 @@ class LiveDiagnostic:
             return GitHubSource(
                 repo=self.target.repository,
                 token_env=rc.github.token_env,
+                monitor_actions=rc.github.monitor_actions,
                 base_branch=self.target.branch,
                 branch_prefix=rc.github.branch_prefix,
                 allow_push_to_default_branch=False,  # diagnostics never write

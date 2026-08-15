@@ -257,6 +257,53 @@ class TestGitHubCheck:
         assert actions.state is not HealthState.FAILED
 
 
+class TestActionsMonitoringDisabled:
+    """A target that deliberately runs no Actions.
+
+    The distinction this rests on: a blind spot is something JARVIS wanted to
+    see and could not, and it is right to report that loudly. Actions being
+    switched off is something JARVIS was *told not to look at*. Reporting the
+    second as the first leaves a permanent amber light on a healthy target,
+    which is how an owner learns to stop reading the dashboard.
+    """
+
+    def _diag(self, tmp_path, **fake_kwargs):
+        config = _config(tmp_path)
+        config.reliability.github.monitor_actions = False
+        return LiveDiagnostic(
+            config, factories={"github": lambda: _FakeGitHub(**fake_kwargs)}
+        )
+
+    def test_disabled_actions_is_healthy_not_degraded(self, tmp_path):
+        """The same fake whose Actions call 403s — which is DEGRADED when
+        monitoring is on — must be HEALTHY when Actions is not monitored."""
+        result = self._diag(tmp_path, actions_403=True).check_github()
+        assert result.state is HealthState.HEALTHY
+
+    def test_disabled_actions_is_not_a_blind_spot(self, tmp_path):
+        result = self._diag(tmp_path, actions_403=True).check_github()
+        assert "actions" not in result.unchecked_capabilities
+        assert "actions" not in result.capabilities
+
+    def test_disabled_actions_is_reported_as_deliberate(self, tmp_path):
+        """Silence would be wrong too: the operator should be able to see that
+        the gap is intentional rather than wonder why Actions vanished."""
+        result = self._diag(tmp_path, actions_403=True).check_github()
+        assert "not monitored" in result.facts.get("actions", "")
+
+    def test_other_capabilities_still_checked(self, tmp_path):
+        result = self._diag(tmp_path, actions_403=True).check_github()
+        for name in ("commits", "branches", "pull_requests"):
+            assert result.capabilities[name].state is HealthState.HEALTHY
+
+    def test_monitoring_on_still_degrades_on_a_403(self, tmp_path):
+        """Control: proves the tests above turn on the flag, not on the fake."""
+        diagnostic = LiveDiagnostic(
+            _config(tmp_path), factories={"github": _FakeGitHub}
+        )
+        assert diagnostic.check_github().state is HealthState.DEGRADED
+
+
 class TestVercelCheck:
     def test_missing_token_is_unknown_not_healthy(self, tmp_path):
         diagnostic = LiveDiagnostic(
@@ -478,3 +525,21 @@ class TestFullRun:
         report = self._diagnostic(tmp_path, store).run(include_probes=False)
         probes = next(c for c in report.checks if c.name == "probes")
         assert probes.state is HealthState.NOT_CHECKED
+
+
+class TestExplanatoryFactsSurvive:
+    """check_github rebuilt its facts dict at the end, discarding the facts the
+    branches above had recorded to explain a deliberately-absent capability.
+    The explanation existed in the code and never reached the operator."""
+
+    def test_write_access_explanation_is_kept(self, tmp_path):
+        config = _config(tmp_path)
+        config.reliability.repair.enabled = False
+        diagnostic = LiveDiagnostic(
+            config, factories={"github": lambda: _FakeGitHub(actions_403=False)}
+        )
+        facts = diagnostic.check_github().facts
+        assert "not required" in facts.get("write_access", "")
+        # and the facts set at the end are still there
+        assert facts["repository"] == "acme/site"
+        assert facts["default_branch"] == "main"

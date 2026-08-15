@@ -140,6 +140,7 @@ def _build_sources(config: Any) -> list:
                 repo=rc.github.repo,
                 token_env=rc.github.token_env,
                 actions_token_env=rc.github.actions_token_env,
+                monitor_actions=rc.github.monitor_actions,
                 base_branch=rc.github.base_branch,
                 branch_prefix=rc.github.branch_prefix,
                 allow_push_to_default_branch=rc.policy.allow_push_to_default_branch,

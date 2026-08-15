@@ -168,6 +168,7 @@ class GitHubSource(BaseSignalSource):
         repo: str,
         token_env: str = "GITHUB_READONLY_TOKEN",
         actions_token_env: str = "",
+        monitor_actions: bool = True,
         base_branch: str = "main",
         branch_prefix: str = "jarvis/incident-",
         allow_push_to_default_branch: bool = False,
@@ -183,9 +184,21 @@ class GitHubSource(BaseSignalSource):
         self._protected_paths = list(protected_paths or [])
         self._token_env = token_env
         self._actions_token_env = actions_token_env or token_env
+        self._monitor_actions = monitor_actions
         self._client = client
         self._actions_client: Optional[ResilientClient] = None
         self._last_error = ""
+
+    @property
+    def monitor_actions(self) -> bool:
+        """Whether Actions is part of this target's health picture.
+
+        Read by the diagnostic so it can say "not monitored" rather than
+        guessing from an empty result — an empty run list means the same thing
+        whether the repository has no workflows or the token cannot see them,
+        and those two need very different answers.
+        """
+        return self._monitor_actions
 
     # -- client -----------------------------------------------------------
 
@@ -331,7 +344,16 @@ class GitHubSource(BaseSignalSource):
     def list_workflow_runs(
         self, *, status: str = "", limit: int = 20, branch: str = ""
     ) -> List[Dict[str, Any]]:
-        """Return recent Actions runs, optionally filtered by status/branch."""
+        """Return recent Actions runs, optionally filtered by status/branch.
+
+        Returns an empty list *without contacting the API* when Actions is not
+        monitored for this target.  The guard lives here rather than only at
+        the call sites so that a new caller cannot reintroduce the API traffic
+        by forgetting to check — the operator said this repository has no CI,
+        and that has to hold everywhere.
+        """
+        if not self._monitor_actions:
+            return []
         params: Dict[str, Any] = {"per_page": min(limit, 100)}
         if status:
             params["status"] = status
@@ -359,7 +381,12 @@ class GitHubSource(BaseSignalSource):
 
         Logs are attacker-influenceable (a test can print anything), so the
         caller must treat the result as untrusted external content.
+
+        Empty, with no API call, when Actions is not monitored: there is no run
+        whose logs could be wanted.
         """
+        if not self._monitor_actions:
+            return ""
         try:
             response = self.actions_client.request(
                 "GET",
@@ -466,7 +493,13 @@ class GitHubSource(BaseSignalSource):
     # -- signal source contract -------------------------------------------
 
     def poll(self, *, since: Optional[str] = None) -> List[Signal]:
-        """Report failed Actions runs as signals."""
+        """Report failed Actions runs as signals.
+
+        Yields nothing when Actions is not monitored — ``list_workflow_runs``
+        returns empty without an API call, so a repository whose last workflow
+        failed months before Actions was switched off cannot manufacture a
+        fresh incident today.
+        """
         try:
             runs = self.list_workflow_runs(status="completed", limit=20)
         except (httpx.HTTPError, CircuitOpenError, MissingTokenError) as exc:

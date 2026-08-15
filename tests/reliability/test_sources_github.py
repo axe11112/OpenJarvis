@@ -434,3 +434,131 @@ class TestWriteCapabilityProbe:
         source.can_write()
         assert route.called
         assert all(call.request.method == "GET" for call in respx_mock.calls)
+
+
+# ---------------------------------------------------------------------------
+# Actions monitoring toggle
+# ---------------------------------------------------------------------------
+
+
+class TestMonitorActionsToggle:
+    """Some repositories deliberately run no GitHub Actions — no minutes on the
+    plan, CI hosted elsewhere, workflows switched off. On those, the Actions API
+    answers truthfully that there is nothing there, or that the newest run it
+    can find failed long before Actions was turned off. Either way JARVIS would
+    report a perfectly healthy target as degraded forever, which is how an owner
+    learns to stop reading the dashboard.
+    """
+
+    def test_enabled_by_default(self):
+        assert _source().monitor_actions is True
+
+    def test_enabled_still_calls_the_api(self, respx_mock):
+        route = respx_mock.get(f"{API}/repos/{REPO}/actions/runs").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "workflow_runs": [
+                        {
+                            "id": 1,
+                            "name": "CI",
+                            "status": "completed",
+                            "conclusion": "failure",
+                            "head_branch": "main",
+                            "head_sha": "abc123",
+                            "html_url": "https://github.com/x/1",
+                            "created_at": "2026-08-15T00:00:00Z",
+                        }
+                    ]
+                },
+            )
+        )
+        runs = _source(monitor_actions=True).list_workflow_runs()
+        assert route.called, "the existing behaviour must be untouched"
+        assert len(runs) == 1 and runs[0]["conclusion"] == "failure"
+
+    def test_disabled_makes_zero_actions_api_calls(self, respx_mock):
+        """Not merely 'filters the result' — the request is never issued. On a
+        repository with Actions disabled the call is wasted quota and a
+        guaranteed 4xx in the logs."""
+        route = respx_mock.get(f"{API}/repos/{REPO}/actions/runs").mock(
+            return_value=httpx.Response(200, json={"workflow_runs": []})
+        )
+        assert _source(monitor_actions=False).list_workflow_runs() == []
+        assert not route.called, "an Actions API call was made while disabled"
+
+    def test_disabled_makes_zero_log_api_calls(self, respx_mock):
+        route = respx_mock.get(f"{API}/repos/{REPO}/actions/runs/7/logs").mock(
+            return_value=httpx.Response(200, text="log text")
+        )
+        assert _source(monitor_actions=False).get_job_logs(7) == ""
+        assert not route.called
+
+    def test_historical_failures_cannot_affect_health_when_disabled(self, respx_mock):
+        """The case that motivated this: a repository whose last workflow run
+        failed months ago, before Actions was switched off. Polling must not
+        manufacture a fresh signal out of that stale failure."""
+        respx_mock.get(f"{API}/repos/{REPO}/actions/runs").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "workflow_runs": [
+                        {
+                            "id": 99,
+                            "name": "Old CI",
+                            "status": "completed",
+                            "conclusion": "failure",
+                            "head_branch": "main",
+                            "head_sha": "deadbee",
+                            "html_url": "https://github.com/x/99",
+                            "created_at": "2026-01-01T00:00:00Z",
+                        }
+                    ]
+                },
+            )
+        )
+        assert _source(monitor_actions=False).poll() == []
+        # Control: the very same stale failure IS a signal when monitoring is on,
+        # so the test proves the toggle, not an empty fixture.
+        signals = _source(monitor_actions=True).poll()
+        assert len(signals) == 1
+        assert signals[0].kind == "workflow_failed"
+        assert signals[0].severity is Severity.HIGH
+
+    def test_other_github_reads_still_work_when_actions_disabled(self, respx_mock):
+        """Disabling Actions must not disable the GitHub integration."""
+        respx_mock.get(f"{API}/repos/{REPO}/commits").mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {
+                        "sha": "abc1234",
+                        "commit": {
+                            "message": "fix: thing",
+                            "author": {
+                                "name": "A",
+                                "email": "a@x.com",
+                                "date": "2026-08-15T00:00:00Z",
+                            },
+                        },
+                        "html_url": "https://github.com/x/c",
+                    }
+                ],
+            )
+        )
+        respx_mock.get(f"{API}/repos/{REPO}/branches").mock(
+            return_value=httpx.Response(200, json=[{"name": "main"}])
+        )
+        respx_mock.get(f"{API}/repos/{REPO}/pulls").mock(
+            return_value=httpx.Response(200, json=[{"number": 1, "title": "t"}])
+        )
+        source = _source(monitor_actions=False)
+        assert len(source.list_commits()) == 1
+        assert len(source.list_branches()) == 1
+        assert len(source.list_pull_requests()) == 1
+
+    def test_health_does_not_depend_on_actions(self, respx_mock):
+        respx_mock.get(f"{API}/repos/{REPO}").mock(
+            return_value=httpx.Response(200, json={"full_name": REPO})
+        )
+        assert _source(monitor_actions=False).health().reachable is True
