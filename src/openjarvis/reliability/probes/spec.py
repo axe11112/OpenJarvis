@@ -247,6 +247,11 @@ class ProbeSpec:
     #: so a shared secret must never be written into one.  Resolved values are
     #: added to the runner's redactor, so they cannot reach evidence either.
     headers_from_env: Dict[str, str] = field(default_factory=dict)
+    #: Named profiles from :mod:`openjarvis.reliability.probes.access` for
+    #: reaching protected deployments. Applied per run, only when the target
+    #: matches the profile, so a probe that can verify a Vercel preview behaves
+    #: identically against production and never reads the secret there.
+    access_profiles: List[str] = field(default_factory=list)
     steps: List[ProbeStep] = field(default_factory=list)
     expect: List[ProbeExpectation] = field(default_factory=list)
     assertions: ProbeAssertions = field(default_factory=ProbeAssertions)
@@ -378,6 +383,25 @@ def _parse_noise_profiles(assertions_raw: Dict[str, Any], where: str) -> List[st
     return names
 
 
+def _parse_access_profiles(probe: Dict[str, Any], where: str) -> List[str]:
+    """Validate ``access_profiles`` against the profile registry.
+
+    An unknown name is a spec error rather than a no-op: silently ignoring it
+    would produce a probe that cannot reach its target and then reports the
+    application as broken, which is the most expensive way to spell a typo.
+    """
+    from openjarvis.reliability.probes.access import KNOWN_ACCESS_PROFILES
+
+    names = list(probe.get("access_profiles", []) or [])
+    unknown = [n for n in names if n not in KNOWN_ACCESS_PROFILES]
+    if unknown:
+        raise ProbeSpecError(
+            f"{where}: unknown access profile(s) {', '.join(sorted(unknown))!r}; "
+            f"known profiles: {', '.join(sorted(KNOWN_ACCESS_PROFILES))}"
+        )
+    return names
+
+
 def parse_probe(data: Dict[str, Any], *, where: str = "<dict>") -> ProbeSpec:
     """Build a :class:`ProbeSpec` from parsed TOML data."""
     probe = data.get("probe", data)
@@ -421,6 +445,7 @@ def parse_probe(data: Dict[str, Any], *, where: str = "<dict>") -> ProbeSpec:
         headers_from_env={
             str(k): str(v) for k, v in (probe.get("headers_from_env", {}) or {}).items()
         },
+        access_profiles=_parse_access_profiles(probe, where),
         assertions=ProbeAssertions(
             no_console_errors=bool(assertions_raw.get("no_console_errors", False)),
             no_failed_requests=bool(assertions_raw.get("no_failed_requests", False)),

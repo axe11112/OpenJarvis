@@ -20,6 +20,7 @@ from openjarvis.reliability.probes._stubs import (
     ProbeRunnerRegistry,
     resolve_headers,
 )
+from openjarvis.reliability.probes.access import resolve_access_headers
 from openjarvis.reliability.probes.spec import ProbeSpec
 from openjarvis.reliability.types import (
     Evidence,
@@ -74,6 +75,11 @@ class HttpProbeRunner(BaseProbeRunner):
         started_at = now_iso()
         url = resolve_url(base_url, spec.url)
         headers, header_secrets = resolve_headers(spec)
+        access_headers, access_secrets = resolve_access_headers(
+            spec.access_profiles, url
+        )
+        headers.update(access_headers)
+        header_secrets.update(access_secrets)
         redactor = CredentialRedactor(header_secrets)
         evidence: List[Evidence] = []
 

@@ -28,6 +28,7 @@ from openjarvis.reliability.probes._stubs import (
     resolve_credentials,
     resolve_headers,
 )
+from openjarvis.reliability.probes.access import resolve_access_headers
 from openjarvis.reliability.probes.http import resolve_url
 from openjarvis.reliability.probes.spec import ProbeSpec, ProbeStep
 from openjarvis.reliability.types import (
@@ -161,6 +162,19 @@ class _Capture:
         )
 
 
+def _first_target_url(spec: ProbeSpec, base_url: str) -> str:
+    """The URL this run will actually open.
+
+    Access profiles key off the deployment under test, not off the spec, so
+    this has to be the resolved target: ``--base-url`` and the verifier's
+    candidate deployment are exactly the cases that matter.
+    """
+    for step in spec.steps:
+        if step.action == "goto" and step.url:
+            return resolve_url(base_url, step.url)
+    return base_url
+
+
 @ProbeRunnerRegistry.register("browser")
 class BrowserProbeRunner(BaseProbeRunner):
     """Executes a workflow in a real browser and reports what broke.
@@ -211,6 +225,14 @@ class BrowserProbeRunner(BaseProbeRunner):
 
         credentials = resolve_credentials(spec)
         headers, header_secrets = resolve_headers(spec)
+        # Access profiles resolve against the URL actually under test, so the
+        # same spec needs no secret when pointed at production and picks one up
+        # automatically when pointed at a protected preview.
+        access_headers, access_secrets = resolve_access_headers(
+            spec.access_profiles, _first_target_url(spec, base_url)
+        )
+        headers.update(access_headers)
+        header_secrets.update(access_secrets)
         # Header secrets go into the redactor alongside credentials: a bypass
         # token travels on every request, so it is the value most likely to be
         # echoed back in an error page or a captured URL.

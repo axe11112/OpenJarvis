@@ -851,3 +851,109 @@ class TestProbeHeaders:
         )
         result = runner.run(spec, base_url=site.base_url)
         assert result.success, result.error
+
+
+# ---------------------------------------------------------------------------
+# Access profiles (Vercel preview protection)
+# ---------------------------------------------------------------------------
+
+
+class TestAccessProfiles:
+    """A probe that can verify a protected preview must stay usable against
+    production, where the secret is absent and irrelevant. The profile is
+    therefore resolved per run against the URL actually under test, not per
+    spec."""
+
+    PREVIEW = "https://wizeperformance-abc123-team.vercel.app"
+    PRODUCTION = "https://www.wizeperformance.com"
+
+    def test_preview_target_gets_the_header(self, monkeypatch):
+        from openjarvis.reliability.probes.access import resolve_access_headers
+
+        monkeypatch.setenv("VERCEL_AUTOMATION_BYPASS_SECRET", "bypass-secret-xyz")
+        headers, secrets = resolve_access_headers(["vercel_preview"], self.PREVIEW)
+        assert headers["x-vercel-protection-bypass"] == "bypass-secret-xyz"
+        assert secrets["x-vercel-protection-bypass"] == "bypass-secret-xyz"
+
+    def test_production_target_gets_no_header(self, monkeypatch):
+        monkeypatch.setenv("VERCEL_AUTOMATION_BYPASS_SECRET", "bypass-secret-xyz")
+        from openjarvis.reliability.probes.access import resolve_access_headers
+
+        headers, secrets = resolve_access_headers(["vercel_preview"], self.PRODUCTION)
+        assert headers == {} and secrets == {}
+
+    def test_production_target_does_not_require_the_secret(self, monkeypatch):
+        """The property that lets a production probe carry the profile safely:
+        with the secret absent, a production run must not raise."""
+        from openjarvis.reliability.probes.access import resolve_access_headers
+
+        monkeypatch.delenv("VERCEL_AUTOMATION_BYPASS_SECRET", raising=False)
+        assert resolve_access_headers(["vercel_preview"], self.PRODUCTION) == ({}, {})
+
+    def test_missing_secret_on_a_preview_fails_clearly(self, monkeypatch):
+        """Failing loudly beats running anyway: an unauthenticated request gets
+        Vercel's login page, and the probe would report the application broken."""
+        from openjarvis.reliability.probes.access import (
+            MissingAccessSecretError,
+            resolve_access_headers,
+        )
+
+        monkeypatch.delenv("VERCEL_AUTOMATION_BYPASS_SECRET", raising=False)
+        with pytest.raises(MissingAccessSecretError) as excinfo:
+            resolve_access_headers(["vercel_preview"], self.PREVIEW)
+        message = str(excinfo.value)
+        assert "VERCEL_AUTOMATION_BYPASS_SECRET" in message
+        assert "x-vercel-protection-bypass" in message
+
+    def test_no_profile_means_no_headers_ever(self, monkeypatch):
+        from openjarvis.reliability.probes.access import resolve_access_headers
+
+        monkeypatch.setenv("VERCEL_AUTOMATION_BYPASS_SECRET", "bypass-secret-xyz")
+        assert resolve_access_headers([], self.PREVIEW) == ({}, {})
+
+    def test_unknown_profile_is_a_spec_error(self):
+        from openjarvis.reliability.probes.spec import ProbeSpecError
+
+        with pytest.raises(ProbeSpecError) as excinfo:
+            _browser_spec(access_profiles=["vercel_previews"])
+        assert "vercel_previews" in str(excinfo.value)
+        assert "vercel_preview" in str(excinfo.value)
+
+    def test_reflected_secret_is_redacted_from_evidence(self, site, monkeypatch):
+        """End to end against an endpoint that echoes the header back. The
+        profile does not apply to a 127.0.0.1 fixture host, so this drives the
+        redaction path directly with the same secrets mapping the runner uses."""
+        from openjarvis.reliability.probes._stubs import CredentialRedactor
+
+        monkeypatch.setenv("VERCEL_AUTOMATION_BYPASS_SECRET", "bypass-secret-xyz")
+        from openjarvis.reliability.probes.access import resolve_access_headers
+
+        _, secrets = resolve_access_headers(["vercel_preview"], self.PREVIEW)
+        redactor = CredentialRedactor(secrets)
+        leaked = "upstream said: x-vercel-protection-bypass: bypass-secret-xyz"
+        assert "bypass-secret-xyz" not in redactor.redact(leaked)
+        assert "[REDACTED]" in redactor.redact(leaked)
+
+    def test_secret_never_appears_in_the_spec_or_on_disk(self, tmp_path, monkeypatch):
+        """The whole reason for a profile rather than a URL parameter: the spec
+        is a file that gets committed, printed and diffed."""
+        monkeypatch.setenv("VERCEL_AUTOMATION_BYPASS_SECRET", "bypass-secret-xyz")
+        spec_file = tmp_path / "p.toml"
+        spec_file.write_text(
+            '[probe]\nid = "p"\naccess_profiles = ["vercel_preview"]\n'
+            '[[probe.steps]]\naction = "goto"\nurl = "/"\n'
+        )
+        from openjarvis.reliability.probes.spec import load_probe
+
+        spec = load_probe(spec_file)
+        assert spec.access_profiles == ["vercel_preview"]
+        assert "bypass-secret-xyz" not in spec_file.read_text()
+        assert "bypass-secret-xyz" not in repr(spec)
+
+    def test_http_runner_applies_the_profile_by_target(self, site, monkeypatch):
+        """A fixture site on 127.0.0.1 is not a *.vercel.app host, so the
+        profile must stay inert and the probe must still pass."""
+        monkeypatch.delenv("VERCEL_AUTOMATION_BYPASS_SECRET", raising=False)
+        runner = HttpProbeRunner(verify_ssrf=False)
+        spec = _http_spec(url="/", access_profiles=["vercel_preview"])
+        assert runner.run(spec, base_url=site.base_url).success
