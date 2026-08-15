@@ -238,6 +238,15 @@ class ProbeSpec:
     timeout_ms: int = 30000
     trace_on_failure: bool = True
     credentials: Dict[str, str] = field(default_factory=dict)
+    #: Literal request headers, sent with every request the probe makes.
+    #: For values that are *not* secret — an Accept-Language, a feature flag.
+    headers: Dict[str, str] = field(default_factory=dict)
+    #: Header name -> **name of an environment variable** holding its value.
+    #: Same indirection as ``credentials``, and for the same reason: a probe
+    #: spec is a file that gets committed, diffed and printed by ``probe show``,
+    #: so a shared secret must never be written into one.  Resolved values are
+    #: added to the runner's redactor, so they cannot reach evidence either.
+    headers_from_env: Dict[str, str] = field(default_factory=dict)
     steps: List[ProbeStep] = field(default_factory=list)
     expect: List[ProbeExpectation] = field(default_factory=list)
     assertions: ProbeAssertions = field(default_factory=ProbeAssertions)
@@ -408,6 +417,10 @@ def parse_probe(data: Dict[str, Any], *, where: str = "<dict>") -> ProbeSpec:
         timeout_ms=int(probe.get("timeout_ms", 30000)),
         trace_on_failure=bool(probe.get("trace_on_failure", True)),
         credentials=dict(probe.get("credentials", {}) or {}),
+        headers={str(k): str(v) for k, v in (probe.get("headers", {}) or {}).items()},
+        headers_from_env={
+            str(k): str(v) for k, v in (probe.get("headers_from_env", {}) or {}).items()
+        },
         assertions=ProbeAssertions(
             no_console_errors=bool(assertions_raw.get("no_console_errors", False)),
             no_failed_requests=bool(assertions_raw.get("no_failed_requests", False)),
@@ -445,6 +458,15 @@ def parse_probe(data: Dict[str, Any], *, where: str = "<dict>") -> ProbeSpec:
         raise ProbeSpecError(f"{where}: the http runner needs a 'url'")
     if spec.runner == "browser" and not spec.steps:
         raise ProbeSpecError(f"{where}: the browser runner needs at least one step")
+
+    clashing = sorted(set(spec.headers) & set(spec.headers_from_env))
+    if clashing:
+        raise ProbeSpecError(
+            f"{where}: header(s) {', '.join(clashing)!r} are declared in both "
+            f"[probe.headers] and [probe.headers_from_env]; declare each header "
+            f"in exactly one, so it is unambiguous whether its value is a "
+            f"literal or a secret"
+        )
 
     declared = set(spec.credentials)
     for index, step in enumerate(spec.steps, start=1):

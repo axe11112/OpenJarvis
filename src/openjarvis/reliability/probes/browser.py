@@ -26,6 +26,7 @@ from openjarvis.reliability.probes._stubs import (
     CredentialRedactor,
     ProbeRunnerRegistry,
     resolve_credentials,
+    resolve_headers,
 )
 from openjarvis.reliability.probes.http import resolve_url
 from openjarvis.reliability.probes.spec import ProbeSpec, ProbeStep
@@ -209,7 +210,11 @@ class BrowserProbeRunner(BaseProbeRunner):
             ) from exc
 
         credentials = resolve_credentials(spec)
-        redactor = CredentialRedactor(credentials)
+        headers, header_secrets = resolve_headers(spec)
+        # Header secrets go into the redactor alongside credentials: a bypass
+        # token travels on every request, so it is the value most likely to be
+        # echoed back in an error page or a captured URL.
+        redactor = CredentialRedactor({**credentials, **header_secrets})
         # Resolved, not raw: a named noise profile contributes to *both*
         # channels.  One framework event can arrive as a failed request and as
         # a console error, and filtering only the channel it was first noticed
@@ -255,6 +260,12 @@ class BrowserProbeRunner(BaseProbeRunner):
                 ignore_https_errors=False,
             )
             context.set_default_timeout(spec.timeout_ms)
+            if headers:
+                # Context-level, so they ride on sub-resource and XHR requests
+                # too, not just the top-level navigation. A deployment-
+                # protection bypass has to cover every request the page makes
+                # or the page loads and its assets 401.
+                context.set_extra_http_headers(headers)
             if trace_path:
                 with suppress(Exception):
                     context.tracing.start(screenshots=True, snapshots=True)

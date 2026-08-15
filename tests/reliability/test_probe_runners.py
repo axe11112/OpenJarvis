@@ -722,3 +722,132 @@ class TestNoiseProfileEndToEnd:
         assert not result.success
         errors = [e for e in result.evidence if e.kind is EvidenceKind.HTTP_ERROR]
         assert any("/api/broken" in e.summary for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# Request headers
+# ---------------------------------------------------------------------------
+
+
+class TestProbeHeaders:
+    """Some targets cannot be reached without a header — a deployment-
+    protection bypass, a feature flag, a language preference. The value of one
+    of those is often a shared secret, which is exactly the kind of thing that
+    must not be written into a spec file that gets committed and printed by
+    ``probe show``.
+    """
+
+    def test_literal_headers_are_returned(self):
+        from openjarvis.reliability.probes._stubs import resolve_headers
+
+        spec = _browser_spec(headers={"accept-language": "sv-SE"})
+        headers, secrets = resolve_headers(spec)
+        assert headers == {"accept-language": "sv-SE"}
+        assert secrets == {}, "a literal is not a secret"
+
+    def test_env_sourced_header_is_resolved_and_marked_secret(self, monkeypatch):
+        from openjarvis.reliability.probes._stubs import resolve_headers
+
+        monkeypatch.setenv("PROBE_TEST_BYPASS", "s3cret-bypass-value")
+        spec = _browser_spec(
+            headers_from_env={"x-vercel-protection-bypass": "PROBE_TEST_BYPASS"}
+        )
+        headers, secrets = resolve_headers(spec)
+        assert headers["x-vercel-protection-bypass"] == "s3cret-bypass-value"
+        assert secrets == {"x-vercel-protection-bypass": "s3cret-bypass-value"}
+
+    def test_missing_env_names_the_variable_not_the_value(self, monkeypatch):
+        from openjarvis.reliability.probes._stubs import resolve_headers
+
+        monkeypatch.delenv("PROBE_TEST_ABSENT", raising=False)
+        spec = _browser_spec(headers_from_env={"x-bypass": "PROBE_TEST_ABSENT"})
+        with pytest.raises(MissingCredentialError) as excinfo:
+            resolve_headers(spec)
+        assert "PROBE_TEST_ABSENT" in str(excinfo.value)
+        assert "x-bypass" in str(excinfo.value)
+
+    def test_secret_header_values_are_redacted_from_evidence(self, monkeypatch):
+        """The point of the split return. A bypass token rides on every request,
+        so it is the value most likely to come back in an error page."""
+        from openjarvis.reliability.probes._stubs import (
+            CredentialRedactor,
+            resolve_headers,
+        )
+
+        monkeypatch.setenv("PROBE_TEST_BYPASS", "s3cret-bypass-value")
+        spec = _browser_spec(headers_from_env={"x-bypass": "PROBE_TEST_BYPASS"})
+        _, secrets = resolve_headers(spec)
+        redactor = CredentialRedactor(secrets)
+        leaked = "denied for token s3cret-bypass-value on /dashboard"
+        assert "s3cret-bypass-value" not in redactor.redact(leaked)
+        assert "[REDACTED]" in redactor.redact(leaked)
+
+    def test_declaring_a_header_twice_is_a_spec_error(self, monkeypatch):
+        """Ambiguous: is the value a literal or the name of a variable?"""
+        from openjarvis.reliability.probes.spec import ProbeSpecError
+
+        with pytest.raises(ProbeSpecError) as excinfo:
+            _browser_spec(
+                headers={"x-bypass": "literal"},
+                headers_from_env={"x-bypass": "SOME_VAR"},
+            )
+        assert "x-bypass" in str(excinfo.value)
+
+    def test_no_headers_by_default(self):
+        from openjarvis.reliability.probes._stubs import resolve_headers
+
+        assert resolve_headers(_browser_spec()) == ({}, {})
+
+    def test_http_runner_sends_the_headers(self, site, monkeypatch):
+        """End to end through the real fixture server, which echoes what it
+        received — proves the header reaches the wire, not just the dict."""
+        monkeypatch.setenv("PROBE_TEST_BYPASS", "bypass-abc123")
+        runner = HttpProbeRunner(verify_ssrf=False)
+        spec = _http_spec(
+            url="/echo-headers",
+            headers={"x-plain": "plain-value"},
+            headers_from_env={"x-secret": "PROBE_TEST_BYPASS"},
+            expect=[{"kind": "text", "value": "x-plain: plain-value"}],
+        )
+        result = runner.run(spec, base_url=site.base_url)
+        assert result.success, result.error
+
+    def test_http_runner_secret_header_does_not_leak_into_evidence(
+        self, site, monkeypatch
+    ):
+        """The echo endpoint deliberately reflects the secret back. A failing
+        assertion captures the body as evidence, so this is the realistic path
+        by which a bypass token would escape into an incident."""
+        monkeypatch.setenv("PROBE_TEST_BYPASS", "bypass-abc123")
+        runner = HttpProbeRunner(verify_ssrf=False)
+        spec = _http_spec(
+            url="/echo-headers",
+            headers_from_env={"x-secret": "PROBE_TEST_BYPASS"},
+            # Force a failure so the body is captured as evidence.
+            assertions={"max_http_status": 1},
+        )
+        result = runner.run(spec, base_url=site.base_url)
+        assert not result.success
+        blob = result.error + "".join(
+            (e.summary or "") + (e.content or "") for e in result.evidence
+        )
+        assert "bypass-abc123" not in blob, "secret header leaked into evidence"
+
+    def test_browser_runner_sends_headers_on_every_request(self, site, monkeypatch):
+        """Context-level, not just the navigation: a deployment-protection
+        bypass has to cover sub-resource and XHR requests too, or the document
+        loads and its assets 401."""
+        pytest.importorskip("playwright.sync_api")
+        monkeypatch.setenv("PROBE_TEST_BYPASS", "bypass-abc123")
+        runner = BrowserProbeRunner(headless=True)
+        spec = _browser_spec(
+            steps=[{"action": "goto", "url": "/echo-headers"}],
+            headers={"x-plain": "plain-value"},
+            headers_from_env={"x-secret": "PROBE_TEST_BYPASS"},
+            expect=[
+                {"kind": "text", "value": "x-plain: plain-value"},
+                {"kind": "text", "value": "x-secret: bypass-abc123"},
+            ],
+        )
+        result = runner.run(spec, base_url=site.base_url)
+        assert result.success, result.error

@@ -159,6 +159,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(500, '{"error":"boom"}', "application/json")
         elif path == "/boom":
             self._send(500, "<h1>Internal Server Error</h1>")
+        elif path == "/echo-headers":
+            # Reflects the request headers back. Deliberately echoes secret
+            # values too: that is the realistic path by which a bypass token
+            # escapes into captured evidence, so a test needs to be able to
+            # reproduce it rather than assume it cannot happen.
+            echoed = "\n".join(f"{k.lower()}: {v}" for k, v in self.headers.items())
+            self._send(200, f"<pre>{echoed}</pre>")
         elif path == "/subresource-404":
             self._send(200, _SUBRESOURCE_404_PAGE)
         elif path == "/rsc-prefetch-abort":

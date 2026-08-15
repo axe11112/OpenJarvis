@@ -24,6 +24,7 @@ __all__ = [
     "MissingCredentialError",
     "ProbeRunnerRegistry",
     "resolve_credentials",
+    "resolve_headers",
 ]
 
 #: Minimum length before a credential value is worth redacting.  Redacting a
@@ -64,6 +65,40 @@ def resolve_credentials(spec: ProbeSpec) -> Dict[str, str]:
             + ", ".join(missing)
         )
     return resolved
+
+
+def resolve_headers(spec: ProbeSpec) -> tuple[Dict[str, str], Dict[str, str]]:
+    """Resolve a spec's request headers.
+
+    Returns ``(headers, secret_values)`` — the full header mapping to send, and
+    just the env-sourced values, which the caller must hand to a
+    :class:`CredentialRedactor`.  The split exists so the caller cannot forget:
+    a header sourced from the environment is a secret by construction, and the
+    one place it would otherwise surface is a captured request URL or an error
+    message quoting the request.
+
+    Raises
+    ------
+    MissingCredentialError
+        When a declared environment variable is unset.  Names the header and
+        the variable, never a value.
+    """
+    headers: Dict[str, str] = dict(spec.headers)
+    secrets: Dict[str, str] = {}
+    missing: List[str] = []
+    for header_name, env_name in spec.headers_from_env.items():
+        value = os.environ.get(env_name, "")
+        if not value:
+            missing.append(f"{header_name} (${env_name})")
+            continue
+        headers[header_name] = value
+        secrets[header_name] = value
+    if missing:
+        raise MissingCredentialError(
+            f"probe '{spec.id}' needs header value(s) that are not set: "
+            + ", ".join(missing)
+        )
+    return headers, secrets
 
 
 class CredentialRedactor:

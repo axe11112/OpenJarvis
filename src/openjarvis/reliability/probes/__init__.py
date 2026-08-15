@@ -8,6 +8,7 @@ from openjarvis.reliability.probes._stubs import (
     MissingCredentialError,
     ProbeRunnerRegistry,
     resolve_credentials,
+    resolve_headers,
 )
 from openjarvis.reliability.probes.executor import (
     ConfirmationTracker,
@@ -68,5 +69,6 @@ __all__ = [
     "load_probes",
     "parse_probe",
     "resolve_credentials",
+    "resolve_headers",
     "resolve_noise_profiles",
 ]
