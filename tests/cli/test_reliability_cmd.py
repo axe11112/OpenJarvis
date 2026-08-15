@@ -502,9 +502,7 @@ class TestConfiguredPathsExpandHome:
         config.reliability.probes.evidence_dir = "~/.openjarvis/reliability/evidence"
         resolved = _evidence_dir(config)
         assert "~" not in resolved
-        assert resolved == str(
-            Path.home() / ".openjarvis" / "reliability" / "evidence"
-        )
+        assert resolved == str(Path.home() / ".openjarvis" / "reliability" / "evidence")
 
     def test_absolute_paths_are_left_alone(self, wired, tmp_path):
         from openjarvis.cli.reliability_cmd import _evidence_dir, _probe_dir
@@ -538,3 +536,71 @@ class TestProbeBaseUrlHonoursEnvironment:
         for name in ("TARGET_PRODUCTION_URL", "PRODUCTION_URL", "TARGET_URL"):
             monkeypatch.delenv(name, raising=False)
         assert _build_executor(config)._base_url == "https://production.example"
+
+
+class TestOutputStreamSeparation:
+    """The CLI writes three different things to two different places, and a
+    reader — human, ``jq``, or an assertion — must be able to tell them apart.
+
+    ``live-diagnostic`` always emits WARNING records for its blind spots, so
+    every test here runs with warnings genuinely present rather than mocked in.
+    """
+
+    @staticmethod
+    def _diagnostic(*extra):
+        return CliRunner().invoke(
+            cli,
+            ["reliability", "live-diagnostic", "--no-probes", "--no-incidents", *extra],
+        )
+
+    def test_warnings_are_emitted_and_reach_stderr(self):
+        """Guards the fix against the lazy version of itself. Making these
+        tests pass by silencing the logger would be a regression: the blind
+        spots are the honest part of the diagnostic."""
+        result = self._diagnostic()
+        assert "diagnostic blind spot" in result.stderr
+
+    def test_human_output_is_on_stdout_and_free_of_log_records(self):
+        result = self._diagnostic()
+        assert "Automatic repair: OFF" in result.stdout
+        assert "WARNING" not in result.stdout
+
+    def test_json_output_is_pure_json_on_stdout(self):
+        """``--json`` means a machine is reading. Warnings must not land in the
+        document, and the document must parse."""
+        import json
+
+        result = self._diagnostic("--json")
+        payload = json.loads(result.stdout)
+        assert "checks" in payload
+        assert "diagnostic blind spot" in result.stderr  # still reported, elsewhere
+
+    def test_json_survives_a_terminal_that_forces_colour(self, monkeypatch):
+        """The real defect. ``console.print_json`` styles its output whenever
+        colour is enabled, so ``$FORCE_COLOR`` — exported by several terminals
+        and agent harnesses — put ANSI escapes at byte 0 of a ``--json``
+        document and broke ``| jq``. Set here deliberately, against the
+        suite-wide normalisation, so this asserts the CLI's behaviour rather
+        than the test environment's."""
+        import json
+
+        monkeypatch.setenv("FORCE_COLOR", "3")
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setenv("TERM", "xterm-256color")
+
+        result = self._diagnostic("--json")
+        assert "\x1b[" not in result.stdout, "ANSI escapes in machine-readable output"
+        assert json.loads(result.stdout)["checks"]
+
+    def test_doctor_json_survives_a_terminal_that_forces_colour(
+        self, wired, monkeypatch
+    ):
+        import json
+
+        monkeypatch.setenv("FORCE_COLOR", "3")
+        monkeypatch.delenv("NO_COLOR", raising=False)
+        monkeypatch.setenv("TERM", "xterm-256color")
+
+        result = CliRunner().invoke(cli, ["reliability", "doctor", "--json"])
+        assert "\x1b[" not in result.stdout
+        assert "target" in json.loads(result.stdout)

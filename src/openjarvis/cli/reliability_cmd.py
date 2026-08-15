@@ -1103,14 +1103,20 @@ def reliability_doctor(connectivity: bool, as_json: bool) -> None:
     reachability = connectivity_report(target) if connectivity else []
 
     if as_json:
-        console.print_json(
+        # click.echo, not console.print_json: Rich syntax-highlights JSON, and
+        # emits the escape codes whenever colour is enabled — a terminal, or
+        # $FORCE_COLOR. `--json` means a machine is reading this, so
+        # `jarvis reliability doctor --json | jq` must not depend on how the
+        # operator's terminal is configured.
+        click.echo(
             json_module.dumps(
                 {
                     "target": target.to_dict(),
                     "connectivity": reachability,
                     "credentials": [c.to_dict() for c in credentials],
                     "safety": _safety_snapshot(config),
-                }
+                },
+                indent=2,
             )
         )
     else:
@@ -1271,7 +1277,9 @@ def reliability_live_diagnostic(
         )
 
         if as_json:
-            console.print_json(json_module.dumps(report.to_dict()))
+            # Plain, for the same reason as `doctor --json` above: machine
+            # output must not carry terminal styling.
+            click.echo(json_module.dumps(report.to_dict(), indent=2))
         else:
             console.print("\n[bold]JARVIS FULL DIAGNOSTIC[/bold]\n")
             for check in report.checks:
