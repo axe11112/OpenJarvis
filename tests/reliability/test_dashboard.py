@@ -31,6 +31,7 @@ from openjarvis.reliability.dashboard.model import (
     ProbeStatus,
     build_snapshot,
     incident_detail,
+    probe_card,
     probe_views,
     redact,
     safety_panel,
@@ -54,6 +55,7 @@ from openjarvis.reliability.types import (
     EvidenceKind,
     Incident,
     IncidentState,
+    ProbeResult,
     Severity,
     TrustLevel,
 )
@@ -548,10 +550,110 @@ def test_a_probe_never_observed_is_not_verified_not_green(tmp_path):
     assert "no record" in views[0].reason
 
 
-def test_a_disabled_probe_is_not_verified(tmp_path):
-    views = probe_views([_spec(enabled=False)], [], evidence_root=tmp_path)
-    assert views[0].status == ProbeStatus.NOT_VERIFIED.value
-    assert "disabled" in views[0].reason
+class TestADisabledProbeIsAParkedDecisionNotABlindSpot:
+    """A disabled spec used to report NOT_VERIFIED, which put it in the blind
+    spots, held the probe card DEGRADED and dragged overall down with it. One
+    deliberately parked probe was enough to make the Control Center amber
+    permanently — and a dashboard that can never go green is one nobody reads.
+
+    What must stay true: it is still listed, it keeps its history, it is still
+    not a pass, and an incident it already opened still counts.
+    """
+
+    def test_it_reports_disabled_rather_than_not_verified(self, tmp_path):
+        views = probe_views([_spec(enabled=False)], [], evidence_root=tmp_path)
+        assert views[0].status == ProbeStatus.DISABLED.value
+        assert views[0].enabled is False
+        assert "disabled in its spec" in views[0].reason
+
+    def test_it_is_still_listed_and_keeps_its_history(self, tmp_path):
+        """Parked, not deleted. Whatever it last observed stays readable."""
+        (tmp_path / "homepage" / "run-1").mkdir(parents=True)
+        views = probe_views([_spec(enabled=False)], [], evidence_root=tmp_path)
+        assert len(views) == 1
+        assert views[0].last_run
+        assert "last observed" in views[0].reason
+
+    def test_it_does_not_make_the_card_degraded(self, tmp_path):
+        """The regression, stated directly."""
+        views = probe_views(
+            [_spec(enabled=False), _spec(id="api", url="https://real.example.net/x")],
+            [],
+            evidence_root=tmp_path,
+            verified={"api": ProbeResult(probe_id="api", success=True)},
+        )
+        card = probe_card(views, directory=tmp_path)
+        assert card.state == HealthState.HEALTHY.value
+        assert card.blind_spots == []
+        assert "1 disabled" in card.summary
+
+    def test_it_is_not_counted_in_the_denominator(self, tmp_path):
+        views = probe_views(
+            [_spec(enabled=False), _spec(id="api", url="https://real.example.net/x")],
+            [],
+            evidence_root=tmp_path,
+            verified={"api": ProbeResult(probe_id="api", success=True)},
+        )
+        facts = {
+            f["label"]: f["value"] for f in probe_card(views, directory=tmp_path).facts
+        }
+        assert facts["configured"] == "1"
+        assert facts["passing"] == "1"
+        assert facts["not verified"] == "0"
+        assert facts["disabled"] == "1"
+
+    def test_it_stays_out_of_the_snapshot_blind_spots(self, tmp_path, config):
+        """Blind spots drive Wiz's message as well as the card."""
+        snapshot = build_snapshot(
+            config,
+            incidents=[],
+            specs=[_spec(enabled=False)],
+            evidence_root=tmp_path,
+            probe_directory=tmp_path,
+        )
+        assert not any("homepage" in spot for spot in snapshot.to_dict()["blind_spots"])
+
+    def test_a_genuinely_unobserved_probe_is_still_a_blind_spot(self, tmp_path):
+        """The fix must not launder real gaps. Enabled and never run stays amber."""
+        views = probe_views(
+            [_spec(), _spec(id="api", url="https://real.example.net/x")],
+            [],
+            evidence_root=tmp_path,
+            verified={"api": ProbeResult(probe_id="api", success=True)},
+        )
+        card = probe_card(views, directory=tmp_path)
+        assert card.state == HealthState.DEGRADED.value
+        assert card.blind_spots
+
+    def test_disabling_a_probe_does_not_clear_its_open_incident(self, store, tmp_path):
+        """Otherwise `enabled = false` becomes a way to silence a failure."""
+        incident = _incident(store, probe_id="homepage")
+        views = probe_views(
+            [_spec(enabled=False)], store.list(limit=10), evidence_root=tmp_path
+        )
+        assert views[0].status == ProbeStatus.FAIL.value
+        assert views[0].incident_id == incident.id
+        card = probe_card(views, directory=tmp_path)
+        assert card.state == HealthState.FAILED.value
+
+    def test_a_fleet_that_is_entirely_disabled_is_not_green(self, tmp_path):
+        """Nothing is watching. That is a configuration state, not health."""
+        views = probe_views(
+            [_spec(enabled=False), _spec(id="api", enabled=False)],
+            [],
+            evidence_root=tmp_path,
+        )
+        card = probe_card(views, directory=tmp_path)
+        assert card.state == HealthState.NOT_CONFIGURED.value
+        assert "all 2 probe(s) are disabled" in card.summary
+
+    def test_disabled_rows_sort_last(self, tmp_path):
+        views = probe_views(
+            [_spec(id="parked", enabled=False), _spec(id="live")],
+            [],
+            evidence_root=tmp_path,
+        )
+        assert [v.id for v in views] == ["live", "parked"]
 
 
 def test_a_placeholder_probe_can_never_pass(tmp_path):

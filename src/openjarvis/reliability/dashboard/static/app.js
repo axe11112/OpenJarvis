@@ -237,9 +237,12 @@
 
   /* ------------------------------------------------------------ probes */
 
+  /* "off" rather than "disabled": .disabled already dims the name cell, and a
+     chip that reads as a gap is the thing this status exists to stop. */
   var PROBE_CLASS = {
     PASS: "pass", FAIL: "fail",
-    NOT_VERIFIED: "notverified", KNOWN_NOISE: "noise"
+    NOT_VERIFIED: "notverified", KNOWN_NOISE: "noise",
+    DISABLED: "off"
   };
 
   function renderProbes(s) {

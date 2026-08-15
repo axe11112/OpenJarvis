@@ -11,7 +11,11 @@ unchanged, because a dashboard is exactly where they are most easily lost:
 * **Not-checked is never green.** A probe JARVIS has not observed reports
   ``NOT_VERIFIED``, never ``PASS``. A card whose check could not reach a verdict
   keeps its ``UNKNOWN`` / ``BLOCKED`` / ``NOT_CONFIGURED`` state instead of
-  being rounded down to a traffic light.
+  being rounded down to a traffic light. The rule is about things JARVIS is
+  *meant* to have checked: a probe switched off in its spec reports
+  ``DISABLED`` and sits outside the verdict entirely, since counting a
+  deliberate decision as a gap makes the amber permanent and the signal
+  worthless.
 * **Only a real observed failure is a failure.** A missing token makes JARVIS
   blind; it does not make the target broken, and the overall status says so.
 
@@ -104,12 +108,23 @@ class OverallStatus(str, Enum):
 
 
 class ProbeStatus(str, Enum):
-    """What JARVIS knows about one probe right now."""
+    """What JARVIS knows about one probe right now.
+
+    ``DISABLED`` is deliberately separate from ``NOT_VERIFIED``. They look
+    alike — neither is a pass — but they mean opposite things to an operator.
+    ``NOT_VERIFIED`` is a gap: something JARVIS is *supposed* to be watching
+    and is not, which is a problem to fix. ``DISABLED`` is a decision: somebody
+    turned the probe off, the watcher does not schedule it, and there is
+    nothing to fix. Collapsing the two makes every deliberately-parked probe
+    read as a permanent blind spot, and an amber dashboard that can never go
+    green is one nobody looks at.
+    """
 
     PASS = "PASS"
     FAIL = "FAIL"
     NOT_VERIFIED = "NOT_VERIFIED"
     KNOWN_NOISE = "KNOWN_NOISE"
+    DISABLED = "DISABLED"
 
 
 #: Severities that make an open incident a full production failure rather than a
@@ -571,10 +586,17 @@ def probe_views(
         An incident attributed to this probe is open. That is the only evidence
         of failure the system records, and it is authoritative.
     ``NOT_VERIFIED``
-        The probe is disabled, is still a placeholder, or JARVIS has no record
-        of ever having run it. None of these are passes, and a dashboard that
-        showed them as green would be exactly the false confidence the
-        reliability system is built to avoid.
+        The probe is still a placeholder, or JARVIS has no record of ever
+        having run it. Neither is a pass, and a dashboard that showed them as
+        green would be exactly the false confidence the reliability system is
+        built to avoid.
+    ``DISABLED``
+        ``enabled = false`` in the spec, so the watcher never schedules it.
+        Reported as its own state and kept in the table with whatever history
+        it has, because the row is still worth reading — but it is not a blind
+        spot, because nobody is expecting it to run. Note the order: an open
+        incident still wins. Switching a probe off must not be a way to clear
+        the failure it already found.
     ``KNOWN_NOISE``
         The run passed, but only after a noise profile filtered something out.
         That is a materially different fact from a clean pass — the probe is
@@ -636,8 +658,10 @@ def probe_views(
             view.status = ProbeStatus.FAIL.value
             view.reason = redact(result.error)[:200]
         elif not spec.enabled:
-            view.status = ProbeStatus.NOT_VERIFIED.value
-            view.reason = "disabled in its spec"
+            view.status = ProbeStatus.DISABLED.value
+            view.reason = "disabled in its spec; the watcher does not schedule it" + (
+                f" — last observed {view.last_run}" if view.last_run else ""
+            )
         elif placeholder:
             view.status = ProbeStatus.NOT_VERIFIED.value
             view.reason = "placeholder probe, refused rather than run: " + "; ".join(
@@ -662,11 +686,13 @@ def probe_views(
             view.reason = "JARVIS has no record of running this probe"
         views.append(view)
 
+    # Worst first, and disabled last: it is history, not news.
     order = {
         ProbeStatus.FAIL.value: 0,
         ProbeStatus.NOT_VERIFIED.value: 1,
         ProbeStatus.KNOWN_NOISE.value: 2,
         ProbeStatus.PASS.value: 3,
+        ProbeStatus.DISABLED.value: 4,
     }
     views.sort(key=lambda v: (order.get(v.status, 9), v.id))
     return views
@@ -675,9 +701,18 @@ def probe_views(
 def probe_card(views: List[ProbeView], *, directory: Path) -> CardView:
     """Summarize the probe fleet as one card.
 
-    ``HEALTHY`` requires every enabled probe to have actually been observed
+    ``HEALTHY`` requires every *active* probe to have actually been observed
     passing. A fleet where half the probes have never run is ``DEGRADED``, not
     green with a footnote.
+
+    Disabled probes are excluded from the verdict and from the denominators
+    entirely. They are counted in their own fact so the row is still visible,
+    but a probe nobody asked to run cannot be a blind spot, and one parked spec
+    must not hold the whole card amber forever.
+
+    The exception is a disabled probe with an open incident: that row is
+    ``FAIL``, set before this function sees it, and it still counts. Otherwise
+    switching a probe off would clear the failure it just found.
     """
     card = CardView(key="probes", title=_CARD_TITLES["probes"])
     card.facts = [{"label": "directory", "value": str(directory)}]
@@ -687,36 +722,53 @@ def probe_card(views: List[ProbeView], *, directory: Path) -> CardView:
         card.remediation = "Add probe specs describing real workflows of the target."
         return card
 
-    failing = [v for v in views if v.status == ProbeStatus.FAIL.value]
-    unverified = [v for v in views if v.status == ProbeStatus.NOT_VERIFIED.value]
+    disabled = [v for v in views if v.status == ProbeStatus.DISABLED.value]
+    active = [v for v in views if v.status != ProbeStatus.DISABLED.value]
+
+    failing = [v for v in active if v.status == ProbeStatus.FAIL.value]
+    unverified = [v for v in active if v.status == ProbeStatus.NOT_VERIFIED.value]
     passing = [
         v
-        for v in views
+        for v in active
         if v.status in (ProbeStatus.PASS.value, ProbeStatus.KNOWN_NOISE.value)
     ]
 
     card.facts += [
-        {"label": "configured", "value": str(len(views))},
+        {"label": "configured", "value": str(len(active))},
         {"label": "passing", "value": str(len(passing))},
         {"label": "failing", "value": str(len(failing))},
         {"label": "not verified", "value": str(len(unverified))},
     ]
+    if disabled:
+        card.facts.append({"label": "disabled", "value": str(len(disabled))})
     card.blind_spots = [f"{v.id}: {v.reason}" for v in unverified]
+
+    if not active:
+        # Every spec is switched off. Nothing is watching the target, which is
+        # a configuration state and emphatically not "all probes passing".
+        card.state = HealthState.NOT_CONFIGURED.value
+        card.summary = f"all {len(disabled)} probe(s) are disabled"
+        card.remediation = (
+            "Enable at least one probe, or JARVIS is not watching this target."
+        )
+        return card
 
     if failing:
         card.state = HealthState.FAILED.value
-        card.summary = f"{len(failing)} of {len(views)} probes are failing"
+        card.summary = f"{len(failing)} of {len(active)} probes are failing"
     elif unverified and passing:
         card.state = HealthState.DEGRADED.value
         card.summary = (
-            f"{len(passing)} passing, {len(unverified)} not verified of {len(views)}"
+            f"{len(passing)} passing, {len(unverified)} not verified of {len(active)}"
         )
     elif unverified:
         card.state = HealthState.NOT_CONFIGURED.value
-        card.summary = f"none of {len(views)} probes have been verified"
+        card.summary = f"none of {len(active)} probes have been verified"
     else:
         card.state = HealthState.HEALTHY.value
-        card.summary = f"all {len(views)} probes passing"
+        card.summary = f"all {len(active)} probes passing"
+    if disabled:
+        card.summary += f" ({len(disabled)} disabled)"
     return card
 
 
