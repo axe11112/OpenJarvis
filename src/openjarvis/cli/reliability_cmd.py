@@ -78,8 +78,15 @@ def _evidence_dir(config: Any) -> str:
     return str(get_config_dir() / "reliability" / "evidence")
 
 
-def _build_executor(config: Any) -> Any:
-    """Build a :class:`ProbeExecutor` wired from user config."""
+def _build_executor(config: Any, *, base_url_override: str = "") -> Any:
+    """Build a :class:`ProbeExecutor` wired from user config.
+
+    ``base_url_override`` is what ``--base-url`` passed on the command line.
+    It wins over both config and the environment: an operator naming a URL in
+    the invocation has said something more specific than either, and silently
+    probing somewhere else is the one behaviour a target override must never
+    have.
+    """
     from openjarvis.reliability.probes.executor import ProbeExecutor
 
     rc = config.reliability
@@ -101,7 +108,11 @@ def _build_executor(config: Any) -> Any:
     from openjarvis.reliability.target import resolve_target
 
     return ProbeExecutor(
-        base_url=resolve_target(config).production_url or rc.site.base_url,
+        base_url=(
+            base_url_override
+            or resolve_target(config).production_url
+            or rc.site.base_url
+        ),
         evidence_dir=_evidence_dir(config),
         runner_options={
             "browser": browser_options,
@@ -337,6 +348,12 @@ def _build_repair_loop(config: Any, store: Any, sources: list) -> Any:
             max_lines_changed=rc.repair.max_changed_lines,
         ),
         github=github,
+        # Cut the worktree from the configured base branch, not from whatever
+        # the workspace checkout happens to be pointing at. The default was
+        # "HEAD", so a checkout left on a feature branch would silently base
+        # every repair on that branch — and the resulting PR, opened against
+        # base_branch, would carry someone else's unrelated commits.
+        base_ref=rc.github.base_branch,
         base_branch=rc.github.base_branch,
         preview_lookup=_preview if vercel is not None else None,
         preview_logs=_preview_build_logs if vercel is not None else None,
@@ -873,7 +890,7 @@ def probe_run(probe_id: str, base_url: str) -> None:
         )
         raise SystemExit(1)
 
-    executor = _build_executor(config)
+    executor = _build_executor(config, base_url_override=base_url)
     console.print(f"Running [bold]{escape(spec.id)}[/bold]...")
     result = executor.run(spec)
 

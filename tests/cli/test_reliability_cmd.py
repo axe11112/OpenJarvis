@@ -604,3 +604,41 @@ class TestOutputStreamSeparation:
         result = CliRunner().invoke(cli, ["reliability", "doctor", "--json"])
         assert "\x1b[" not in result.stdout
         assert "target" in json.loads(result.stdout)
+
+
+class TestExplicitBaseUrlWins:
+    """`--base-url` must beat both config and the environment.
+
+    Resolving the target through resolve_target fixed one bug and introduced
+    another: $TARGET_PRODUCTION_URL is set on any machine configured for real
+    monitoring, so it silently outranked the URL the operator typed. `probe run
+    --base-url <preview>` then probed production instead — the single worst
+    behaviour a target override can have, and it fails silently because
+    production is usually healthy.
+    """
+
+    def test_flag_beats_the_environment(self, wired, monkeypatch):
+        from openjarvis.cli.reliability_cmd import _build_executor
+
+        config, _ = wired
+        config.reliability.site.base_url = "https://config.example"
+        monkeypatch.setenv("TARGET_PRODUCTION_URL", "https://production.example")
+        executor = _build_executor(config, base_url_override="https://preview.example")
+        assert executor._base_url == "https://preview.example"
+
+    def test_environment_still_wins_when_no_flag(self, wired, monkeypatch):
+        from openjarvis.cli.reliability_cmd import _build_executor
+
+        config, _ = wired
+        config.reliability.site.base_url = "https://config.example"
+        monkeypatch.setenv("TARGET_PRODUCTION_URL", "https://production.example")
+        assert _build_executor(config)._base_url == "https://production.example"
+
+    def test_config_used_when_neither(self, wired, monkeypatch):
+        from openjarvis.cli.reliability_cmd import _build_executor
+
+        config, _ = wired
+        config.reliability.site.base_url = "https://config.example"
+        for name in ("TARGET_PRODUCTION_URL", "PRODUCTION_URL", "TARGET_URL"):
+            monkeypatch.delenv(name, raising=False)
+        assert _build_executor(config)._base_url == "https://config.example"
