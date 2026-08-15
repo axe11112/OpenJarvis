@@ -279,11 +279,11 @@ class TestBrowserRunner:
         assert "/login" in result.final_url
 
     def test_subresource_404_is_not_a_javascript_error(self, runner, site):
-        """A missing favicon makes Chromium log a console *error*. Treating that
+        """A missing image makes Chromium log a console *error*. Treating that
         as a JS error would false-positive on essentially every real site, and
         would double-report what the network listener already captures."""
         spec = _browser_spec(
-            steps=[{"action": "goto", "url": "/login"}],
+            steps=[{"action": "goto", "url": "/subresource-404"}],
             assertions={"no_console_errors": True},
         )
         result = runner.run(spec, base_url=site.base_url)

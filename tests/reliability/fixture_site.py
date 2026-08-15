@@ -60,6 +60,21 @@ _SLOW_PAGE = """<!doctype html>
 <html><head><title>Slow</title></head><body><h1>Slow</h1></body></html>
 """
 
+# A page with one broken subresource, for the assertion that a failed image
+# load is a *network* problem and not a JavaScript error.
+#
+# That assertion used to ride on Chromium fetching /favicon.ico and getting a
+# 404, which headless Chromium does not reliably do — so the test passed or
+# failed on browser build rather than on the behaviour it names. It gets its
+# own route so that adding a guaranteed-404 subresource cannot change the
+# result of any probe pointed at /login.
+_SUBRESOURCE_404_PAGE = """<!doctype html>
+<html><head><title>Missing art</title></head><body>
+  <h1>Missing art</h1>
+  <img src="/does-not-exist.png" alt="">
+</body></html>
+"""
+
 # Reproduces, with no Next.js involved, exactly what the Next.js App Router
 # does to a probe: it starts a speculative `?_rsc=` prefetch, cancels it when
 # the visitor goes elsewhere, and — because it was awaiting the response —
@@ -144,6 +159,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(500, '{"error":"boom"}', "application/json")
         elif path == "/boom":
             self._send(500, "<h1>Internal Server Error</h1>")
+        elif path == "/subresource-404":
+            self._send(200, _SUBRESOURCE_404_PAGE)
         elif path == "/rsc-prefetch-abort":
             self._send(200, _RSC_ABORT_PAGE)
         elif path == "/rsc-prefetch-abort-and-broken-api":
