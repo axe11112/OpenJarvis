@@ -642,3 +642,179 @@ class TestExplicitBaseUrlWins:
         for name in ("TARGET_PRODUCTION_URL", "PRODUCTION_URL", "TARGET_URL"):
             monkeypatch.delenv(name, raising=False)
         assert _build_executor(config)._base_url == "https://config.example"
+
+
+class TestIncidentClose:
+    """Manual closure exists for incidents that are no longer *true* — a false
+    positive, a failure that stopped reproducing, a retired class of check. It
+    must be indistinguishable from any other transition as far as the audit
+    chain is concerned, and distinguishable from a verified repair as far as a
+    reader is concerned.
+    """
+
+    def _close(self, incident_id, *extra):
+        return CliRunner().invoke(
+            cli, ["reliability", "incident", "close", incident_id, *extra]
+        )
+
+    def test_normal_closure(self, wired):
+        _, store = wired
+        incident = store.create(_incident())
+        result = self._close(incident.id, "--reason", "false positive")
+        assert result.exit_code == 0, result.output
+        assert "closed" in result.stdout
+        assert store.get(incident.id).state is IncidentState.RESOLVED
+
+    def test_reason_is_required(self, wired):
+        _, store = wired
+        incident = store.create(_incident())
+        result = self._close(incident.id)
+        assert result.exit_code != 0
+        assert "reason" in (result.stdout + result.stderr).lower()
+        assert store.get(incident.id).state is IncidentState.DETECTED
+
+    def test_blank_reason_is_refused(self, wired):
+        """`--reason ""` satisfies click but says nothing; the point of the
+        flag is the audit record, not the ceremony."""
+        _, store = wired
+        incident = store.create(_incident())
+        result = self._close(incident.id, "--reason", "   ")
+        assert result.exit_code != 0
+        assert store.get(incident.id).state is IncidentState.DETECTED
+
+    def test_already_resolved_is_refused(self, wired):
+        _, store = wired
+        incident = store.create(_incident())
+        store.transition(incident, IncidentState.RESOLVED, reason="fixed")
+        before = len(store.transitions_for(incident.id))
+        result = self._close(incident.id, "--reason", "again")
+        assert result.exit_code != 0
+        assert "already RESOLVED" in result.stdout
+        assert len(store.transitions_for(incident.id)) == before, "no audit noise"
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            IncidentState.FIXING,
+            IncidentState.TESTING,
+            IncidentState.VERIFYING,
+            IncidentState.RECOVERY_REQUIRED,
+        ],
+    )
+    def test_active_repair_is_refused_without_force(self, wired, state):
+        """Closing mid-repair races a live attempt that may hold an open
+        worktree or a pushed branch."""
+        _, store = wired
+        incident = store.create(_incident())
+        for step in (
+            IncidentState.INVESTIGATING,
+            IncidentState.REPRODUCING,
+            IncidentState.FIXING,
+            IncidentState.TESTING,
+            IncidentState.VERIFYING,
+        ):
+            if store.get(incident.id).state is state:
+                break
+            store.transition(incident, step, reason="advance")
+        if state is IncidentState.RECOVERY_REQUIRED:
+            store.transition(incident, state, reason="interrupted")
+
+        result = self._close(incident.id, "--reason", "stale")
+        assert result.exit_code != 0
+        assert "repair is in progress" in result.stdout
+        assert store.get(incident.id).state is not IncidentState.RESOLVED
+
+    def test_force_closes_an_active_repair(self, wired):
+        _, store = wired
+        incident = store.create(_incident())
+        for step in (
+            IncidentState.INVESTIGATING,
+            IncidentState.REPRODUCING,
+            IncidentState.FIXING,
+        ):
+            store.transition(incident, step, reason="advance")
+        result = self._close(incident.id, "--reason", "abandoned", "--force")
+        assert result.exit_code == 0, result.output
+        assert store.get(incident.id).state is IncidentState.RESOLVED
+
+    def test_force_from_fixing_routes_through_human_required(self, wired):
+        """FIXING cannot reach RESOLVED directly — the state machine reserves
+        that path for verification. The command must not invent a shortcut; it
+        records that a human took the incident over, then closed it."""
+        _, store = wired
+        incident = store.create(_incident())
+        for step in (
+            IncidentState.INVESTIGATING,
+            IncidentState.REPRODUCING,
+            IncidentState.FIXING,
+        ):
+            store.transition(incident, step, reason="advance")
+        self._close(incident.id, "--reason", "abandoned", "--force")
+        states = [t.to_state for t in store.transitions_for(incident.id)]
+        assert IncidentState.HUMAN_REQUIRED in states
+        assert states[-1] is IncidentState.RESOLVED
+
+    def test_audit_entry_records_who_why_and_both_states(self, wired):
+        _, store = wired
+        incident = store.create(_incident())
+        self._close(
+            incident.id, "--reason", "RSC noise profile", "--actor", "operator:axel"
+        )
+        last = store.transitions_for(incident.id)[-1]
+        assert last.from_state is IncidentState.DETECTED
+        assert last.to_state is IncidentState.RESOLVED
+        assert last.actor == "operator:axel"
+        assert "RSC noise profile" in last.reason
+        assert last.at, "a timestamp is recorded"
+
+    def test_actor_defaults_to_a_named_operator_not_jarvis(self, wired):
+        """The audit trail is how a reader tells an administrative closure from
+        a verified repair, so the actor must not default to 'jarvis'."""
+        _, store = wired
+        incident = store.create(_incident())
+        self._close(incident.id, "--reason", "stale")
+        assert store.transitions_for(incident.id)[-1].actor.startswith("operator:")
+
+    def test_audit_chain_remains_valid(self, wired):
+        _, store = wired
+        for n in range(3):
+            inc = store.create(_incident(fingerprint=f"fp_{n}"))
+            self._close(inc.id, "--reason", f"stale {n}")
+        intact, broken_at = store.verify_chain()
+        assert intact, f"audit chain broken at row {broken_at}"
+
+    def test_evidence_and_attempts_are_preserved(self, wired):
+        _, store = wired
+        incident = store.create(_incident())
+        store.add_evidence(
+            incident,
+            Evidence(kind=EvidenceKind.CONSOLE_ERROR, summary="TypeError in auth.js"),
+        )
+        store.add_attempt(incident, RepairAttempt(number=1, branch="jarvis/fix/x"))
+        self._close(incident.id, "--reason", "stale")
+        reloaded = store.get(incident.id)
+        assert len(reloaded.evidence) == 1
+        assert reloaded.evidence[0].summary == "TypeError in auth.js"
+        assert len(reloaded.attempts) == 1
+
+    def test_closed_incident_is_no_longer_open(self, wired):
+        """Requirement: status and open-incident counts must stop showing it."""
+        _, store = wired
+        incident = store.create(_incident())
+        assert len(store.list(open_only=True)) == 1
+        self._close(incident.id, "--reason", "stale")
+        assert store.list(open_only=True) == []
+        status = CliRunner().invoke(cli, ["reliability", "status"])
+        assert "No open incidents" in status.stdout
+
+    def test_unknown_incident_is_an_error(self, wired):
+        result = self._close("INC-99999", "--reason", "stale")
+        assert result.exit_code != 0
+        assert "No such incident" in result.stdout
+
+    def test_nothing_is_deleted(self, wired):
+        _, store = wired
+        incident = store.create(_incident())
+        self._close(incident.id, "--reason", "stale")
+        assert store.get(incident.id) is not None
+        assert len(store.transitions_for(incident.id)) >= 2

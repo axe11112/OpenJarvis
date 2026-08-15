@@ -1079,6 +1079,127 @@ def incident_show(incident_id: str) -> None:
         store.close()
 
 
+#: States in which JARVIS is actively working on the incident. Closing one of
+#: these by hand races a running repair: a worktree may be open, a branch
+#: half-pushed, a coding agent mid-edit. Closure is refused unless the operator
+#: says explicitly that they know.
+#: As state *names*, so this module keeps its lazy-import convention — the
+#: reliability types are not loaded just to start the CLI.
+_ACTIVE_REPAIR_STATES = frozenset(
+    {"FIXING", "TESTING", "VERIFYING", "RECOVERY_REQUIRED"}
+)
+
+
+@incident_group.command("close")
+@click.argument("incident_id")
+@click.option(
+    "--reason",
+    required=True,
+    help="Why this incident is being closed. Recorded in the audit chain.",
+)
+@click.option(
+    "--actor",
+    default="",
+    help="Who is closing it. Defaults to operator:<login>.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Close even while a repair is in progress. Requires --reason to say why.",
+)
+def incident_close(incident_id: str, reason: str, actor: str, force: bool) -> None:
+    """Close an incident administratively, with an audited reason.
+
+    For incidents that are no longer true rather than ones JARVIS fixed: a
+    false positive, a failure that stopped reproducing, a class of check that
+    has since been retired. The distinction from an automatic resolution lives
+    in the audit chain, which records the actor and the reason — a verified
+    repair is closed by ``jarvis``, this is closed by a named operator.
+
+    Nothing is deleted and nothing is edited in place. The move goes through
+    the same state machine and the same hash-chained transition log as every
+    other transition, so evidence, screenshots, traces and repair attempts are
+    all preserved and ``verify-audit`` still passes afterwards.
+    """
+    import getpass
+
+    from openjarvis.reliability.types import (
+        LEGAL_TRANSITIONS,
+        IncidentState,
+        InvalidTransitionError,
+    )
+
+    console = Console()
+    store = _get_store()
+    try:
+        incident = store.get(incident_id)
+        if incident is None:
+            console.print(f"[red]No such incident: {escape(incident_id)}[/red]")
+            raise SystemExit(1)
+
+        if not reason.strip():
+            console.print("[red]--reason cannot be blank.[/red]")
+            raise SystemExit(1)
+
+        if incident.state is IncidentState.RESOLVED:
+            console.print(
+                f"[yellow]{escape(incident.id)} is already RESOLVED; "
+                "nothing to close.[/yellow]"
+            )
+            raise SystemExit(1)
+
+        if incident.state.value in _ACTIVE_REPAIR_STATES and not force:
+            console.print(
+                f"[red]{escape(incident.id)} is {_state_text(incident.state.value)} "
+                "— a repair is in progress.[/red]\n"
+                "Closing it now would abandon a running attempt, which may have "
+                "an open worktree or a pushed branch.\n"
+                "Stop the repair first, or pass --force if you know it is not "
+                "running."
+            )
+            raise SystemExit(1)
+
+        who = actor.strip() or f"operator:{getpass.getuser()}"
+        previous = incident.state
+
+        try:
+            # Some in-flight states cannot reach RESOLVED directly — the state
+            # machine reserves that path for verification. Hand the incident to
+            # a human first, which is what is actually happening, rather than
+            # inventing a shortcut. Both steps are legal and both are audited.
+            if IncidentState.RESOLVED not in LEGAL_TRANSITIONS.get(
+                incident.state, frozenset()
+            ):
+                store.transition(
+                    incident,
+                    IncidentState.HUMAN_REQUIRED,
+                    actor=who,
+                    reason=f"manual closure: {reason}",
+                )
+            store.transition(
+                incident,
+                IncidentState.RESOLVED,
+                actor=who,
+                reason=f"manual closure: {reason}",
+            )
+        except InvalidTransitionError as exc:
+            console.print(f"[red]Refused: {escape(str(exc))}[/red]")
+            raise SystemExit(1) from exc
+
+        console.print(
+            f"[green]{escape(incident.id)} closed[/green] "
+            f"{_state_text(previous.value)} → {_state_text(incident.state.value)}"
+        )
+        console.print(f"  actor : {escape(who)}")
+        console.print(f"  reason: {escape(reason)}")
+        console.print(
+            f"  [dim]evidence ({len(incident.evidence)}) and repair attempts "
+            f"({len(incident.attempts)}) are preserved[/dim]"
+        )
+    finally:
+        store.close()
+
+
 @reliability.command("verify-audit")
 def reliability_verify_audit() -> None:
     """Verify the incident transition log's hash chain."""
