@@ -472,3 +472,69 @@ class TestReportCommand:
         payload = json.loads(result.output)
         assert payload["incident_id"] == incident.id
         assert payload["production_deployed"] is False
+
+
+class TestConfiguredPathsExpandHome:
+    """``directory = "~/.openjarvis/reliability/probes"`` is what
+    docs/JARVIS_LIVE_SETUP.md §2 tells an operator to write, and TOML has no
+    notion of a home directory.  Left unexpanded it resolves relative to the
+    working directory, and JARVIS reports "no probe specs" while pointing at a
+    directory full of them — a monitoring system that says it is watching
+    nothing, when it has simply looked in the wrong place."""
+
+    def test_probe_directory_expands_tilde(self, wired):
+        from pathlib import Path
+
+        from openjarvis.cli.reliability_cmd import _probe_dir
+
+        config, _ = wired
+        config.reliability.probes.directory = "~/.openjarvis/reliability/probes"
+        resolved = _probe_dir(config)
+        assert "~" not in str(resolved)
+        assert resolved == Path.home() / ".openjarvis" / "reliability" / "probes"
+
+    def test_evidence_directory_expands_tilde(self, wired):
+        from pathlib import Path
+
+        from openjarvis.cli.reliability_cmd import _evidence_dir
+
+        config, _ = wired
+        config.reliability.probes.evidence_dir = "~/.openjarvis/reliability/evidence"
+        resolved = _evidence_dir(config)
+        assert "~" not in resolved
+        assert resolved == str(
+            Path.home() / ".openjarvis" / "reliability" / "evidence"
+        )
+
+    def test_absolute_paths_are_left_alone(self, wired, tmp_path):
+        from openjarvis.cli.reliability_cmd import _evidence_dir, _probe_dir
+
+        config, _ = wired
+        config.reliability.probes.directory = str(tmp_path / "p")
+        config.reliability.probes.evidence_dir = str(tmp_path / "e")
+        assert str(_probe_dir(config)) == str(tmp_path / "p")
+        assert _evidence_dir(config) == str(tmp_path / "e")
+
+
+class TestProbeBaseUrlHonoursEnvironment:
+    """The diagnostic resolves the target through ``resolve_target``, which
+    documents ``$TARGET_PRODUCTION_URL`` as the way to point a one-off run at
+    staging.  The CLI executor used to read ``config`` directly, so the same
+    override moved the diagnostic and left ``probe run`` on production."""
+
+    def test_env_override_wins(self, wired, monkeypatch):
+        from openjarvis.cli.reliability_cmd import _build_executor
+
+        config, _ = wired
+        config.reliability.site.base_url = "https://production.example"
+        monkeypatch.setenv("TARGET_PRODUCTION_URL", "https://staging.example")
+        assert _build_executor(config)._base_url == "https://staging.example"
+
+    def test_config_is_used_when_no_override(self, wired, monkeypatch):
+        from openjarvis.cli.reliability_cmd import _build_executor
+
+        config, _ = wired
+        config.reliability.site.base_url = "https://production.example"
+        for name in ("TARGET_PRODUCTION_URL", "PRODUCTION_URL", "TARGET_URL"):
+            monkeypatch.delenv(name, raising=False)
+        assert _build_executor(config)._base_url == "https://production.example"

@@ -57,16 +57,25 @@ def _probe_dir(config: Any) -> Any:
 
     configured = getattr(config.reliability.probes, "directory", "")
     if configured:
-        return Path(configured)
+        # expanduser because "~/.openjarvis/reliability/probes" is what
+        # docs/JARVIS_LIVE_SETUP.md tells an operator to write, and TOML has no
+        # notion of a home directory. Without this the path resolves relative to
+        # the working directory, the probes are silently not found, and JARVIS
+        # reports "no probes configured" while looking straight at them.
+        return Path(configured).expanduser()
     return get_config_dir() / "reliability" / "probes"
 
 
 def _evidence_dir(config: Any) -> str:
     """Resolve the evidence-artifact directory."""
+    from pathlib import Path
+
     from openjarvis.core.paths import get_config_dir
 
     configured = getattr(config.reliability.probes, "evidence_dir", "")
-    return configured or str(get_config_dir() / "reliability" / "evidence")
+    if configured:
+        return str(Path(configured).expanduser())
+    return str(get_config_dir() / "reliability" / "evidence")
 
 
 def _build_executor(config: Any) -> Any:
@@ -84,8 +93,15 @@ def _build_executor(config: Any) -> Any:
     if getattr(rc.probes, "browser_executable_path", ""):
         browser_options["executable_path"] = rc.probes.browser_executable_path
 
+    # Through resolve_target, not rc.site.base_url directly: the diagnostic
+    # already resolves the target that way, and $TARGET_PRODUCTION_URL is
+    # documented as the override for pointing a one-off run at staging. Reading
+    # config here and the environment there meant `probe run` could hit
+    # production while `live-diagnostic` reported it had checked staging.
+    from openjarvis.reliability.target import resolve_target
+
     return ProbeExecutor(
-        base_url=rc.site.base_url,
+        base_url=resolve_target(config).production_url or rc.site.base_url,
         evidence_dir=_evidence_dir(config),
         runner_options={
             "browser": browser_options,

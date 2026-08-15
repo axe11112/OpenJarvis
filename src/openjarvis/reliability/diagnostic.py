@@ -899,9 +899,16 @@ class LiveDiagnostic:
         from openjarvis.core.paths import get_config_dir
 
         configured = getattr(self._config.reliability.probes, "directory", "")
-        return Path(configured or str(get_config_dir() / "reliability" / "probes"))
+        # expanduser: see the note in cli/reliability_cmd.py::_probe_dir. A "~"
+        # that is not expanded turns "probes are configured" into "no probes
+        # found", which the diagnostic would otherwise report as a clean run.
+        return Path(
+            configured or str(get_config_dir() / "reliability" / "probes")
+        ).expanduser()
 
     def _build_executor(self) -> Any:
+        from pathlib import Path
+
         from openjarvis.reliability.probes.executor import ProbeExecutor
 
         rc = self._config.reliability
@@ -914,9 +921,10 @@ class LiveDiagnostic:
         }
         if getattr(rc.probes, "browser_executable_path", ""):
             browser_options["executable_path"] = rc.probes.browser_executable_path
+        evidence_dir = getattr(rc.probes, "evidence_dir", "") or ""
         return ProbeExecutor(
             base_url=self.target.production_url,
-            evidence_dir=getattr(rc.probes, "evidence_dir", "") or "",
+            evidence_dir=str(Path(evidence_dir).expanduser()) if evidence_dir else "",
             runner_options={
                 "browser": browser_options,
                 "http": {"verify_ssrf": not rc.probes.allow_private_targets},
