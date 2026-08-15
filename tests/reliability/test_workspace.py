@@ -244,3 +244,148 @@ class TestWorktreeRecord:
         )
         assert "abcdef123456" in wt.summary
         assert "main" in wt.summary
+
+
+# ---------------------------------------------------------------------------
+# Commit author identity
+# ---------------------------------------------------------------------------
+
+
+class TestRepairCommitIdentity:
+    """Who a repair commit is authored by is load-bearing, not cosmetic.
+
+    Hosting providers decide whether to build a pushed branch by mapping the
+    commit author to an authorized account. A synthetic author gets the preview
+    deployment silently refused — which presents as "the repair did not work"
+    rather than "nobody was allowed to build it", and sends the operator
+    debugging the fix instead of the identity.
+    """
+
+    IDENTITY = ("Axel Svahn", "axelsvahn10@gmail.com")
+
+    def _workspace(self, repo, tmp_path, identity):
+        return RepairWorkspace(
+            repo_path=str(repo),
+            root=str(tmp_path / "worktrees"),
+            git_identity=identity,
+        )
+
+    def _commit(self, ws, repo, incident="INC-1"):
+        worktree = ws.create(incident, base_ref="main")
+        Path(worktree.path, "app.py").write_text("VALUE = 2\n")
+        return worktree, ws.commit_all(worktree, "fix: value")
+
+    def test_configured_identity_is_applied_to_a_new_worktree(self, repo, tmp_path):
+        """Set at creation, before the coding agent — which has a shell and can
+        commit on its own — ever runs."""
+        ws = self._workspace(repo, tmp_path, self.IDENTITY)
+        worktree = ws.create("INC-1", base_ref="main")
+        assert ws.committer_identity(worktree.path) == self.IDENTITY
+
+    def test_repair_commit_uses_the_configured_identity(self, repo, tmp_path):
+        ws = self._workspace(repo, tmp_path, self.IDENTITY)
+        worktree, sha = self._commit(ws, repo)
+        author = subprocess.run(
+            ["git", "log", "-1", "--format=%an <%ae>"],
+            cwd=worktree.path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert author == "Axel Svahn <axelsvahn10@gmail.com>"
+
+    def test_configured_identity_beats_the_repository_default(self, repo, tmp_path):
+        """The repo fixture sets Test <t@example.com>; the configured identity
+        must win, or a repair would be authored as whoever last used the
+        checkout."""
+        ws = self._workspace(repo, tmp_path, self.IDENTITY)
+        worktree, _ = self._commit(ws, repo)
+        author = subprocess.run(
+            ["git", "log", "-1", "--format=%ae"],
+            cwd=worktree.path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert author == "axelsvahn10@gmail.com"
+
+    def test_no_global_git_config_is_written(self, repo, tmp_path, monkeypatch):
+        """JARVIS repairing one target must not change how the operator's
+        commits everywhere else are authored."""
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(fake_home / ".config"))
+        ws = self._workspace(repo, tmp_path, self.IDENTITY)
+        self._commit(ws, repo)
+        assert not (fake_home / ".gitconfig").exists()
+        assert not (fake_home / ".config" / "git" / "config").exists()
+
+    def test_unconfigured_inherits_the_repository_identity(self, repo, tmp_path):
+        """Default behaviour stays safe: no identity configured means git
+        resolves it normally, rather than JARVIS imposing a synthetic one."""
+        ws = self._workspace(repo, tmp_path, None)
+        worktree, _ = self._commit(ws, repo)
+        author = subprocess.run(
+            ["git", "log", "-1", "--format=%an <%ae>"],
+            cwd=worktree.path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert author == "Test <t@example.com>"
+
+    def test_fallback_only_when_git_has_no_identity_at_all(self, tmp_path, monkeypatch):
+        """A missing setting must not lose a repair, so a last-resort identity
+        still applies — but only when git can resolve none."""
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(fake_home / ".config"))
+        monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+        repo = tmp_path / "bare-identity-repo"
+        repo.mkdir()
+        _run(["git", "init", "-b", "main"], repo)
+        (repo / "app.py").write_text("VALUE = 1\n")
+        _run(["git", "add", "-A"], repo)
+        _run(
+            [
+                "git",
+                "-c",
+                "user.name=Seed",
+                "-c",
+                "user.email=s@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+            repo,
+        )
+        ws = RepairWorkspace(
+            repo_path=str(repo), root=str(tmp_path / "wt"), git_identity=None
+        )
+        worktree = ws.create("INC-2", base_ref="main")
+        Path(worktree.path, "app.py").write_text("VALUE = 3\n")
+        ws.commit_all(worktree, "fix")
+        author = subprocess.run(
+            ["git", "log", "-1", "--format=%ae"],
+            cwd=worktree.path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert author == "jarvis@localhost"
+
+    def test_incomplete_identity_is_ignored_not_half_applied(self, repo, tmp_path):
+        """A name with no email would produce a commit git refuses or a
+        nonsense author; leave it to git and warn instead."""
+        ws = self._workspace(repo, tmp_path, ("Axel Svahn", ""))
+        worktree, _ = self._commit(ws, repo)
+        author = subprocess.run(
+            ["git", "log", "-1", "--format=%an <%ae>"],
+            cwd=worktree.path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert author == "Test <t@example.com>"

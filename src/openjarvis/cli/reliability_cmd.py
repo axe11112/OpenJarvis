@@ -334,6 +334,11 @@ def _build_repair_loop(config: Any, store: Any, sources: list) -> Any:
             root=_worktree_root(config),
             branch_prefix=rc.github.branch_prefix,
             keep_on_failure=rc.repair.keep_failed_worktrees,
+            git_identity=(
+                (rc.repair.git_author_name, rc.repair.git_author_email)
+                if rc.repair.git_author_name and rc.repair.git_author_email
+                else None
+            ),
         ),
         test_command=rc.repair.test_command,
         checks=CheckSuite.from_config(

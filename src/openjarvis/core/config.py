@@ -1513,6 +1513,17 @@ class ReliabilityRepairConfig:
     """
 
     enabled: bool = False
+
+    #: Identity repair commits are authored with, set inside the isolated
+    #: worktree before anything commits. Empty means "leave it to git".
+    #:
+    #: Not cosmetic. Hosting providers decide whether to build a pushed branch
+    #: by mapping the commit author to an authorized account, so a synthetic
+    #: author gets the preview deployment silently refused — which looks like a
+    #: failed repair rather than a refused build. Set these to an identity the
+    #: target's host will accept.
+    git_author_name: str = ""
+    git_author_email: str = ""
     max_attempts: int = 3
     #: Repository the isolated worktrees are cut from. Read-only: JARVIS creates
     #: worktrees from it and never commits to it.

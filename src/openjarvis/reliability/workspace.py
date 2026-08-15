@@ -32,6 +32,13 @@ from openjarvis.reliability.types import now_iso
 
 logger = logging.getLogger(__name__)
 
+#: Last-resort commit identity, used only when git can resolve none at all.
+#: Deliberately not a default: a synthetic author gets deployments refused by
+#: hosts that map commit authors to authorized accounts, so it exists to stop a
+#: missing setting from losing a repair, not as a normal operating mode.
+_FALLBACK_AUTHOR_NAME = "JARVIS"
+_FALLBACK_AUTHOR_EMAIL = "jarvis@localhost"
+
 __all__ = [
     "RepairWorkspace",
     "WorkspaceError",
@@ -128,12 +135,26 @@ class RepairWorkspace:
     keep_on_failure:
         Leave the directory behind when a repair fails, so a human can inspect
         what the agent actually did. Successful repairs clean up.
+    git_identity:
+        ``(name, email)`` to author repair commits as, set inside the worktree
+        before any commit is made.
+
+        A repair commit is a commit in somebody else's repository, and the
+        identity on it is load-bearing well beyond attribution: hosting
+        providers decide whether to build a branch based on whether the commit
+        author maps to an authorized account.  A synthetic identity gets the
+        deployment silently refused, which reads as "the fix did not work"
+        rather than "nobody was allowed to build it".
+
+        Left unset, JARVIS does not touch the worktree's identity and git
+        resolves it normally from the repository and user configuration.
     """
 
     repo_path: str
     root: str
     branch_prefix: str = "jarvis/incident-"
     keep_on_failure: bool = True
+    git_identity: Optional[tuple[str, str]] = None
 
     # -- creation ---------------------------------------------------------
 
@@ -176,6 +197,10 @@ class RepairWorkspace:
             ["worktree", "add", "-b", branch, str(path), base_commit],
             cwd=self.repo_path,
         )
+        # Before anything can commit — the coding agent has a shell and may
+        # commit on its own, so setting this only at commit_all would leave a
+        # hole the agent walks straight through.
+        self._apply_git_identity(str(path))
         logger.info(
             "prepared repair worktree for %s: %s @ %s",
             incident_id,
@@ -189,6 +214,45 @@ class RepairWorkspace:
             base_commit=base_commit,
             base_ref=base_ref,
         )
+
+    def _apply_git_identity(self, worktree_path: str) -> None:
+        """Set the configured author identity inside *worktree_path*.
+
+        Scoped to the repository the worktree belongs to.  Global git
+        configuration is never written: JARVIS repairing one target must not
+        change how the operator's other commits are authored.
+        """
+        if not self.git_identity:
+            return
+        name, email = self.git_identity
+        if not name or not email:
+            logger.warning(
+                "repair git identity is incomplete (name=%r email=%r); "
+                "leaving the worktree identity to git",
+                name,
+                email,
+            )
+            return
+        git_output(["config", "user.name", name], cwd=worktree_path)
+        git_output(["config", "user.email", email], cwd=worktree_path)
+        logger.info("repair worktree will author commits as %s <%s>", name, email)
+
+    def committer_identity(self, worktree_path: str) -> tuple[str, str]:
+        """Return the ``(name, email)`` git would use in *worktree_path*.
+
+        Exposed so the repair loop can assert, before it pushes, that the
+        commit it is about to create carries an identity the target will
+        accept — rather than discovering it from a refused deployment.
+        """
+        # check=False: `git config <key>` exits 1 when the key is unset, which
+        # is an answer ("git has no identity here"), not a failure.
+        name = git_output(
+            ["config", "user.name"], cwd=worktree_path, check=False
+        ).strip()
+        email = git_output(
+            ["config", "user.email"], cwd=worktree_path, check=False
+        ).strip()
+        return name, email
 
     # -- inspection -------------------------------------------------------
 
@@ -264,19 +328,37 @@ class RepairWorkspace:
         status = git_output(["status", "--porcelain"], cwd=worktree.path)
         if not status.strip():
             raise WorkspaceError("nothing to commit")
-        git_output(
-            [
+
+        # The identity comes from the worktree, which create() configured.
+        #
+        # This used to pass `-c user.name=JARVIS -c user.email=jarvis@localhost`
+        # here, which does not merely fail to inherit the repository's identity
+        # — `-c` outranks every config level, so it actively overrode an
+        # identity the operator had deliberately set. The visible consequence
+        # was a Vercel preview silently refused because the commit author
+        # mapped to no authorized account, which presents as "the repair did
+        # not work" rather than "nobody was allowed to build it".
+        #
+        # A last-resort identity is still applied when git has none at all,
+        # because failing the commit outright would turn a missing setting into
+        # a lost repair.
+        command = ["commit", "--no-verify", "-m", message]
+        name, email = self.committer_identity(worktree.path)
+        if not name or not email:
+            logger.warning(
+                "no git identity in %s; committing with the JARVIS fallback. "
+                "Set [reliability.repair] git_author_name/git_author_email so "
+                "repair commits carry an identity your host will accept.",
+                worktree.path,
+            )
+            command = [
                 "-c",
-                "user.name=JARVIS",
+                f"user.name={_FALLBACK_AUTHOR_NAME}",
                 "-c",
-                "user.email=jarvis@localhost",
-                "commit",
-                "--no-verify",
-                "-m",
-                message,
-            ],
-            cwd=worktree.path,
-        )
+                f"user.email={_FALLBACK_AUTHOR_EMAIL}",
+                *command,
+            ]
+        git_output(command, cwd=worktree.path)
         return git_output(["rev-parse", "HEAD"], cwd=worktree.path).strip()
 
     def push(self, worktree: Worktree, *, remote: str = "origin") -> None:
