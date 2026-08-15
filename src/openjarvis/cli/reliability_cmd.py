@@ -881,6 +881,18 @@ def probe_run(probe_id: str, base_url: str) -> None:
             f"[green]PASS[/green] in {result.duration_seconds:.2f}s "
             f"({result.steps_completed} step(s))"
         )
+        # A pass that filtered something is not the same as a pass that saw
+        # nothing, and an operator who cannot tell them apart has no way to
+        # notice a pattern that has quietly grown too broad.
+        suppressed_console = int(result.metadata.get("suppressed_console_count", 0))
+        suppressed_requests = int(result.metadata.get("suppressed_request_count", 0))
+        if suppressed_console or suppressed_requests:
+            parts = []
+            if suppressed_console:
+                parts.append(f"{suppressed_console} console error(s)")
+            if suppressed_requests:
+                parts.append(f"{suppressed_requests} failed request(s)")
+            console.print(f"  [dim]ignored as known noise: {', '.join(parts)}[/dim]")
         return
 
     severity = escalate_severity(spec, result)

@@ -9,7 +9,7 @@ from openjarvis.reliability.probes._stubs import (
     MissingCredentialError,
     resolve_credentials,
 )
-from openjarvis.reliability.probes.browser import BrowserProbeRunner
+from openjarvis.reliability.probes.browser import BrowserProbeRunner, _Capture
 from openjarvis.reliability.probes.http import HttpProbeRunner, resolve_url
 from openjarvis.reliability.probes.spec import parse_probe
 from openjarvis.reliability.types import EvidenceKind
@@ -401,3 +401,324 @@ class TestBrowserRunner:
         second = runner.run(spec, base_url=site.base_url)
         assert first.success and second.success
         assert first.metadata["run_id"] != second.metadata["run_id"]
+
+
+# ---------------------------------------------------------------------------
+# Failed-request noise filtering
+# ---------------------------------------------------------------------------
+
+
+class _FakeRequest:
+    """The three attributes ``_Capture.on_request_failed`` reads."""
+
+    def __init__(self, url: str, method: str = "GET", failure: str = "net::ERR_FAILED"):
+        self.url = url
+        self.method = method
+        self.failure = failure
+
+
+class TestIgnoredRequestFailures:
+    """A router that cancels its own speculative prefetches reports a *failed*
+    request on every healthy page load.  Without a way to name that, the
+    ``no_failed_requests`` assertion cannot be used at all on such a site."""
+
+    def test_unfiltered_failures_are_recorded(self):
+        capture = _Capture()
+        capture.on_request_failed(_FakeRequest("https://x.com/api/thing"))
+        assert len(capture.failed_requests) == 1
+        assert capture.suppressed_requests == 0
+
+    def test_author_pattern_suppresses_the_match(self):
+        capture = _Capture(ignore_requests=[r"\?_rsc=[^ ]* net::ERR_ABORTED"])
+        capture.on_request_failed(
+            _FakeRequest("https://x.com/privacy?_rsc=19zvn", failure="net::ERR_ABORTED")
+        )
+        assert capture.failed_requests == []
+        assert capture.suppressed_requests == 1
+
+    def test_a_real_failure_still_gets_through(self):
+        """The pattern is scoped, not a blanket mute: a genuinely broken
+        request on the same host is still reported."""
+        capture = _Capture(ignore_requests=[r"\?_rsc=[^ ]* net::ERR_ABORTED"])
+        capture.on_request_failed(
+            _FakeRequest("https://x.com/api/thing", failure="net::ERR_CONNECTION_RESET")
+        )
+        assert len(capture.failed_requests) == 1
+        assert capture.suppressed_requests == 0
+
+    def test_patterns_can_scope_by_method(self):
+        capture = _Capture(ignore_requests=[r"^GET .*/beacon"])
+        capture.on_request_failed(_FakeRequest("https://x.com/beacon", method="POST"))
+        assert len(capture.failed_requests) == 1
+
+    def test_spec_parses_the_patterns(self):
+        spec = _browser_spec(
+            assertions={
+                "no_failed_requests": True,
+                "ignore_request_patterns": ["_rsc="],
+            }
+        )
+        assert spec.assertions.ignore_request_patterns == ["_rsc="]
+
+    def test_patterns_default_to_empty(self):
+        assert _browser_spec().assertions.ignore_request_patterns == []
+
+
+# ---------------------------------------------------------------------------
+# Named noise profiles (INC-00001)
+# ---------------------------------------------------------------------------
+
+
+#: The console error verbatim from https://www.wizeperformance.com/dashboard on
+#: 2026-08-15, stack trace and all. Hard-coded rather than paraphrased: the
+#: whole value of the pattern is that it matches what a real Next.js build
+#: actually emits, and a paraphrase would let a drifted pattern keep passing.
+_PRODUCTION_RSC_CONSOLE_ERROR = (
+    "Failed to fetch RSC payload for https://www.wizeperformance.com/privacy. "
+    "Falling back to browser navigation. TypeError: Failed to fetch\n"
+    "    at f (https://www.wizeperformance.com/_next/static/chunks/"
+    "7537-af1bd9b3d36afbdc.js:1:46127)\n"
+    "    at https://www.wizeperformance.com/_next/static/chunks/"
+    "7537-af1bd9b3d36afbdc.js:1:59679"
+)
+
+#: The corresponding failed request, in the "METHOD URL reason" form
+#: ``_Capture`` matches against.
+_PRODUCTION_RSC_REQUEST = (
+    "https://www.wizeperformance.com/privacy?_rsc=hi3jv",
+    "net::ERR_ABORTED",
+)
+
+
+def _rsc_capture():
+    """A capture configured exactly as the nextjs_rsc_prefetch profile does."""
+    spec = _browser_spec(assertions={"ignore_known_noise": ["nextjs_rsc_prefetch"]})
+    return _Capture(
+        spec.assertions.resolved_console_patterns(),
+        spec.assertions.resolved_request_patterns(),
+    )
+
+
+class _FakeConsoleMessage:
+    """The three attributes ``_Capture.on_console`` reads."""
+
+    def __init__(self, text: str, type: str = "error"):  # noqa: A002
+        self.type = type
+        self.text = text
+        self.location = {"url": "https://x.com/app.js"}
+
+
+class TestNextjsRscProfileIgnoresBenignNoise:
+    """INC-00001. The cancelled prefetch reaches JARVIS on two independent
+    channels — ``requestfailed`` and ``console`` — and only the first was
+    filtered, so a probe asserting ``no_console_errors`` (and not
+    ``no_failed_requests``) was never protected by that fix at all."""
+
+    def test_production_console_error_is_suppressed(self):
+        capture = _rsc_capture()
+        capture.on_console(_FakeConsoleMessage(_PRODUCTION_RSC_CONSOLE_ERROR))
+        assert capture.console_errors == []
+        assert capture.suppressed_console == 1
+
+    def test_production_failed_request_is_suppressed(self):
+        url, reason = _PRODUCTION_RSC_REQUEST
+        capture = _rsc_capture()
+        capture.on_request_failed(_FakeRequest(url, failure=reason))
+        assert capture.failed_requests == []
+        assert capture.suppressed_requests == 1
+
+    def test_suppression_is_counted_not_hidden(self):
+        """Evidence capture stays intact: what was filtered is still reported
+        as a number, so 'quiet' and 'not looking' remain distinguishable."""
+        url, reason = _PRODUCTION_RSC_REQUEST
+        capture = _rsc_capture()
+        capture.on_console(_FakeConsoleMessage(_PRODUCTION_RSC_CONSOLE_ERROR))
+        capture.on_request_failed(_FakeRequest(url, failure=reason))
+        assert (capture.suppressed_console, capture.suppressed_requests) == (1, 1)
+
+    def test_nothing_is_filtered_without_the_opt_in(self):
+        """The profile is not global: a spec that does not name it sees the
+        noise, which is what makes this a probe-author decision."""
+        url, reason = _PRODUCTION_RSC_REQUEST
+        capture = _Capture()
+        capture.on_console(_FakeConsoleMessage(_PRODUCTION_RSC_CONSOLE_ERROR))
+        capture.on_request_failed(_FakeRequest(url, failure=reason))
+        assert len(capture.console_errors) == 1
+        assert len(capture.failed_requests) == 1
+
+
+class TestNextjsRscProfileStillReportsRealFailures:
+    """Each of these is a failure the profile must never swallow. They are the
+    reason the patterns are over-specified rather than matching 'Failed to
+    fetch', which is the shorthand a hurried author would reach for."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "TypeError: Failed to fetch",
+            "Uncaught TypeError: Failed to fetch at loadProfile (app.js:12)",
+            "Failed to fetch user profile: 500",
+            "Error: Failed to fetch RSC payload",  # truncated, no recovery clause
+        ],
+        ids=["bare", "uncaught", "app-message", "no-recovery-clause"],
+    )
+    def test_arbitrary_failed_to_fetch_is_not_ignored(self, text):
+        capture = _rsc_capture()
+        capture.on_console(_FakeConsoleMessage(text))
+        assert len(capture.console_errors) == 1, f"{text!r} was wrongly suppressed"
+
+    def test_genuine_uncaught_exception_is_not_ignored(self):
+        capture = _rsc_capture()
+        capture.on_page_error("TypeError: window.notAFunction is not a function")
+        assert len(capture.page_errors) == 1
+
+    @pytest.mark.parametrize(
+        "url,reason",
+        [
+            ("https://x.com/api/athletes", "net::ERR_CONNECTION_REFUSED"),
+            ("https://x.com/api/athletes?_rsc=abc", "net::ERR_CONNECTION_REFUSED"),
+            ("https://x.com/logo.png", "net::ERR_ABORTED"),
+            ("https://x.com/_next/static/chunks/main.js", "net::ERR_ABORTED"),
+            ("https://x.com/styles.css", "net::ERR_ABORTED"),
+            ("https://x.com/privacy?_rsc=hi3jv", "net::ERR_NAME_NOT_RESOLVED"),
+            ("https://x.com/privacy?_rsc=hi3jv", "net::ERR_CERT_DATE_INVALID"),
+        ],
+        ids=["api", "api-with-rsc", "image", "script", "css", "dns", "tls"],
+    )
+    def test_real_request_failures_are_not_ignored(self, url, reason):
+        capture = _rsc_capture()
+        capture.on_request_failed(_FakeRequest(url, failure=reason))
+        assert len(capture.failed_requests) == 1, f"{url} {reason} wrongly suppressed"
+
+
+class TestNoiseProfileSpecParsing:
+    def test_profile_expands_into_both_channels(self):
+        spec = _browser_spec(assertions={"ignore_known_noise": ["nextjs_rsc_prefetch"]})
+        assert spec.assertions.resolved_console_patterns()
+        assert spec.assertions.resolved_request_patterns()
+
+    def test_author_patterns_are_preserved_verbatim(self):
+        """Resolution is additive and non-destructive, so ``probe show`` can
+        still print what the author wrote rather than an expanded blob."""
+        spec = _browser_spec(
+            assertions={
+                "ignore_known_noise": ["nextjs_rsc_prefetch"],
+                "ignore_console_patterns": ["ResizeObserver loop"],
+                "ignore_request_patterns": ["/beacon"],
+            }
+        )
+        assert spec.assertions.ignore_console_patterns == ["ResizeObserver loop"]
+        assert spec.assertions.ignore_request_patterns == ["/beacon"]
+        assert "ResizeObserver loop" in spec.assertions.resolved_console_patterns()
+        assert "/beacon" in spec.assertions.resolved_request_patterns()
+
+    def test_unknown_profile_is_a_spec_error(self):
+        """A typo must fail loudly. The quiet version of this bug is a probe
+        whose author believes noise is filtered when it is not — or believes a
+        check is running when the name guarding it never matched."""
+        from openjarvis.reliability.probes.spec import ProbeSpecError
+
+        with pytest.raises(ProbeSpecError) as excinfo:
+            _browser_spec(assertions={"ignore_known_noise": ["nextjs_rsc_prefetc"]})
+        assert "nextjs_rsc_prefetc" in str(excinfo.value)
+        assert "nextjs_rsc_prefetch" in str(excinfo.value)  # names the valid one
+
+    def test_defaults_to_no_profiles(self):
+        spec = _browser_spec()
+        assert spec.assertions.ignore_known_noise == []
+        assert spec.assertions.resolved_console_patterns() == []
+        assert spec.assertions.resolved_request_patterns() == []
+
+
+class TestNoiseProfileEndToEnd:
+    """Through a real Chromium against the fixture site, so the patterns are
+    tested against what a browser actually emits rather than against strings
+    this test suite made up."""
+
+    @pytest.fixture
+    def runner(self, require_browser):
+        return BrowserProbeRunner(headless=True)
+
+    def test_benign_prefetch_abort_passes(self, runner, site):
+        spec = _browser_spec(
+            steps=[
+                {"action": "goto", "url": "/rsc-prefetch-abort"},
+                {"action": "wait_for_timeout", "timeout_ms": 800},
+            ],
+            assertions={
+                "no_console_errors": True,
+                "no_failed_requests": True,
+                "ignore_known_noise": ["nextjs_rsc_prefetch"],
+            },
+        )
+        result = runner.run(spec, base_url=site.base_url)
+        assert result.success, result.error
+        # Proves the run really did produce the noise, rather than the page
+        # quietly failing to reproduce it and the test passing for free.
+        assert result.metadata["suppressed_console_count"] >= 1
+        assert result.metadata["suppressed_request_count"] >= 1
+
+    def test_same_page_fails_without_the_profile(self, runner, site):
+        """The control: identical probe, profile removed."""
+        spec = _browser_spec(
+            steps=[
+                {"action": "goto", "url": "/rsc-prefetch-abort"},
+                {"action": "wait_for_timeout", "timeout_ms": 800},
+            ],
+            assertions={"no_console_errors": True, "no_failed_requests": True},
+        )
+        result = runner.run(spec, base_url=site.base_url)
+        assert not result.success
+        assert result.failure_kind == "console_error"
+
+    def test_genuine_javascript_error_still_fails(self, runner, site):
+        spec = _browser_spec(
+            steps=[{"action": "goto", "url": "/js-error"}],
+            assertions={
+                "no_console_errors": True,
+                "ignore_known_noise": ["nextjs_rsc_prefetch"],
+            },
+        )
+        result = runner.run(spec, base_url=site.base_url)
+        assert not result.success
+        assert "JavaScript error" in result.error
+        console = [e for e in result.evidence if e.kind is EvidenceKind.CONSOLE_ERROR]
+        assert any("notAFunction" in (e.content or "") for e in console)
+
+    def test_broken_api_call_alongside_the_noise_still_fails(self, runner, site):
+        """Both happen on the same page load. The profile must let exactly one
+        of them through."""
+        spec = _browser_spec(
+            steps=[
+                {"action": "goto", "url": "/rsc-prefetch-abort-and-broken-api"},
+                {"action": "wait_for_timeout", "timeout_ms": 800},
+            ],
+            assertions={
+                "no_failed_requests": True,
+                "ignore_known_noise": ["nextjs_rsc_prefetch"],
+            },
+        )
+        result = runner.run(spec, base_url=site.base_url)
+        assert not result.success
+        assert result.failure_kind == "network_failure"
+        failures = [
+            e for e in result.evidence if e.kind is EvidenceKind.NETWORK_FAILURE
+        ]
+        assert any("/api/profile" in e.summary for e in failures)
+        assert not any("_rsc=" in e.summary for e in failures)
+
+    def test_http_500_still_fails_with_the_profile_on(self, runner, site):
+        spec = _browser_spec(
+            steps=[
+                {"action": "goto", "url": "/xhr-fail"},
+                {"action": "wait_for_timeout", "timeout_ms": 500},
+            ],
+            assertions={
+                "max_http_status": 399,
+                "ignore_known_noise": ["nextjs_rsc_prefetch"],
+            },
+        )
+        result = runner.run(spec, base_url=site.base_url)
+        assert not result.success
+        errors = [e for e in result.evidence if e.kind is EvidenceKind.HTTP_ERROR]
+        assert any("/api/broken" in e.summary for e in errors)

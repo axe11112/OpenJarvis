@@ -108,6 +108,17 @@ favicon would open an incident on essentially every real site. Those messages ar
 the JavaScript-error bucket (they remain visible via `no_failed_requests`/`max_http_status`), and
 `ignore_console_patterns` covers app-specific noise.
 
+**Design note (INC-00001).** Framework noise can reach JARVIS on *two independent channels*. A
+cancelled Next.js RSC prefetch arrives as a `requestfailed` (`net::ERR_ABORTED`) and, when the
+router was awaiting it, as a `console` error too. Filtering only the channel the noise was first
+noticed on left `auth-gate-dashboard` — which asserts `no_console_errors` but not
+`no_failed_requests` — failing intermittently on healthy production. The fix is
+`ignore_known_noise`: named, vetted profiles in `probes/noise.py` that a spec opts into by name and
+that cover every channel at once. Deliberately *not* global — a monitoring system that decides on
+its own what to stop looking at is worth very little — and deliberately not left to per-probe
+regexes, because the intuitive shorthand for this one (`Failed to fetch`) also hides a broken API
+call. Unknown profile names are a spec error, never a silent no-op.
+
 ---
 
 ## Phase 3 — GitHub

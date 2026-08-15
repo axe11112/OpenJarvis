@@ -15,6 +15,11 @@ from openjarvis.reliability.probes.executor import (
     escalate_severity,
 )
 from openjarvis.reliability.probes.http import HttpProbeRunner
+from openjarvis.reliability.probes.noise import (
+    KNOWN_NOISE_PROFILES,
+    NoiseProfile,
+    resolve_noise_profiles,
+)
 from openjarvis.reliability.probes.spec import (
     ProbeAssertions,
     ProbeExpectation,
@@ -41,6 +46,7 @@ except ImportError:  # pragma: no cover
     BrowserUnavailableError = RuntimeError  # type: ignore[misc,assignment]
 
 __all__ = [
+    "KNOWN_NOISE_PROFILES",
     "BaseProbeRunner",
     "BrowserProbeRunner",
     "BrowserUnavailableError",
@@ -48,6 +54,7 @@ __all__ = [
     "CredentialRedactor",
     "HttpProbeRunner",
     "MissingCredentialError",
+    "NoiseProfile",
     "ProbeAssertions",
     "ProbeExecutor",
     "ProbeExpectation",
@@ -61,4 +68,5 @@ __all__ = [
     "load_probes",
     "parse_probe",
     "resolve_credentials",
+    "resolve_noise_profiles",
 ]

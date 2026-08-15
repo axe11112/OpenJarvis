@@ -72,17 +72,26 @@ class _Capture:
     Parameters
     ----------
     ignore_console:
-        Author-supplied regexes for known, benign console noise specific to the
-        application under test.
+        Regexes for known, benign console noise — the spec's own patterns plus
+        those of any noise profile it named.
+    ignore_requests:
+        Regexes for request failures the application causes on purpose —
+        matched against ``"METHOD URL reason"``, same two sources.
     """
 
-    def __init__(self, ignore_console: Optional[List[str]] = None) -> None:
+    def __init__(
+        self,
+        ignore_console: Optional[List[str]] = None,
+        ignore_requests: Optional[List[str]] = None,
+    ) -> None:
         self.console_errors: List[Dict[str, Any]] = []
         self.failed_requests: List[Dict[str, Any]] = []
         self.http_errors: List[Dict[str, Any]] = []
         self.page_errors: List[str] = []
         self.suppressed_console = 0
+        self.suppressed_requests = 0
         self._ignore = [re.compile(p) for p in (ignore_console or [])]
+        self._ignore_requests = [re.compile(p) for p in (ignore_requests or [])]
 
     def _is_author_ignored(self, text: str) -> bool:
         """Author-declared noise, applied to every JavaScript error source."""
@@ -125,16 +134,19 @@ class _Capture:
             self.page_errors.append(text)
 
     def on_request_failed(self, request: Any) -> None:
+        failure = getattr(request, "failure", None)
+        entry = {
+            "url": request.url,
+            "method": request.method,
+            "reason": str(failure) if failure else "unknown",
+        }
+        subject = f"{entry['method']} {entry['url']} {entry['reason']}"
+        if any(pattern.search(subject) for pattern in self._ignore_requests):
+            self.suppressed_requests += 1
+            return
         if len(self.failed_requests) >= _MAX_NETWORK_ENTRIES:
             return
-        failure = getattr(request, "failure", None)
-        self.failed_requests.append(
-            {
-                "url": request.url,
-                "method": request.method,
-                "reason": str(failure) if failure else "unknown",
-            }
-        )
+        self.failed_requests.append(entry)
 
     def on_response(self, response: Any) -> None:
         if response.status < 400 or len(self.http_errors) >= _MAX_NETWORK_ENTRIES:
@@ -198,7 +210,14 @@ class BrowserProbeRunner(BaseProbeRunner):
 
         credentials = resolve_credentials(spec)
         redactor = CredentialRedactor(credentials)
-        capture = _Capture(spec.assertions.ignore_console_patterns)
+        # Resolved, not raw: a named noise profile contributes to *both*
+        # channels.  One framework event can arrive as a failed request and as
+        # a console error, and filtering only the channel it was first noticed
+        # on is what let the RSC prefetch abort keep failing this probe.
+        capture = _Capture(
+            spec.assertions.resolved_console_patterns(),
+            spec.assertions.resolved_request_patterns(),
+        )
 
         run_id = uuid.uuid4().hex[:12]
         artifact_dir = self._artifact_dir(evidence_dir, spec.id, run_id)
@@ -361,6 +380,7 @@ class BrowserProbeRunner(BaseProbeRunner):
                 + len(capture.page_errors),
                 "suppressed_console_count": capture.suppressed_console,
                 "failed_request_count": len(capture.failed_requests),
+                "suppressed_request_count": capture.suppressed_requests,
                 "http_error_count": len(capture.http_errors),
             },
         )

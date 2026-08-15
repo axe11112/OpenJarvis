@@ -60,6 +60,54 @@ _SLOW_PAGE = """<!doctype html>
 <html><head><title>Slow</title></head><body><h1>Slow</h1></body></html>
 """
 
+# Reproduces, with no Next.js involved, exactly what the Next.js App Router
+# does to a probe: it starts a speculative `?_rsc=` prefetch, cancels it when
+# the visitor goes elsewhere, and — because it was awaiting the response —
+# logs its own console error before recovering with a full navigation.
+#
+# The console text is the real one, captured from
+# https://www.wizeperformance.com/dashboard on 2026-08-15 (INC-00001), down to
+# the wording of the sentence the pattern keys on. Chromium turns the abort
+# into a genuine `net::ERR_ABORTED` requestfailed event, so this exercises both
+# channels the profile has to cover, through a real browser.
+_RSC_ABORT_PAGE = """<!doctype html>
+<html><head><title>Prefetch</title></head><body>
+  <h1 id="ready">Prefetch</h1>
+  <script>
+    var url = '/rsc-slow?_rsc=1obve';
+    var controller = new AbortController();
+    fetch(url, {signal: controller.signal}).catch(function (err) {
+      console.error(
+        'Failed to fetch RSC payload for ' + location.origin + url +
+        '. Falling back to browser navigation.', err);
+    });
+    setTimeout(function () { controller.abort(); }, 100);
+  </script>
+</body></html>
+"""
+
+# The same benign prefetch abort, plus a genuinely broken API call that fails
+# at the transport layer (port 1 refuses connections). A probe that names the
+# RSC profile must still fail on this one — that is the whole point of scoping
+# the pattern to `?_rsc=` and `net::ERR_ABORTED` rather than to "Failed to
+# fetch".
+_RSC_ABORT_PLUS_REAL_FAILURE_PAGE = """<!doctype html>
+<html><head><title>Prefetch</title></head><body>
+  <h1 id="ready">Prefetch</h1>
+  <script>
+    var url = '/rsc-slow?_rsc=1obve';
+    var controller = new AbortController();
+    fetch(url, {signal: controller.signal}).catch(function (err) {
+      console.error(
+        'Failed to fetch RSC payload for ' + location.origin + url +
+        '. Falling back to browser navigation.', err);
+    });
+    setTimeout(function () { controller.abort(); }, 100);
+    fetch('http://127.0.0.1:1/api/profile').catch(function () {});
+  </script>
+</body></html>
+"""
+
 
 class _Handler(BaseHTTPRequestHandler):
     """Routes for the fixture site."""
@@ -96,6 +144,15 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(500, '{"error":"boom"}', "application/json")
         elif path == "/boom":
             self._send(500, "<h1>Internal Server Error</h1>")
+        elif path == "/rsc-prefetch-abort":
+            self._send(200, _RSC_ABORT_PAGE)
+        elif path == "/rsc-prefetch-abort-and-broken-api":
+            self._send(200, _RSC_ABORT_PLUS_REAL_FAILURE_PAGE)
+        elif path == "/rsc-slow":
+            # Slow enough that the page's AbortController always wins the race,
+            # so the request is genuinely in flight when it is cancelled.
+            time.sleep(2.0)
+            self._send(200, "{}", "application/json")
         elif path == "/slow":
             time.sleep(1.5)
             self._send(200, _SLOW_PAGE)

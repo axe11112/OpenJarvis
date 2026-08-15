@@ -154,6 +154,29 @@ class ProbeAssertions:
     they are network problems, already reported by ``no_failed_requests`` and
     ``max_http_status`` with far more detail.  Use
     ``ignore_console_patterns`` for application-specific noise on top of that.
+
+    ``ignore_request_patterns`` is the same escape hatch for the network side.
+    Some frameworks *routinely* abort requests they started on purpose — a
+    router that speculatively prefetches the next page cancels the fetch when
+    the user goes elsewhere, and the browser reports a cancelled request as a
+    failed one.  Without a way to name that, ``no_failed_requests`` is
+    unusable on those applications: it fails on every run of a perfectly
+    healthy page, which is exactly the noise that trains an owner to ignore
+    JARVIS.  Patterns are regexes matched against ``"METHOD URL reason"``, so
+    an author can scope them by verb, by URL shape, by failure reason, or any
+    combination — never a blanket "ignore network failures" switch.
+
+    ``ignore_known_noise`` names one or more vetted profiles from
+    :mod:`openjarvis.reliability.probes.noise` instead of restating their
+    regexes.  It exists because those two lists have a sharp edge: the same
+    framework event can surface as a console error *and* as a failed request,
+    so muting it correctly means writing two patterns in two different places,
+    and the intuitive shorthand for one of them (``"Failed to fetch"``) is
+    broad enough to hide a genuinely broken API call.  A profile name is
+    reviewed once and says what it means; the probe still has to ask for it.
+
+    The three are additive.  A probe may name a profile *and* declare its own
+    patterns; nothing is filtered that no spec asked to filter.
     """
 
     no_console_errors: bool = False
@@ -161,6 +184,26 @@ class ProbeAssertions:
     max_http_status: int = 0  # 0 = not asserted
     max_duration_seconds: float = 0.0  # 0 = not asserted
     ignore_console_patterns: List[str] = field(default_factory=list)
+    ignore_request_patterns: List[str] = field(default_factory=list)
+    ignore_known_noise: List[str] = field(default_factory=list)
+
+    def resolved_console_patterns(self) -> List[str]:
+        """Author patterns plus those of every named profile.
+
+        Kept as a method rather than folded into the field at parse time so
+        that ``probe show`` can still print what the author actually wrote.
+        """
+        from openjarvis.reliability.probes.noise import resolve_noise_profiles
+
+        console, _ = resolve_noise_profiles(self.ignore_known_noise)
+        return [*self.ignore_console_patterns, *console]
+
+    def resolved_request_patterns(self) -> List[str]:
+        """Author patterns plus those of every named profile."""
+        from openjarvis.reliability.probes.noise import resolve_noise_profiles
+
+        _, requests = resolve_noise_profiles(self.ignore_known_noise)
+        return [*self.ignore_request_patterns, *requests]
 
 
 @dataclass(slots=True)
@@ -304,6 +347,28 @@ def _parse_expectation(raw: Dict[str, Any], where: str, index: int) -> ProbeExpe
     return expectation
 
 
+def _parse_noise_profiles(assertions_raw: Dict[str, Any], where: str) -> List[str]:
+    """Validate ``ignore_known_noise`` against the profile registry.
+
+    An unknown name is rejected rather than ignored.  The quiet version of
+    this typo is a probe that looks like it suppresses framework noise, does
+    not, and gets muted by its owner the third time it cries wolf — or the
+    reverse, a probe whose author believes a check is active when the name
+    guarding it never matched anything.
+    """
+    from openjarvis.reliability.probes.noise import KNOWN_NOISE_PROFILES
+
+    names = list(assertions_raw.get("ignore_known_noise", []) or [])
+    unknown = [name for name in names if name not in KNOWN_NOISE_PROFILES]
+    if unknown:
+        raise ProbeSpecError(
+            f"{where}: unknown noise profile(s) {', '.join(sorted(unknown))!r} in "
+            f"ignore_known_noise; known profiles: "
+            f"{', '.join(sorted(KNOWN_NOISE_PROFILES))}"
+        )
+    return names
+
+
 def parse_probe(data: Dict[str, Any], *, where: str = "<dict>") -> ProbeSpec:
     """Build a :class:`ProbeSpec` from parsed TOML data."""
     probe = data.get("probe", data)
@@ -353,6 +418,10 @@ def parse_probe(data: Dict[str, Any], *, where: str = "<dict>") -> ProbeSpec:
             ignore_console_patterns=list(
                 assertions_raw.get("ignore_console_patterns", []) or []
             ),
+            ignore_request_patterns=list(
+                assertions_raw.get("ignore_request_patterns", []) or []
+            ),
+            ignore_known_noise=_parse_noise_profiles(assertions_raw, where),
         ),
         retry=ProbeRetry(
             attempts=int(retry_raw.get("attempts", 1) or 1),
