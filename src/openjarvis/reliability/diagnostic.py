@@ -771,10 +771,20 @@ class LiveDiagnostic:
 
         agent = ClaudeCliAgent()
         if agent.available():
+            # Say which of the two worlds this is. The summary used to assert
+            # "repair disabled" unconditionally, which reads as reassurance and
+            # becomes a lie the moment repair is switched on — in exactly the
+            # phase where an operator most needs the diagnostic to be literal.
+            repair_enabled = bool(self._config.reliability.repair.enabled)
             return CheckResult(
                 name="code_agent",
                 state=HealthState.HEALTHY,
-                summary="claude CLI available (diagnostic-only; repair disabled)",
+                summary=(
+                    "claude CLI available (repair ENABLED — it may modify code "
+                    "in an isolated worktree)"
+                    if repair_enabled
+                    else "claude CLI available (diagnostic-only; repair disabled)"
+                ),
             )
         return CheckResult(
             name="code_agent",

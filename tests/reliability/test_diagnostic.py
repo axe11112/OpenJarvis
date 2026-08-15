@@ -543,3 +543,42 @@ class TestExplanatoryFactsSurvive:
         # and the facts set at the end are still there
         assert facts["repository"] == "acme/site"
         assert facts["default_branch"] == "main"
+
+
+class TestCodeAgentReportsWhatItMayActuallyDo:
+    """The summary asserted "repair disabled" no matter what repair was set to.
+
+    Harmless while repair was off, and a lie the moment it was switched on —
+    in exactly the phase where an operator is reading the diagnostic to find
+    out whether anything can now modify code.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _cli_on_path(self, monkeypatch):
+        monkeypatch.setattr("shutil.which", lambda _name: "/usr/local/bin/claude")
+
+    def test_repair_off_says_diagnostic_only(self, tmp_path):
+        config = _config(tmp_path)
+        config.reliability.repair.enabled = False
+        check = LiveDiagnostic(config).check_code_agent()
+        assert check.state is HealthState.HEALTHY
+        assert "diagnostic-only" in check.summary
+        assert "repair disabled" in check.summary
+
+    def test_repair_on_says_it_may_modify_code(self, tmp_path):
+        config = _config(tmp_path)
+        config.reliability.repair.enabled = True
+        check = LiveDiagnostic(config).check_code_agent()
+        assert check.state is HealthState.HEALTHY
+        assert "repair ENABLED" in check.summary
+        assert "isolated worktree" in check.summary
+        # The reassurance must not survive into the enabled state.
+        assert "repair disabled" not in check.summary
+        assert "diagnostic-only" not in check.summary
+
+    def test_a_missing_cli_is_still_not_configured(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("shutil.which", lambda _name: None)
+        config = _config(tmp_path)
+        config.reliability.repair.enabled = True
+        check = LiveDiagnostic(config).check_code_agent()
+        assert check.state is HealthState.NOT_CONFIGURED
