@@ -87,6 +87,18 @@ class VoiceEndpoints:
                 "confirmations": [c.to_dict() for c in self.confirmations.pending()],
                 "at": now_iso(),
             }
+        if path == "/api/voice/audio-check":
+            # What the last utterance actually was, per live session: container,
+            # sample rate, duration, peak level, raw transcript. Metadata only —
+            # the audio itself is never stored, so there is nothing here to leak
+            # beyond what Sir already said out loud.
+            sessions = getattr(self.sessions, "_sessions", {}) or {}
+            return 200, {
+                "sessions": {
+                    sid: getattr(s, "last_audio", {}) for sid, s in sessions.items()
+                },
+                "at": now_iso(),
+            }
         if path == "/api/voice/push-key":
             # The public half only. It is meant to be public — the browser
             # passes it to the push service to bind the subscription to us.

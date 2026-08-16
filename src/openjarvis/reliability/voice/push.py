@@ -225,7 +225,13 @@ class PushSender:
     """Sends empty, VAPID-signed knocks to registered phones."""
 
     key: VapidKey
-    subject: str = "mailto:jarvis@localhost"
+    #: VAPID contact, sent to the push service. Apple validates this and
+    #: rejects the entire token with ``BadJwtToken`` when the address is not
+    #: plausible: ``mailto:jarvis@localhost`` fails, because ``localhost`` is
+    #: not a domain anybody could reach. Found the only way it could be found —
+    #: by pushing to a real iPhone. An ``https:`` URL is equally valid per
+    #: RFC 8292 and gives a push service somewhere real to send a complaint.
+    subject: str = "https://github.com/axe11112/OpenJarvis"
     #: How long a push service should hold the knock for a phone that is off.
     ttl_seconds: int = 600
     timeout_seconds: float = 10.0

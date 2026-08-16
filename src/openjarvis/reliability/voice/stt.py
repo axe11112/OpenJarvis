@@ -38,12 +38,13 @@ microphone in a room ends up triggering an operation.
 from __future__ import annotations
 
 import logging
+import math
 import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,89 @@ class WhisperTranscriber:
         if not Path(self.model_path).exists():
             return f"the whisper model file is missing: {self.model_path}"
         return ""
+
+    def inspect(self, wav_bytes: bytes) -> Dict[str, Any]:
+        """Describe an utterance without transcribing it.
+
+        Exists because "I didn't catch that" has half a dozen possible causes —
+        a browser that sent a container whisper cannot read, a microphone that
+        was never actually opened, a recording of pure silence, a two-frame clip
+        from a tapped button — and they are indistinguishable from the outside.
+        Measuring the bytes tells you which one it is in one look.
+        """
+        info: Dict[str, Any] = {"bytes": len(wav_bytes), "format": "unknown"}
+        if len(wav_bytes) < 44:
+            info["problem"] = "too short to be a WAV file"
+            return info
+
+        head = wav_bytes[:12]
+        if head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+            # The commonest wrong answer: MediaRecorder output. whisper.cpp
+            # reads WAV only, so naming the container is the whole diagnosis.
+            if wav_bytes[:4] == b"\x1aE\xdf\xa3":
+                info["format"] = "WebM/Opus (MediaRecorder) — whisper cannot read this"
+            elif wav_bytes[4:8] == b"ftyp":
+                info["format"] = "MP4/AAC (MediaRecorder) — whisper cannot read this"
+            else:
+                info["format"] = f"not RIFF/WAVE, starts with {wav_bytes[:4]!r}"
+            info["problem"] = "not a WAV container"
+            return info
+
+        try:
+            import io
+            import wave
+
+            with wave.open(io.BytesIO(wav_bytes), "rb") as handle:
+                channels = handle.getnchannels()
+                width = handle.getsampwidth()
+                rate = handle.getframerate()
+                frames = handle.getnframes()
+                raw = handle.readframes(frames)
+        except Exception as exc:  # noqa: BLE001
+            info["problem"] = f"unreadable WAV: {exc}"
+            return info
+
+        info.update(
+            {
+                "format": "WAV",
+                "channels": channels,
+                "sample_width_bytes": width,
+                "sample_rate": rate,
+                "frames": frames,
+                "duration_seconds": round(frames / rate, 2) if rate else 0.0,
+            }
+        )
+
+        # Peak amplitude answers "was the microphone actually live?". A stream
+        # of zeros is a permission that was granted and a graph that was never
+        # connected — which looks exactly like a quiet room from up here.
+        if width == 2 and raw:
+            import array
+
+            samples = array.array("h")
+            samples.frombytes(raw[: len(raw) - (len(raw) % 2)])
+            if samples:
+                peak = max(max(samples), -min(samples))
+                info["peak_amplitude"] = peak
+                info["peak_dbfs"] = (
+                    round(20 * math.log10(peak / 32768), 1) if peak else -999
+                )
+                info["silent"] = peak < 200
+
+        problems = []
+        if rate != 16000:
+            problems.append(f"sample rate is {rate}, whisper wants 16000")
+        if channels != 1:
+            problems.append(f"{channels} channels, whisper wants mono")
+        if width != 2:
+            problems.append(f"{width * 8}-bit samples, whisper wants 16-bit")
+        if info.get("duration_seconds", 0) < 0.3:
+            problems.append("shorter than 0.3s — nothing to transcribe")
+        if info.get("silent"):
+            problems.append("silent: the microphone produced no signal")
+        if problems:
+            info["problem"] = "; ".join(problems)
+        return info
 
     def transcribe(self, wav_bytes: bytes) -> str:
         """Return the text of *wav_bytes*, or ``""``.

@@ -47,6 +47,23 @@ DEFAULT_MAX_DURATION = 1800.0
 GREETING = "Sir, I'm here. What would you like to know?"
 
 
+def _summarise(diagnosis: Dict[str, Any]) -> str:
+    """One readable line describing an utterance, for the log."""
+    if not diagnosis:
+        return "(not inspected)"
+    parts = [f"{diagnosis.get('bytes', 0)}B", str(diagnosis.get("format", "?"))]
+    if diagnosis.get("sample_rate"):
+        parts.append(
+            f"{diagnosis['sample_rate']}Hz/{diagnosis.get('channels', '?')}ch/"
+            f"{diagnosis.get('duration_seconds', 0)}s"
+        )
+    if "peak_dbfs" in diagnosis:
+        parts.append(f"peak {diagnosis['peak_dbfs']}dBFS")
+    if diagnosis.get("problem"):
+        parts.append(f"PROBLEM: {diagnosis['problem']}")
+    return " ".join(parts)
+
+
 @dataclass
 class Turn:
     """One exchange: what was heard, and what was said back."""
@@ -89,6 +106,9 @@ class VoiceSession:
     ended: bool = False
     end_reason: str = ""
     turns: List[Turn] = field(default_factory=list)
+    #: What the last utterance actually contained: container, sample rate,
+    #: duration, peak level, raw transcript. Metadata only — never the audio.
+    last_audio: Dict[str, Any] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def __post_init__(self) -> None:
@@ -133,12 +153,32 @@ class VoiceSession:
 
         self.last_activity = self.clock()
         heard = ""
+        # Measured before transcription, and logged whatever happens. "I didn't
+        # catch that" has several very different causes that look identical from
+        # the outside; this is what tells them apart without a debugger on a
+        # phone that is not here.
+        diagnosis: Dict[str, Any] = {}
         try:
             if self.transcriber is not None:
+                # Optional: a transcriber that cannot describe audio is still a
+                # perfectly good transcriber, and losing the diagnosis must
+                # never cost us the transcript.
+                inspect = getattr(self.transcriber, "inspect", None)
+                if callable(inspect):
+                    try:
+                        diagnosis = inspect(wav_bytes) or {}
+                    except Exception:  # noqa: BLE001
+                        logger.exception("voice: could not inspect the audio")
                 heard = self.transcriber.transcribe(wav_bytes) or ""
         except Exception:  # noqa: BLE001 - unheard, never invented
             logger.exception("voice: transcription failed")
             heard = ""
+
+        diagnosis["raw_transcript"] = heard
+        self.last_audio = diagnosis
+        logger.warning(
+            "voice: utterance %s -> transcript=%r", _summarise(diagnosis), heard
+        )
 
         heard = self._clean(heard)
         if not heard:
