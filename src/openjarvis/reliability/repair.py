@@ -725,7 +725,9 @@ class RepairLoop:
                 "No rollback was attempted and no database was written."
             ),
         )
-        self._escalate(incident, reason)
+        # notify=False: the CRITICAL message below is this event's notification,
+        # and it says more than the generic escalation would.
+        self._escalate(incident, reason, notify=False)
 
         if self.notifier is not None:
             try:
@@ -782,8 +784,16 @@ class RepairLoop:
             f"{str(marker.get('reason', ''))[:200]}"
         )
 
-    def _escalate(self, incident: Incident, reason: str) -> None:
-        """Stop touching code and hand the incident to a human."""
+    def _escalate(
+        self, incident: Incident, reason: str, *, notify: bool = True
+    ) -> None:
+        """Stop touching code and hand the incident to a human.
+
+        ``notify=False`` is for callers that send their own, more specific
+        message. The post-merge failure path is the only one: it has a CRITICAL
+        notification naming the live deployment, and sending the generic
+        escalation alongside it would tell the owner the same bad news twice.
+        """
         logger.warning("Incident %s requires a human: %s", incident.id, reason)
         if incident.state is not IncidentState.HUMAN_REQUIRED:
             try:
@@ -792,13 +802,14 @@ class RepairLoop:
                 )
             except Exception:
                 logger.exception("could not transition %s", incident.id)
-        self._notify(
-            "human_required",
-            incident,
-            reason=reason,
-            attempts=incident.attempts_used,
-            max_attempts=self.policy.max_attempts,
-        )
+        if notify:
+            self._notify(
+                "human_required",
+                incident,
+                reason=reason,
+                attempts=incident.attempts_used,
+                max_attempts=self.policy.max_attempts,
+            )
 
     def _security_sweep(
         self, incident: Incident, attempt: RepairAttempt

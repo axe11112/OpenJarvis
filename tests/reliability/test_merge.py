@@ -806,14 +806,17 @@ class TestAutoMergerNotifies:
         ).merge_for(incident)
         assert record.merged is True
 
-    def test_the_outcome_message_names_the_gates_that_refused(self):
-        from openjarvis.reliability.notify import render_merge_outcome
-
+    def test_a_refusal_is_recorded_even_though_it_is_not_announced(self):
+        """The gates refusing is not news for the owner — it is the system
+        working — but it must still be written down, in full, with the gate that
+        refused named. The audit log is where a refusal lives now."""
         incident = _incident()
         github = _FakeGitHub()
+        audited = []
 
         class _Store:
-            def record_audit(self, *a, **k):
+            def record_audit(self, _incident, *, actor, reason):
+                audited.append(reason)
                 return None
 
             def add_evidence(self, *a, **k):
@@ -822,19 +825,10 @@ class TestAutoMergerNotifies:
         record = AutoMerger(github=github, store=_Store(), enabled=False).merge_for(
             incident
         )
-        message = render_merge_outcome(incident, record=record)
-        assert "merge refused" in message
-        assert "merge_enabled" in message
-        assert "nothing was deployed" in message.lower()
-
-    def test_the_attempt_message_says_it_is_not_a_deployment(self):
-        from openjarvis.reliability.notify import render_merge_attempt
-
-        message = render_merge_attempt(
-            _incident(), pr_number=42, head_sha=VERIFIED_SHA, method="squash"
-        )
-        assert "#42" in message
-        assert "does not deploy" in message
+        assert not record.merged
+        assert "merge_enabled" in record.decision.reason
+        assert audited and "refused" in audited[0]
+        assert not github.merge_calls
 
 
 # ---------------------------------------------------------------------------

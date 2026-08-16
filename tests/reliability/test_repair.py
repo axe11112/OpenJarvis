@@ -678,6 +678,119 @@ class TestPostMergeStateFlow:
         assert intact, f"audit chain broken at row {bad_row}"
 
 
+class TestWhatReachesTheOwner:
+    """End to end, through the real router: how many messages does a repair send?
+
+    The unit tests prove each event is silent; these prove the whole run is. A
+    policy that suppresses six notifications individually and still sends four
+    from somewhere else has not achieved anything.
+    """
+
+    def _router(self):
+        from openjarvis.reliability.notify import ConsoleNotifier, NotificationRouter
+        from openjarvis.reliability.types import Severity
+
+        notifier = ConsoleNotifier()
+        return (
+            NotificationRouter(
+                notifier=notifier,
+                min_severity=Severity.LOW,
+                dedup_window_seconds=0.0,
+            ),
+            notifier,
+        )
+
+    def test_a_successful_pr_repair_sends_exactly_one_message(self, store, incident):
+        router, sent = self._router()
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([True]),
+            github=_MergingGitHub(),
+            notifier=router,
+        )
+        loop.run(incident, _spec())
+
+        assert len(sent.sent) == 1, f"expected one message, got:\n{sent.sent}"
+        assert sent.sent[0].startswith("Sir, I fixed the issue.")
+
+    def test_a_failed_repair_sends_exactly_one_message(self, store, incident):
+        """Three attempts, three failures — one escalation, not three updates."""
+        router, sent = self._router()
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([False, False, False]),
+            github=_MergingGitHub(),
+            notifier=router,
+        )
+        loop.run(incident, _spec())
+
+        assert len(sent.sent) == 1, f"expected one message, got:\n{sent.sent}"
+        assert sent.sent[0].startswith("Sir, I need your help.")
+
+    def test_a_live_repair_sends_exactly_one_message(self, store, incident):
+        router, sent = self._router()
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([True]),
+            github=_MergingGitHub(),
+            auto_merger=_FakeMerger(),
+            post_merge_verifier=_FakePostMerge(verified=True),
+            notifier=router,
+        )
+        loop.run(incident, _spec())
+
+        assert len(sent.sent) == 1, f"expected one message, got:\n{sent.sent}"
+        assert sent.sent[0].startswith("Sir, it's fixed.")
+
+    def test_a_post_merge_failure_sends_exactly_one_critical_message(
+        self, store, incident
+    ):
+        """It must arrive, and it must arrive once. The escalation and the
+        post-merge alert are the same bad news; the owner hears it one way."""
+        router, sent = self._router()
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([True]),
+            github=_MergingGitHub(),
+            auto_merger=_FakeMerger(),
+            post_merge_verifier=_FakePostMerge(
+                verified=False, reason="production stayed red", rule="fleet_failed"
+            ),
+            notifier=router,
+        )
+        loop.run(incident, _spec())
+
+        assert len(sent.sent) == 1, f"expected one message, got:\n{sent.sent}"
+        assert sent.sent[0].startswith("Sir, I need your help.")
+        assert "I stopped making changes." in sent.sent[0]
+
+    def test_no_message_mentions_the_bot_or_internal_states(self, store, incident):
+        router, sent = self._router()
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([True]),
+            github=_MergingGitHub(),
+            notifier=router,
+        )
+        loop.run(incident, _spec())
+
+        for message in sent.sent:
+            assert message.startswith("Sir,")
+            assert not message.startswith("JARVIS")
+            for jargon in ("RESOLVED", "VERIFYING", "fingerprint", "probe"):
+                assert jargon not in message
+
+
 class TestRetryStormGuard:
     """A merge that broke production must not be answered with another merge."""
 

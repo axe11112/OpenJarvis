@@ -10,7 +10,8 @@ from openjarvis.reliability.notify import (
     TelegramNotifier,
     render_alert,
     render_human_required,
-    render_progress,
+    render_post_merge_failed,
+    render_production_verified,
     render_resolved,
     render_rolled_back,
 )
@@ -51,73 +52,123 @@ class _FakeClock:
 # ---------------------------------------------------------------------------
 
 
+#: Internal vocabulary that must never reach the owner's phone. Every one of
+#: these is a word this codebase uses correctly and constantly, which is exactly
+#: why the guard is a test rather than a style note.
+JARGON = (
+    "fingerprint",
+    "verification gate",
+    "state transition",
+    "deployment lineage",
+    "scope violation",
+    "reproduction contract",
+    "verifier authority",
+    "health vocabulary",
+    "probe fleet",
+    "incident lifecycle",
+    "HUMAN_REQUIRED",
+    "RESOLVED",
+    "combined_status",
+    "SHA",
+)
+
+
+def _assert_owner_readable(text: str) -> None:
+    """Every message the owner receives has to survive this."""
+    assert text.startswith("Sir,"), f"must open with 'Sir,': {text[:40]!r}"
+    assert not text.startswith("JARVIS"), "must not open with the bot's own name"
+    lowered = text.lower()
+    for word in JARGON:
+        assert word.lower() not in lowered, f"internal jargon leaked: {word!r}"
+    assert len(text.splitlines()) <= 6, f"too long for a phone:\n{text}"
+
+
 class TestTemplates:
-    def test_alert(self):
+    def test_alert_is_short_and_plain(self):
         text = render_alert(_incident())
-        assert "JARVIS ALERT" in text
-        assert "INC-00042" in text
-        assert "CRITICAL" in text
-        assert "authentication" in text
+        _assert_owner_readable(text)
+        assert "something serious happened" in text
+        assert "Login is down." in text
 
-    def test_alert_persona(self):
-        assert render_alert(_incident(), persona=True).startswith("🔴 JARVIS ALERT")
-        assert "Sir, I've detected" in render_alert(_incident(), persona=True)
-
-    def test_alert_without_persona_is_still_precise(self):
+    def test_alert_without_persona_drops_the_address(self):
         text = render_alert(_incident(), persona=False)
         assert "Sir," not in text
-        assert "authentication" in text
-        assert "INC-00042" in text
+        assert "Login is down." in text
 
-    def test_alert_mentions_repeat_occurrences(self):
+    def test_alert_names_the_thing_not_the_component(self):
+        """The owner knows what login is. "authentication" is our word."""
+        assert "Login" in render_alert(_incident(component="authentication"))
+        assert "The database" in render_alert(_incident(component="supabase"))
+
+    def test_resolved_is_one_short_success_message(self):
         incident = _incident()
-        incident.record_occurrence()
-        assert "Observed 2 times" in render_alert(incident)
-
-    def test_severity_icons_differ(self):
-        critical = render_alert(_incident(severity=Severity.CRITICAL))
-        low = render_alert(_incident(severity=Severity.LOW))
-        assert critical[0] != low[0]
-
-    def test_progress(self):
-        text = render_progress(_incident(), attempt=1, max_attempts=3)
-        assert "Attempt: 1/3" in text
-        assert "reproduced" in text
-
-    def test_resolved_states_how_it_was_verified(self):
-        """ "Resolved" without "verified how" is the claim JARVIS exists not to
-        make."""
+        incident.resolution.root_cause = "the callback dropped the session cookie"
+        incident.resolution.pr_url = "https://github.com/x/y/pull/123"
         text = render_resolved(
-            _incident(),
+            incident,
             attempt=RepairAttempt(number=1, diff_stat="1 file changed"),
             verification=VerificationResult(
                 passed=True, probe_id="auth-login", target_url="https://preview"
             ),
         )
-        assert "passed verification" in text
-        assert "auth-login" in text
-        assert "https://preview" in text
+        _assert_owner_readable(text)
+        assert text.splitlines()[0] == "Sir, I fixed the issue."
+        assert (
+            "Login was failing because the callback dropped the session cookie." in text
+        )
+        assert "PR #123 is ready" in text
+        # None of the machinery that produced the fix belongs in the message.
+        assert "auth-login" not in text
+        assert "https://preview" not in text
+        assert "1 file changed" not in text
 
-    def test_resolved_includes_pull_request(self):
+    def test_resolved_without_a_known_cause_does_not_invent_one(self):
+        text = render_resolved(_incident())
+        _assert_owner_readable(text)
+        assert "Login was failing." in text
+        assert "because" not in text
+
+    def test_resolved_drops_an_over_long_root_cause(self):
+        """A paragraph of analysis is not a phone message."""
         incident = _incident()
-        incident.resolution.pr_url = "https://github.com/x/y/pull/3"
-        assert "pull/3" in render_resolved(incident)
+        incident.resolution.root_cause = "x" * 400
+        text = render_resolved(incident)
+        _assert_owner_readable(text)
+        assert "x" * 20 not in text
 
-    def test_human_required(self):
+    def test_human_required_says_what_to_do(self):
         text = render_human_required(
             _incident(),
-            reason="verification failed 3 times",
+            reason="verification failed 3 times; attempts exhausted",
             attempts=3,
             max_attempts=3,
         )
-        assert "Human intervention" in text
-        assert "3/3" in text
-        assert "verification failed 3 times" in text
+        _assert_owner_readable(text)
+        assert text.splitlines()[0] == "Sir, I need your help."
+        assert "I stopped making changes." in text
+        assert "3/3" not in text, "attempt counts are dashboard detail"
+
+    @pytest.mark.parametrize(
+        "reason,expected",
+        [
+            ("the change touches protected path(s): x", "not allowed to change"),
+            ("a secret was found in the diff", "looked like a password"),
+            ("attempts exhausted", "could not fix it safely"),
+            ("the check is flapping", "keeps coming back"),
+            ("something nobody anticipated", "could not fix it safely"),
+        ],
+    )
+    def test_escalation_reasons_are_translated(self, reason, expected):
+        text = render_human_required(
+            _incident(), reason=reason, attempts=3, max_attempts=3
+        )
+        _assert_owner_readable(text)
+        assert expected in text
 
     def test_rolled_back(self):
         text = render_rolled_back(_incident(), reason="regression detected")
-        assert "rolled it back" in text
-        assert "regression detected" in text
+        _assert_owner_readable(text)
+        assert "rolled a change back" in text
 
 
 # ---------------------------------------------------------------------------
@@ -279,22 +330,17 @@ class TestIncidentHelpers:
         kwargs.setdefault("clock", _FakeClock())
         return NotificationRouter(notifier=notifier, **kwargs), notifier
 
-    def test_alert(self):
+    def test_a_critical_incident_alerts(self):
         router, notifier = self._router()
-        assert router.alert(_incident())
-        assert "JARVIS ALERT" in notifier.sent[0]
-
-    def test_progress(self):
-        router, notifier = self._router()
-        router.progress(_incident(), attempt=2, max_attempts=3)
-        assert "2/3" in notifier.sent[0]
+        assert router.alert(_incident(severity=Severity.CRITICAL))
+        _assert_owner_readable(notifier.sent[0])
 
     def test_resolved(self):
         router, notifier = self._router()
         router.resolved(
             _incident(), verification=VerificationResult(passed=True, probe_id="p")
         )
-        assert "passed verification" in notifier.sent[0]
+        assert "Sir, I fixed the issue." in notifier.sent[0]
 
     def test_human_required_is_always_critical(self):
         """An escalation the owner never sees is the same as no escalation."""
@@ -308,15 +354,214 @@ class TestIncidentHelpers:
             attempts=3,
             max_attempts=3,
         )
-        assert "Human intervention" in notifier.sent[-1]
+        assert "Sir, I need your help." in notifier.sent[-1]
 
     def test_rolled_back(self):
         router, notifier = self._router()
         router.rolled_back(_incident(), reason="regression")
-        assert "rolled it back" in notifier.sent[0]
+        assert "rolled a change back" in notifier.sent[0]
 
     @pytest.mark.parametrize("persona", [True, False])
     def test_persona_flag_is_honoured(self, persona):
         router, notifier = self._router(persona=persona)
-        router.alert(_incident())
+        router.alert(_incident(severity=Severity.CRITICAL))
         assert ("Sir," in notifier.sent[0]) is persona
+
+
+# ---------------------------------------------------------------------------
+# What the owner is NOT told
+# ---------------------------------------------------------------------------
+
+
+class TestSilencePolicy:
+    """Most of what JARVIS does is not news, and that is the feature.
+
+    Each of these used to send a message. Together they were six notifications
+    per incident, which is how an owner learns to swipe JARVIS away — and then
+    misses the one that mattered.
+    """
+
+    def _router(self, **kwargs):
+        notifier = ConsoleNotifier()
+        kwargs.setdefault("min_severity", Severity.LOW)
+        kwargs.setdefault("clock", _FakeClock())
+        return NotificationRouter(notifier=notifier, **kwargs), notifier
+
+    @pytest.mark.parametrize("severity", [Severity.LOW, Severity.MEDIUM, Severity.HIGH])
+    def test_an_ordinary_incident_opening_says_nothing(self, severity):
+        router, notifier = self._router()
+        assert router.alert(_incident(severity=severity)) is False
+        assert notifier.sent == []
+
+    def test_a_repair_starting_says_nothing(self):
+        router, notifier = self._router()
+        assert router.progress(_incident(), attempt=1, max_attempts=3) is False
+        assert notifier.sent == []
+
+    def test_a_self_healing_incident_says_nothing(self):
+        router, notifier = self._router()
+        assert router.recovered(_incident()) is False
+        assert notifier.sent == []
+
+    def test_a_merge_starting_and_landing_says_nothing(self):
+        router, notifier = self._router()
+        record = type("R", (), {"merged": True, "pr_number": 7})()
+        assert (
+            router.merge_attempt(
+                _incident(), pr_number=7, head_sha="a" * 40, method="squash"
+            )
+            is False
+        )
+        assert router.merge_outcome(_incident(), record=record) is False
+        assert notifier.sent == []
+
+    def test_a_refused_merge_says_nothing(self):
+        """The gates declining is the system working, not an incident."""
+        router, notifier = self._router()
+        record = type("R", (), {"merged": False, "pr_number": 7})()
+        assert router.merge_outcome(_incident(), record=record) is False
+        assert notifier.sent == []
+
+    def test_production_deployment_and_verification_start_say_nothing(self):
+        router, notifier = self._router()
+        observation = type("O", (), {"deployment_id": "dpl_1", "state": "READY"})()
+        assert (
+            router.production_deployment(_incident(), observation=observation) is False
+        )
+        assert (
+            router.production_verification_started(
+                _incident(), observation=observation, target_url="https://x"
+            )
+            is False
+        )
+        assert notifier.sent == []
+
+    def test_a_whole_quiet_incident_produces_no_messages(self):
+        """Detected, repaired, verified, merged, deployed — one message at the
+        end, and nothing before it."""
+        router, notifier = self._router()
+        incident = _incident(severity=Severity.HIGH)
+        record = type("R", (), {"merged": True, "pr_number": 7})()
+        observation = type("O", (), {"deployment_id": "dpl_1", "state": "READY"})()
+
+        router.alert(incident)
+        router.progress(incident, attempt=1, max_attempts=3)
+        router.merge_attempt(incident, pr_number=7, head_sha="a" * 40, method="squash")
+        router.merge_outcome(incident, record=record)
+        router.production_deployment(incident, observation=observation)
+        router.production_verification_started(incident, observation=observation)
+        assert notifier.sent == [], "nothing before the outcome"
+
+        router.resolved(incident)
+        assert len(notifier.sent) == 1, "exactly one message, at the end"
+        _assert_owner_readable(notifier.sent[0])
+
+
+# ---------------------------------------------------------------------------
+# The live-mode outcomes
+# ---------------------------------------------------------------------------
+
+
+def _observation(**overrides):
+    facts = {"deployment_id": "dpl_aNDR9i1G", "state": "READY", "commit_sha": "e" * 40}
+    facts.update(overrides)
+    return type("O", (), facts)()
+
+
+def _result(**overrides):
+    facts = {
+        "verified": True,
+        "reason": "production verified",
+        "rule": "verified",
+        "deployment": _observation(),
+        "reproduction": type("P", (), {"probe_id": "auth-login", "passed": True})(),
+        "fleet": [],
+        "failures": [],
+    }
+    facts.update(overrides)
+    return type("R", (), facts)()
+
+
+class TestProductionOutcomeMessages:
+    def test_a_live_fix_says_it_is_live(self):
+        incident = _incident()
+        incident.resolution.root_cause = "the callback dropped the session cookie"
+        record = type("M", (), {"pr_number": 210, "merge_commit_sha": "e" * 40})()
+        text = render_production_verified(incident, record=record, result=_result())
+
+        _assert_owner_readable(text)
+        assert text.splitlines()[0] == "Sir, it's fixed."
+        assert "The fix is live and all checks are passing." in text
+        # The identifiers that made this true stay in the dashboard.
+        assert "dpl_aNDR9i1G" not in text
+        assert "e" * 12 not in text
+
+    def test_a_bad_deployment_asks_for_help_without_the_forensics(self):
+        incident = _incident()
+        record = type("M", (), {"pr_number": 210, "merge_commit_sha": "e" * 40})()
+        result = _result(
+            verified=False,
+            rule="fleet_failed",
+            reason="production probe(s) failed after the merge: signup",
+            failures=[type("P", (), {"probe_id": "signup", "summary": "no form"})()],
+        )
+        text = render_post_merge_failed(incident, record=record, result=result)
+
+        _assert_owner_readable(text)
+        assert text.splitlines()[0] == "Sir, I need your help."
+        assert "still fails" in text
+        assert "I stopped making changes." in text
+        assert "PR #210" in text
+        assert "dpl_aNDR9i1G" not in text
+
+    @pytest.mark.parametrize(
+        "rule,expected",
+        [
+            ("deployment_missing", "never went live"),
+            ("deployment_not_ready", "the deployment failed"),
+            ("reproduction_failed", "still fails"),
+        ],
+    )
+    def test_the_failure_says_which_way_it_went_wrong(self, rule, expected):
+        record = type("M", (), {"pr_number": 210, "merge_commit_sha": "e" * 40})()
+        text = render_post_merge_failed(
+            _incident(), record=record, result=_result(verified=False, rule=rule)
+        )
+        _assert_owner_readable(text)
+        assert expected in text
+
+    def test_a_post_merge_failure_is_critical_and_beats_the_rate_cap(self):
+        """The one message that must never be dropped: code is live and wrong."""
+        notifier = ConsoleNotifier()
+        router = NotificationRouter(
+            notifier=notifier,
+            min_severity=Severity.CRITICAL,
+            max_per_hour=1,
+            dedup_window_seconds=0,
+            clock=_FakeClock(),
+        )
+        router.notify("filler", severity=Severity.CRITICAL)
+        record = type("M", (), {"pr_number": 210, "merge_commit_sha": "e" * 40})()
+        assert router.post_merge_failed(
+            _incident(severity=Severity.LOW),
+            record=record,
+            result=_result(verified=False, rule="fleet_failed"),
+        )
+        assert "Sir, I need your help." in notifier.sent[-1]
+
+    def test_a_live_success_is_the_only_message_of_its_run(self):
+        notifier = ConsoleNotifier()
+        router = NotificationRouter(
+            notifier=notifier, min_severity=Severity.LOW, clock=_FakeClock()
+        )
+        incident = _incident(severity=Severity.HIGH)
+        record = type("M", (), {"pr_number": 210, "merge_commit_sha": "e" * 40})()
+
+        router.alert(incident)
+        router.merge_outcome(incident, record=record)
+        router.production_deployment(incident, observation=_observation())
+        router.production_verification_started(incident, observation=_observation())
+        router.production_verified(incident, record=record, result=_result())
+
+        assert len(notifier.sent) == 1
+        assert notifier.sent[0].startswith("Sir, it's fixed.")
