@@ -387,6 +387,7 @@ def _build_auto_merger(config: Any, store: Any, github: Any) -> Any:
         base_branch=rc.github.base_branch,
         branch_prefix=rc.github.branch_prefix,
         require_status_checks=rc.merge.require_status_checks,
+        required_status_contexts=list(rc.merge.required_status_contexts),
         delete_branch_on_merge=rc.merge.delete_branch_on_merge,
         notifier=_build_notifier(config),
     )

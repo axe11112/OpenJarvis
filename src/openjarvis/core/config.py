@@ -1616,6 +1616,23 @@ class ReliabilityMergeConfig:
     #: check suite and the preview verification are the only gates, and the
     #: refusal reason says so rather than implying CI agreed.
     require_status_checks: bool = True
+    #: Status contexts that must each be present and ``success`` on the verified
+    #: commit. Naming them turns "some CI was green" into a contract: this
+    #: deployment, on this commit, reported success.
+    #:
+    #: It also makes the gate usable by a credential that cannot read the Checks
+    #: API at all. GitHub's fine-grained tokens have no Checks permission, so
+    #: ``/commits/{sha}/check-runs`` answers 403 for them however the token is
+    #: scoped; with no named contexts that denial has to be treated as a blind
+    #: spot, because the missing half is exactly where the evidence might be.
+    #: Name the contexts and the question changes from "is anything red
+    #: anywhere" to "did *these* report success", which the Commit Statuses API
+    #: answers on its own. The Checks denial is then reported as unavailable for
+    #: this credential rather than silently read as consent.
+    #:
+    #: Empty is the conservative default: both APIs must be readable and
+    #: everything they report must be green.
+    required_status_contexts: List[str] = field(default_factory=list)
     #: Delete the incident branch after a successful merge. Off by default: a
     #: merged branch is the cheapest way for a human to inspect what landed.
     delete_branch_on_merge: bool = False

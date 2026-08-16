@@ -447,6 +447,18 @@ def safety_panel(config: Any, *, stop_flag_engaged: bool) -> SafetyPanel:
             ),
         ),
         SafetyRow(
+            label="Required merge statuses",
+            value=", ".join(rc.merge.required_status_contexts) or "none",
+            detail=(
+                "each must be present and green on the verified commit"
+                if rc.merge.required_status_contexts
+                else (
+                    "no named contexts: every status and check-run must be "
+                    "readable and green"
+                )
+            ),
+        ),
+        SafetyRow(
             label="Supabase writes",
             value="ON" if rc.supabase.allow_production_writes else "OFF",
             dangerous=bool(rc.supabase.allow_production_writes),

@@ -177,6 +177,7 @@ class _FakeGitHub:
         self._base_sha = base_sha
         self._fail = fail
         self.merge_calls = []
+        self.status_calls = []
         self.client = self
 
     # -- read side (also serves as the fake ResilientClient) --------------
@@ -185,7 +186,12 @@ class _FakeGitHub:
             raise RuntimeError("GitHub is unavailable")
         return dict(self._pr, number=number)
 
-    def combined_status(self, sha):
+    def combined_status(self, sha, *, required_contexts=None):
+        # Recorded, not just answered: asserting on the question proves the gate
+        # asked about the verified commit and named the configured contexts.
+        self.status_calls.append(
+            (sha, list(required_contexts) if required_contexts is not None else None)
+        )
         return dict(self._status)
 
     def get_json(self, path, default=None, **_kw):
@@ -900,3 +906,188 @@ class TestTheVerifiedAttemptIsTheOneThatCounts:
         )
         assert record.verified_head_sha == VERIFIED_SHA
         assert github.merge_calls[0]["expected_head_sha"] == VERIFIED_SHA
+
+
+# ---------------------------------------------------------------------------
+# The named deployment status as the required evidence
+# ---------------------------------------------------------------------------
+
+
+def _vercel(state="success", *, sha=VERIFIED_SHA, checks="unavailable", **extra):
+    """A verdict in the shape ``combined_status`` returns for named contexts.
+
+    ``checks="unavailable"`` is the default because that is the real shape for a
+    GitHub fine-grained token: it has no Checks permission to grant, so
+    check-runs answers 403 no matter how the token is scoped.
+    """
+    per_context = {"Vercel": state if state != "none" else "missing"}
+    verdict = {
+        "state": state,
+        "contexts": ["Vercel"],
+        "count": 1,
+        "missing_permissions": ["Checks: Read"] if checks == "unavailable" else [],
+        "sha": sha,
+        "required_configured": True,
+        "required": per_context,
+        "missing_required": [
+            n for n, v in per_context.items() if v in ("missing", "unreadable")
+        ],
+        "statuses_api": "readable",
+        "checks_api": checks,
+    }
+    verdict.update(extra)
+    return verdict
+
+
+class TestRequiredStatusContextsGate:
+    """``required_status_contexts = ["Vercel"]`` against the merge gate.
+
+    The reason this configuration exists: the Checks API is closed to the
+    credential, so the whole-picture rule can never go green. Naming the context
+    the deployment actually posts makes the gate answerable — without making it
+    weaker, which is what every refusal below is here to prove.
+    """
+
+    def test_vercel_success_passes(self):
+        decision = _decide(
+            required_status_contexts=["Vercel"], status=_vercel("success")
+        )
+        assert decision.allowed
+        detail = next(g.detail for g in decision.gates if g.name == "status_checks")
+        assert "Vercel = success" in detail
+        # Reported, never silently swallowed.
+        assert "Checks API is unavailable" in detail
+
+    @pytest.mark.parametrize("state", ["failure", "pending", "error", "none"])
+    def test_anything_other_than_success_refuses(self, state):
+        decision = _decide(required_status_contexts=["Vercel"], status=_vercel(state))
+        assert _refused(decision, "status_checks")
+
+    def test_vercel_missing_refuses(self):
+        """No context by that name reported at all. Absence is not consent."""
+        verdict = _vercel("none")
+        verdict["required"] = {"Vercel": "missing"}
+        decision = _decide(required_status_contexts=["Vercel"], status=verdict)
+        assert _refused(decision, "status_checks")
+
+    def test_commit_statuses_unreadable_refuses(self):
+        """The API the verdict now rests on is forbidden: refuse, and say why."""
+        verdict = _vercel("unreadable", checks="unavailable")
+        verdict["statuses_api"] = "unavailable"
+        verdict["required"] = {"Vercel": "unreadable"}
+        verdict["missing_permissions"] = ["Commit statuses: Read"]
+        decision = _decide(required_status_contexts=["Vercel"], status=verdict)
+        assert _refused(decision, "status_checks")
+        detail = next(g.detail for g in decision.gates if g.name == "status_checks")
+        assert "credential problem" in detail
+        # It must never propose removing the gate as the fix.
+        assert "do not remove the required context" in detail
+
+    def test_status_belonging_to_another_commit_refuses(self):
+        """Green Vercel status — for a commit nobody verified."""
+        decision = _decide(
+            required_status_contexts=["Vercel"],
+            status=_vercel("success", sha=OTHER_SHA),
+        )
+        assert _refused(decision, "status_checks")
+
+    def test_verdict_without_a_commit_refuses(self):
+        decision = _decide(
+            required_status_contexts=["Vercel"], status=_vercel("success", sha="")
+        )
+        assert _refused(decision, "status_checks")
+
+    def test_a_verdict_that_does_not_answer_the_question_refuses(self):
+        """Contexts were required; the verdict evaluated something else.
+
+        Passing on the summary alone would drop the contract silently — the one
+        failure mode a narrowed gate must not have.
+        """
+        decision = _decide(
+            required_status_contexts=["Vercel"],
+            status={"state": "success", "count": 2, "contexts": ["ci"]},
+        )
+        assert _refused(decision, "status_checks")
+
+    def test_a_verdict_for_the_wrong_contexts_refuses(self):
+        verdict = _vercel("success")
+        verdict["required"] = {"build": "success"}
+        decision = _decide(required_status_contexts=["Vercel"], status=verdict)
+        assert _refused(decision, "status_checks")
+
+    def test_checks_api_403_does_not_block_a_green_required_context(self):
+        """The whole point: the fine-grained PAT's permanent 403 stops poisoning
+        a verdict the Commit Statuses API can answer on its own."""
+        decision = _decide(
+            required_status_contexts=["Vercel"],
+            status=_vercel("success", checks="unavailable"),
+        )
+        assert decision.allowed
+
+    def test_without_required_contexts_the_old_conservative_rule_stands(self):
+        """Requirement 8: unconfigured behaviour is untouched. The same verdict
+        that passes with a named context refuses without one."""
+        unnamed = {
+            "state": "unreadable",
+            "contexts": ["Vercel"],
+            "count": 1,
+            "missing_permissions": ["Checks: Read"],
+        }
+        assert _refused(_decide(status=unnamed), "status_checks")
+        green = {"state": "success", "count": 1, "contexts": ["Vercel"]}
+        assert _decide(status=green).allowed
+
+    def test_old_style_verdict_naming_the_wrong_commit_still_refuses(self):
+        """Even unconfigured, a verdict that names a commit must name the right
+        one. Verdicts that name none at all are unaffected."""
+        stale = {
+            "state": "success",
+            "count": 1,
+            "contexts": ["Vercel"],
+            "sha": OTHER_SHA,
+        }
+        assert _refused(_decide(status=stale), "status_checks")
+
+
+class TestRequiredContextsReachGitHub:
+    """The gate is only as good as the question the source was asked."""
+
+    def test_the_verified_sha_and_the_named_contexts_are_what_is_queried(self, store):
+        incident = store.create(_incident())
+        github = _FakeGitHub(status=_vercel("success"))
+        AutoMerger(
+            github=github,
+            store=store,
+            enabled=True,
+            required_status_contexts=["Vercel"],
+        ).merge_for(incident)
+        assert github.status_calls == [(VERIFIED_SHA, ["Vercel"])]
+
+    def test_unconfigured_asks_exactly_as_before(self, store):
+        """No named contexts: the source is called without the argument, so a
+        source that predates it keeps working."""
+        incident = store.create(_incident())
+        github = _FakeGitHub()
+        AutoMerger(github=github, store=store, enabled=True).merge_for(incident)
+        assert github.status_calls == [(VERIFIED_SHA, None)]
+
+    def test_a_source_that_cannot_answer_refuses_rather_than_crashing(self, store):
+        """An older source raising on the new argument must produce a refusal,
+        not an exception that unwinds into the watcher."""
+
+        class _OldSource(_FakeGitHub):
+            def combined_status(self, sha, **kwargs):
+                if kwargs:
+                    raise TypeError("unexpected keyword argument")
+                return dict(self._status)
+
+        incident = store.create(_incident())
+        github = _OldSource()
+        record = AutoMerger(
+            github=github,
+            store=store,
+            enabled=True,
+            required_status_contexts=["Vercel"],
+        ).merge_for(incident)
+        assert not record.decision.allowed
+        assert not github.merge_calls

@@ -315,6 +315,62 @@ class LiveDiagnostic:
                 remediation=scope_hint,
             )
         )
+        # What the merge gate will demand, and what it reads right now — visible
+        # without running a merge. An operator who cannot see the contract has to
+        # infer it from a refusal, which is how a permission problem gets
+        # mistaken for a CI problem.
+        required_contexts = [c for c in rc.merge.required_status_contexts if c]
+        if required_contexts:
+            head_sha = commits[0]["sha"] if commits else ""
+            if not head_sha:
+                result.facts["merge_status_contexts"] = (
+                    "required: "
+                    + ", ".join(required_contexts)
+                    + " — no commit available to read them on"
+                )
+            else:
+
+                def _required_status() -> Dict[str, Any]:
+                    return source.combined_status(
+                        head_sha, required_contexts=required_contexts
+                    )
+
+                def _describe_required(verdict: Dict[str, Any]) -> str:
+                    per = dict(verdict.get("required") or {})
+                    named = ", ".join(
+                        f"{c} = {per.get(c, 'unknown')}" for c in required_contexts
+                    )
+                    if verdict.get("checks_api") == "unavailable":
+                        named += " (Checks API unavailable to this credential)"
+                    return f"{named} on {head_sha[:8]}"
+
+                result.add(
+                    _capability(
+                        "merge_status_contexts",
+                        _required_status,
+                        describe=_describe_required,
+                        remediation=(
+                            "The merge gate requires these Commit Status contexts. "
+                            f"Grant ${rc.github.token_env} 'Commit statuses: Read', "
+                            "or correct [reliability.merge] "
+                            "required_status_contexts."
+                        ),
+                    )
+                )
+                verdict_check = result.capabilities["merge_status_contexts"]
+                if verdict_check.state is HealthState.HEALTHY:
+                    verdict = _required_status()
+                    # A red or pending deployment is news about the repository,
+                    # not about JARVIS, and must not turn the dashboard amber.
+                    # Not being *allowed to look* is the opposite: that is a
+                    # blind spot and belongs in the health state.
+                    if verdict.get("state") == "unreadable":
+                        verdict_check.state = HealthState.FAILED
+                        verdict_check.summary = (
+                            "cannot read the required merge status context(s): "
+                            + ", ".join(verdict.get("missing_permissions") or [])
+                        )
+                    result.facts["merge_status_contexts"] = _describe_required(verdict)
         # Same reasoning as write_access below: something the target is
         # correct not to have must be recorded as a fact, not as an
         # unverified capability. A repository that deliberately runs no
