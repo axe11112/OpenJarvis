@@ -134,7 +134,11 @@ def _status(facts: VoiceFacts, **_kw: Any) -> str:
             else "Sir, everything is passing, but I am not running right now."
         )
     if len(incidents) == 1:
-        return "Sir, " + _sentence(_plain_subject(incidents[0]), incidents[0]).lower()
+        # Lower-case the leading subject only, never the whole sentence: the
+        # "I" in "and I am looking into it" has to survive.
+        incident = incidents[0]
+        sentence = _sentence(_plain_subject(incident), incident)
+        return f"Sir, {sentence[:1].lower()}{sentence[1:]}"
     needing = [i for i in incidents if i.state is IncidentState.HUMAN_REQUIRED]
     if needing:
         return (
