@@ -554,29 +554,61 @@ class GitHubSource(BaseSignalSource):
         Actions uses. Reading only one reports "no CI" for half the world, so
         both are read and the pessimistic answer wins.
 
-        ``state`` is ``"success"``, ``"failure"``, ``"pending"`` or ``"none"``.
-        ``"none"`` means nothing reported at all — deliberately its own value,
-        because "no CI ran" and "CI passed" are different facts and only one of
-        them is evidence.
+        ``state`` is ``"success"``, ``"failure"``, ``"pending"``, ``"none"`` or
+        ``"unreadable"``. The last two are distinct from each other and from
+        ``"success"``, and keeping them apart is the whole point:
+
+        ``"none"``
+            Nothing was reported. "No CI ran" is not "CI passed".
+        ``"unreadable"``
+            The credential is not permitted to look. A fine-grained token
+            without *Commit statuses: Read* and *Checks: Read* gets 403 on both
+            endpoints below.
+
+        Collapsing ``unreadable`` into ``none`` — or letting the 403 escape as
+        an exception the caller reports as "could not read the pull request" —
+        turns a blind spot into an observation and sends whoever is debugging it
+        looking for absent CI instead of an absent permission. Found against a
+        real repository whose Vercel status was green the entire time and simply
+        could not be seen. ``missing_permissions`` names what to grant.
         """
         states: List[str] = []
         contexts: List[str] = []
+        denied: List[str] = []
 
-        combined = (
-            self.client.get_json(f"/repos/{self.repo}/commits/{sha}/status", default={})
-            or {}
+        def _read(path: str, permission: str, **params: Any) -> Dict[str, Any]:
+            """Read *path*, recording a permission denial rather than raising."""
+            try:
+                return (
+                    self.client.get_json(path, params=params or None, default={}) or {}
+                )
+            except (httpx.HTTPStatusError, CircuitOpenError) as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", 0)
+                # 404 is included on purpose: GitHub returns it instead of 403
+                # for resources a token may not even know exist.
+                if status in (401, 403, 404):
+                    denied.append(permission)
+                    logger.warning(
+                        "github: cannot read %s (HTTP %s) — the token is missing "
+                        "the '%s' permission",
+                        path,
+                        status,
+                        permission,
+                    )
+                    return {}
+                raise
+
+        combined = _read(
+            f"/repos/{self.repo}/commits/{sha}/status", "Commit statuses: Read"
         )
         for item in combined.get("statuses") or []:
             states.append(str(item.get("state", "")).lower())
             contexts.append(str(item.get("context", "")))
 
-        runs = (
-            self.client.get_json(
-                f"/repos/{self.repo}/commits/{sha}/check-runs",
-                params={"per_page": 100},
-                default={},
-            )
-            or {}
+        runs = _read(
+            f"/repos/{self.repo}/commits/{sha}/check-runs",
+            "Checks: Read",
+            per_page=100,
         )
         for run in runs.get("check_runs") or []:
             contexts.append(str(run.get("name", "")))
@@ -591,15 +623,28 @@ class GitHubSource(BaseSignalSource):
             else:
                 states.append("failure")
 
-        if not states:
-            state = "none"
-        elif any(s == "failure" or s == "error" for s in states):
+        if any(s == "failure" or s == "error" for s in states):
+            # A denial does not soften an observed failure: something red was
+            # seen, and that is enough to refuse whatever else was invisible.
             state = "failure"
+        elif denied:
+            # Checked before "none" on purpose. With one endpoint forbidden and
+            # the other empty, "nothing reported" would be a guess dressed as an
+            # observation — the forbidden half is exactly where the evidence
+            # would have been.
+            state = "unreadable"
+        elif not states:
+            state = "none"
         elif any(s == "pending" for s in states):
             state = "pending"
         else:
             state = "success"
-        return {"state": state, "contexts": contexts, "count": len(states)}
+        return {
+            "state": state,
+            "contexts": contexts,
+            "count": len(states),
+            "missing_permissions": sorted(set(denied)),
+        }
 
     def merge_pull_request(
         self,

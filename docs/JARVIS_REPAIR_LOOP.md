@@ -494,11 +494,39 @@ rather than short-circuiting, so the audit record shows all of them:
 | `no_conflicts` | GitHub reports conflicts, `blocked`, or has not decided yet |
 | `head_sha_unchanged` | The PR head is not the commit that was verified |
 | `base_unchanged` | The base branch moved since verification |
-| `status_checks` | CI is failing, pending, or reported nothing at all |
+| `status_checks` | CI is failing, pending, reported nothing at all, or **could not be read** |
 
 Note that lint is **advisory for opening a pull request and blocking for merging
 one**. A human reviewing a PR can weigh a style violation against an outage;
 nobody is going to review this one.
+
+### The token must be able to *see* CI
+
+`status_checks` distinguishes four failing conditions, and one of them is about
+JARVIS rather than about the repository:
+
+| `state` | Meaning |
+|---|---|
+| `failure` / `pending` | CI reported, and it is not green |
+| `none` | Nothing reported. "No CI ran" is not "CI passed" |
+| `unreadable` | **The token is not permitted to look** |
+
+A GitHub fine-grained token needs two repository permissions beyond those the
+repair loop uses, or both CI endpoints return 403:
+
+- **Commit statuses: Read** — for `/commits/{sha}/status`
+- **Checks: Read** — for `/commits/{sha}/check-runs`
+
+Without them `combined_status` reports `unreadable` and names the missing
+permissions, and the merge is refused. **Do not respond by setting
+`require_status_checks = false`.** That reads a credential problem as evidence
+about CI and disables a working control on the strength of a misread — measured
+on a real repository whose Vercel status was green the entire time and simply
+could not be seen. Grant the permission instead.
+
+Third-party CI counts: Vercel publishes a combined-status context named `Vercel`
+that goes `failure` when a preview build breaks, so a repository with no GitHub
+Actions workflows can still have a meaningful `status_checks` gate.
 
 ### Time-of-check / time-of-use
 

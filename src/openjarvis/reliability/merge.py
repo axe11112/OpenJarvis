@@ -465,21 +465,32 @@ def evaluate_merge(
     if require_status_checks:
         reported = dict(status or {})
         ci_state = str(reported.get("state") or "none")
-        gate(
-            "status_checks",
-            ci_state == "success",
-            (
-                f"{reported.get('count', 0)} check(s) green"
-                if ci_state == "success"
-                else (
-                    "no status or check-run reported on the head commit; "
-                    "set [reliability.merge] require_status_checks = false only "
-                    "if this repository genuinely runs no CI"
-                    if ci_state == "none"
-                    else f"checks are '{ci_state}'"
-                )
-            ),
-        )
+        if ci_state == "success":
+            detail = f"{reported.get('count', 0)} check(s) green: " + ", ".join(
+                reported.get("contexts") or []
+            )
+        elif ci_state == "unreadable":
+            # Never advise switching the gate off here. The checks may well be
+            # green; JARVIS is simply not allowed to look, and turning off the
+            # gate because of a permission error would disable a working control
+            # on the strength of a misread.
+            missing = ", ".join(reported.get("missing_permissions") or []) or "unknown"
+            detail = (
+                "JARVIS is not permitted to read CI on the head commit — the "
+                f"GitHub token is missing: {missing}. This is a credential "
+                "problem, not evidence about CI. Grant the permission; do not "
+                "set require_status_checks = false to work around it."
+            )
+        elif ci_state == "none":
+            detail = (
+                "no status or check-run reported on the head commit; "
+                "set [reliability.merge] require_status_checks = false only "
+                "if this repository genuinely runs no CI"
+            )
+        else:
+            contexts = ", ".join(reported.get("contexts") or [])
+            detail = f"checks are '{ci_state}'" + (f" ({contexts})" if contexts else "")
+        gate("status_checks", ci_state == "success", detail)
     else:
         gate(
             "status_checks",
@@ -566,8 +577,6 @@ class AutoMerger:
                 record.base_ref = str(pull_request.get("base_ref") or "")
                 observed_base = self._base_sha()
                 record.base_sha_observed = observed_base
-                if self.require_status_checks and record.observed_head_sha:
-                    status = self.github.combined_status(record.observed_head_sha)
             except Exception as exc:  # noqa: BLE001 - refusal, not a crash
                 logger.warning("merge: could not read PR #%s: %s", expected, exc)
                 record.error = f"could not read the pull request: {exc}"
@@ -580,6 +589,22 @@ class AutoMerger:
                 self._record(incident, record)
                 self._notify_outcome(incident, record)
                 return record
+
+            if self.require_status_checks and record.observed_head_sha:
+                # Read separately from the pull request, so a CI read that fails
+                # produces a *status* verdict rather than aborting the whole
+                # evaluation as "could not read the pull request" — which is how
+                # a missing token scope used to be reported as a missing PR.
+                try:
+                    status = self.github.combined_status(record.observed_head_sha)
+                except Exception as exc:  # noqa: BLE001 - a gate result, not a crash
+                    logger.warning("merge: could not read CI status: %s", exc)
+                    status = {
+                        "state": "unreadable",
+                        "contexts": [],
+                        "count": 0,
+                        "missing_permissions": [f"unreadable: {exc}"],
+                    }
 
         decision = evaluate_merge(
             incident,

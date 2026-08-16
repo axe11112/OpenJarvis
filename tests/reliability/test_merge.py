@@ -566,6 +566,68 @@ class TestRepositoryStateGates:
         decision = _decide(status={"state": "none", "count": 0, "contexts": []})
         assert _refused(decision, "status_checks")
 
+    def test_unreadable_ci_is_no_merge_and_blames_the_credential(self):
+        """A 403 is a fact about the token, not about CI.
+
+        Measured against the real Wize-Performance repository: the Vercel status
+        was green on every commit the whole time, and JARVIS's fine-grained
+        token could not read it. Reporting that as "no CI" would send somebody
+        looking for absent CI instead of an absent permission.
+        """
+        decision = _decide(
+            status={
+                "state": "unreadable",
+                "count": 0,
+                "contexts": [],
+                "missing_permissions": ["Checks: Read", "Commit statuses: Read"],
+            }
+        )
+        assert _refused(decision, "status_checks")
+        gate = next(g for g in decision.gates if g.name == "status_checks")
+        assert "Commit statuses: Read" in gate.detail
+        assert "credential problem" in gate.detail
+
+    def test_unreadable_ci_never_suggests_disabling_the_gate(self):
+        """The 'none' branch offers the opt-out. This one must not.
+
+        Advising require_status_checks = false in response to a permission error
+        would turn one misread into a permanently disabled control.
+        """
+        decision = _decide(
+            status={
+                "state": "unreadable",
+                "count": 0,
+                "contexts": [],
+                "missing_permissions": ["Checks: Read"],
+            }
+        )
+        gate = next(g for g in decision.gates if g.name == "status_checks")
+        assert "require_status_checks = false" in gate.detail
+        assert "do not set" in gate.detail.lower()
+
+    def test_an_observed_failure_outranks_an_unreadable_endpoint(self):
+        """Something red was seen. That is enough, whatever else was hidden."""
+        decision = _decide(
+            status={
+                "state": "failure",
+                "count": 1,
+                "contexts": ["Vercel"],
+                "missing_permissions": ["Checks: Read"],
+            }
+        )
+        assert _refused(decision, "status_checks")
+        gate = next(g for g in decision.gates if g.name == "status_checks")
+        assert "Vercel" in gate.detail
+
+    def test_a_green_gate_names_the_contexts_it_trusted(self):
+        """The record should say *which* checks were green, not just how many."""
+        decision = _decide(
+            status={"state": "success", "count": 1, "contexts": ["Vercel"]}
+        )
+        assert decision.allowed
+        gate = next(g for g in decision.gates if g.name == "status_checks")
+        assert "Vercel" in gate.detail
+
     def test_absent_ci_can_be_opted_out_of_explicitly(self):
         """For repositories that genuinely run no CI — and it says so."""
         decision = _decide(
