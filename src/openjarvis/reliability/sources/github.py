@@ -4,10 +4,18 @@ Read operations are used for correlation: given a failure at time T, which
 commits landed just before it and what did they touch?
 
 Write operations exist only for the repair loop and are deliberately narrow.
-There is no method here that can push to the default branch, force-push, merge a
-pull request, or modify a workflow file — those are refused structurally rather
-than by policy, so a bug or an injected instruction cannot reach them.
+There is no method here that can push to the default branch, force-push, or
+modify a workflow file — those are refused structurally rather than by policy,
+so a bug or an injected instruction cannot reach them.
 See ``docs/JARVIS_SECURITY.md`` §4.
+
+:meth:`GitHubSource.merge_pull_request` is the one exception and the only way
+code here can reach the default branch. It is still structurally narrow — it
+cannot create a pull request to merge, cannot push, and refuses any commit other
+than the exact SHA the caller names — but it is real authority, and it is off by
+default. The gates that decide whether to call it live in
+:mod:`openjarvis.reliability.merge`, not here: this class knows how to merge one
+named commit and nothing about whether it should.
 """
 
 from __future__ import annotations
@@ -31,9 +39,20 @@ from openjarvis.reliability.types import Severity, Signal, TrustLevel, now_iso
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["GitHubSource", "ProtectedPathError", "UnsafeBranchError"]
+__all__ = [
+    "MERGE_METHODS",
+    "GitHubSource",
+    "ProtectedPathError",
+    "UnsafeBranchError",
+    "UnsafeMergeError",
+]
 
 _API_ROOT = "https://api.github.com"
+
+#: Merge verbs this class will send. An allowlist rather than a passthrough:
+#: the merge method is read from configuration, and configuration is not a
+#: trust boundary.
+MERGE_METHODS = frozenset({"squash", "merge", "rebase"})
 
 #: Paths a repair may never touch, whatever the policy says.  A self-modifying
 #: CI configuration would let a compromised repair loop disable its own checks.
@@ -49,6 +68,10 @@ class UnsafeBranchError(RuntimeError):
 
 class ProtectedPathError(RuntimeError):
     """Raised when a change touches a path repairs may never modify."""
+
+
+class UnsafeMergeError(RuntimeError):
+    """Raised when a merge is attempted without the guarantees that make it safe."""
 
 
 def normalize_path(path: str) -> str:
@@ -489,6 +512,165 @@ class GitHubSource(BaseSignalSource):
             except (httpx.HTTPError, CircuitOpenError):
                 logger.warning("github: could not label PR #%s", number)
         return {"number": number, "url": payload.get("html_url", "")}
+
+    def get_pull_request(self, number: int) -> Dict[str, Any]:
+        """Read one pull request's current facts.
+
+        Returns the fields a merge decision needs and nothing else. ``head_sha``
+        is read fresh on every call by design: it is the value the whole
+        time-of-check/time-of-use argument turns on, and a cached one is worse
+        than none.
+
+        ``mergeable`` is GitHub's tri-state and is passed through as-is —
+        ``None`` means "still computing", which is not the same as "yes" and
+        must not be rounded up to one.
+        """
+        raw = self.client.get_json(f"/repos/{self.repo}/pulls/{number}", default={})
+        if not raw:
+            raise RuntimeError(f"github: pull request #{number} could not be read")
+        head = raw.get("head") or {}
+        base = raw.get("base") or {}
+        return {
+            "number": raw.get("number", 0),
+            "title": raw.get("title", ""),
+            "state": raw.get("state", ""),
+            "draft": bool(raw.get("draft", False)),
+            "head_ref": head.get("ref", ""),
+            "head_sha": head.get("sha", ""),
+            "base_ref": base.get("ref", ""),
+            "base_sha": base.get("sha", ""),
+            "mergeable": raw.get("mergeable"),
+            "mergeable_state": raw.get("mergeable_state", ""),
+            "merged": bool(raw.get("merged", False)),
+            "author": (raw.get("user") or {}).get("login", ""),
+            "url": raw.get("html_url", ""),
+        }
+
+    def combined_status(self, sha: str) -> Dict[str, Any]:
+        """Report CI's verdict on *sha* from both status APIs.
+
+        GitHub has two, and a repository can use either: the legacy combined
+        *status* API that third-party CI posts to, and the *check-runs* API that
+        Actions uses. Reading only one reports "no CI" for half the world, so
+        both are read and the pessimistic answer wins.
+
+        ``state`` is ``"success"``, ``"failure"``, ``"pending"`` or ``"none"``.
+        ``"none"`` means nothing reported at all — deliberately its own value,
+        because "no CI ran" and "CI passed" are different facts and only one of
+        them is evidence.
+        """
+        states: List[str] = []
+        contexts: List[str] = []
+
+        combined = (
+            self.client.get_json(f"/repos/{self.repo}/commits/{sha}/status", default={})
+            or {}
+        )
+        for item in combined.get("statuses") or []:
+            states.append(str(item.get("state", "")).lower())
+            contexts.append(str(item.get("context", "")))
+
+        runs = (
+            self.client.get_json(
+                f"/repos/{self.repo}/commits/{sha}/check-runs",
+                params={"per_page": 100},
+                default={},
+            )
+            or {}
+        )
+        for run in runs.get("check_runs") or []:
+            contexts.append(str(run.get("name", "")))
+            if str(run.get("status", "")).lower() != "completed":
+                states.append("pending")
+                continue
+            conclusion = str(run.get("conclusion", "")).lower()
+            if conclusion in ("success", "neutral", "skipped"):
+                states.append("success")
+            elif conclusion in ("cancelled", "timed_out", "action_required"):
+                states.append("pending")
+            else:
+                states.append("failure")
+
+        if not states:
+            state = "none"
+        elif any(s == "failure" or s == "error" for s in states):
+            state = "failure"
+        elif any(s == "pending" for s in states):
+            state = "pending"
+        else:
+            state = "success"
+        return {"state": state, "contexts": contexts, "count": len(states)}
+
+    def merge_pull_request(
+        self,
+        *,
+        number: int,
+        expected_head_sha: str,
+        method: str = "squash",
+        title: str = "",
+        message: str = "",
+    ) -> Dict[str, Any]:
+        """Merge a pull request, and only at *expected_head_sha*.
+
+        The narrowest write in this class, and the only one that can put code on
+        the default branch. Three properties make it narrow:
+
+        * ``expected_head_sha`` is mandatory and is sent to GitHub as ``sha``.
+          GitHub then refuses the merge with 409 if the head has moved since the
+          caller read it. That is what closes the last time-of-check/
+          time-of-use window: the check and the merge are the same call, decided
+          by the server, so no amount of racing between JARVIS's read and its
+          write can land a different commit than the one that was verified.
+        * ``method`` is validated against a three-name allowlist rather than
+          passed through, so a corrupted config cannot invent a merge verb.
+        * There is still no way to reach the default branch except through an
+          existing reviewed pull request. This method cannot create one, cannot
+          push, and cannot force anything.
+
+        Callers must not use this directly for automatic merges — go through
+        :class:`~openjarvis.reliability.merge.AutoMerger`, which owns the gates.
+        """
+        if method not in MERGE_METHODS:
+            raise UnsafeMergeError(
+                f"refusing merge method '{method}'; "
+                f"permitted: {', '.join(sorted(MERGE_METHODS))}"
+            )
+        if not expected_head_sha:
+            raise UnsafeMergeError(
+                "refusing to merge without an expected head SHA: the merge would "
+                "land whatever happens to be on the branch at the time"
+            )
+        if not number:
+            raise UnsafeMergeError("refusing to merge without a pull request number")
+
+        payload: Dict[str, Any] = {
+            "merge_method": method,
+            "sha": expected_head_sha,
+        }
+        if title:
+            payload["commit_title"] = title
+        if message:
+            payload["commit_message"] = message
+
+        response = self.client.request(
+            "PUT",
+            f"/repos/{self.repo}/pulls/{number}/merge",
+            json=payload,
+            expected=(200,),
+        )
+        body = response.json()
+        merged = bool(body.get("merged", False))
+        logger.info(
+            "github: merge of PR #%s at %s -> merged=%s",
+            number,
+            expected_head_sha[:12],
+            merged,
+        )
+        return {
+            "merged": merged,
+            "sha": body.get("sha", ""),
+            "message": body.get("message", ""),
+        }
 
     # -- signal source contract -------------------------------------------
 

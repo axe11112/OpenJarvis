@@ -91,17 +91,24 @@ class _ReproductionExecutor:
 
 
 class _RecordingGitHub:
-    """Captures pull requests instead of contacting GitHub.
+    """Captures pull requests and merges instead of contacting GitHub.
 
-    Deliberately has no merge method — mirroring ``GitHubSource``, where the
-    absence is the safety property.
+    ``merge_calls`` is the assertion surface for the merge tests below: proving
+    a merge did not happen means proving the request was never made, not that
+    the result was falsy.
     """
 
     base_branch = "main"
+    repo = "acme/site"
 
     def __init__(self) -> None:
         self.pull_requests = []
         self.branches = []
+        self.merge_calls = []
+        #: Set by a test to control what the PR looks like when re-read.
+        self.pr_facts = {}
+        self.base_sha = "b" * 40
+        self.client = self
 
     def branch_name_for(self, incident_id):
         return f"jarvis/incident-{incident_id}"
@@ -113,6 +120,37 @@ class _RecordingGitHub:
     def create_pull_request(self, **kwargs):
         self.pull_requests.append(kwargs)
         return {"number": 7, "url": "https://github.com/acme/site/pull/7"}
+
+    # -- read side used by the merge gates --------------------------------
+    def get_pull_request(self, number):
+        facts = {
+            "number": number,
+            "state": "open",
+            "draft": False,
+            "head_ref": "",
+            "head_sha": "",
+            "base_ref": "main",
+            "base_sha": self.base_sha,
+            "mergeable": True,
+            "mergeable_state": "clean",
+            "merged": False,
+            "author": "jarvis-bot",
+            "url": f"https://github.com/acme/site/pull/{number}",
+        }
+        facts.update(self.pr_facts)
+        return facts
+
+    def combined_status(self, _sha):
+        return {"state": "success", "count": 1, "contexts": ["ci"]}
+
+    def get_json(self, path, default=None, **_kw):
+        if "/git/ref/heads/" in path:
+            return {"object": {"sha": self.base_sha}}
+        return default
+
+    def merge_pull_request(self, **kwargs):
+        self.merge_calls.append(kwargs)
+        return {"merged": True, "sha": "m" * 40, "message": "Pull Request merged"}
 
 
 def _spec():
@@ -535,11 +573,120 @@ class TestNothingOutsideTheWorktreeIsTouched:
         assert outcome.resolved is True
         assert "pr_only" in outcome.reason
 
-    def test_no_component_can_merge_a_pull_request(self):
-        """The safety property is an absence: assert it stays absent."""
-        from openjarvis.reliability.sources import github as github_module
+    def test_the_repair_loop_merges_nothing_unless_it_is_given_a_merger(
+        self, harness, incident
+    ):
+        """This used to assert that no merge method existed anywhere.
 
-        assert not hasattr(github_module.GitHubSource, "merge_pull_request")
-        assert not any(
-            "merge" in name.lower() for name in dir(github_module.GitHubSource)
+        It cannot any more — merging is implemented. The property that replaces
+        it is narrower and is the one that actually matters: the repair loop's
+        default is still a pull request and nothing else. ``auto_merger``
+        defaults to ``None``, and a loop built without one has no path to the
+        default branch regardless of what else is configured.
+        """
+        harness.incident_id["value"] = incident.id
+        loop, _, github, _ = harness(fixture_repo.agent_correct_fix)
+
+        assert loop.auto_merger is None
+        outcome = loop.run(incident, _spec())
+
+        assert outcome.resolved is True
+        assert github.pull_requests, "a pull request should still be opened"
+        assert github.merge_calls == []
+
+    def test_the_default_configuration_builds_no_merger(self, tmp_path):
+        """Off by default, checked where the wiring actually happens."""
+        from openjarvis.cli.reliability_cmd import _build_auto_merger
+        from openjarvis.core.config import JarvisConfig
+
+        config = JarvisConfig()
+        assert config.reliability.merge.enabled is False
+        assert _build_auto_merger(config, object(), _RecordingGitHub()) is None
+
+
+class TestAClaimOfSuccessNeverReachesTheDefaultBranch:
+    """§21, end to end through the real repair loop.
+
+    The coding agent reports success in the same words it always uses. The fix
+    it produces is plausible, passes the project's own shipped tests, and does
+    not fix the bug — so independent verification, which re-runs the original
+    reproduction, fails.
+
+    Everything downstream must stay untouched: no pull request, no merge, and an
+    incident that ends up with a human rather than marked resolved. The merger
+    is wired in and enabled for this test precisely so that "no merge" is a
+    result rather than a consequence of nothing being connected.
+    """
+
+    def _merger(self, store, github):
+        from openjarvis.reliability.merge import AutoMerger
+
+        return AutoMerger(github=github, store=store, enabled=True, base_branch="main")
+
+    def test_agent_claims_success_verifier_disagrees_nothing_is_merged(
+        self, harness, incident, store
+    ):
+        harness.incident_id["value"] = incident.id
+        github = _RecordingGitHub()
+        loop, agent, _, _ = harness(
+            fixture_repo.agent_plausible_but_wrong,
+            github=github,
+            auto_merger=self._merger(store, github),
         )
+
+        outcome = loop.run(incident, _spec())
+
+        # The agent really was run, and really did claim success — otherwise
+        # this test would prove only that an agent which says nothing merges
+        # nothing, which is not the property under test. Read the claim off the
+        # persisted attempt rather than by invoking the agent again: its
+        # ``on_run`` hook writes files, and a test that re-runs it to inspect it
+        # edits the working tree it is running in.
+        assert agent.calls, "the agent should have been run"
+        reloaded = store.get(incident.id)
+        assert reloaded.attempts, "an attempt should have been recorded"
+        assert all("fixed" in a.claim.lower() for a in reloaded.attempts)
+
+        assert outcome.resolved is False
+        assert outcome.final_state is IncidentState.HUMAN_REQUIRED
+        assert github.merge_calls == [], "a refuted repair must not be merged"
+        assert github.pull_requests == [], "a refuted repair must not open a PR"
+
+    def test_the_projects_own_tests_passed_which_is_why_this_matters(
+        self, harness, incident, store
+    ):
+        """The wrong fix is not caught by the local suite.
+
+        If it were, this would only prove that failing tests block a merge —
+        which is a different, weaker property already covered elsewhere. The
+        point here is that everything cheap said yes and verification said no.
+        """
+        harness.incident_id["value"] = incident.id
+        github = _RecordingGitHub()
+        loop, _, _, _ = harness(
+            fixture_repo.agent_plausible_but_wrong,
+            github=github,
+            auto_merger=self._merger(store, github),
+        )
+
+        loop.run(incident, _spec())
+
+        reloaded = store.get(incident.id)
+        attempt = reloaded.attempts[0]
+        assert attempt.tests_passed is True
+        assert attempt.verification is not None
+        assert attempt.verification.passed is False
+        assert github.merge_calls == []
+
+    def test_the_refusal_is_in_the_audit_chain(self, harness, incident, store):
+        """A merge that did not happen still leaves a record that it was judged."""
+        harness.incident_id["value"] = incident.id
+        github = _RecordingGitHub()
+        loop, _, _, _ = harness(
+            fixture_repo.agent_plausible_but_wrong,
+            github=github,
+            auto_merger=self._merger(store, github),
+        )
+        loop.run(incident, _spec())
+
+        assert store.verify_chain()[0] is True

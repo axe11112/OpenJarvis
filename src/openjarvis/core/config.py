@@ -1592,6 +1592,36 @@ class ReliabilityPolicyConfig:
 
 
 @dataclass(slots=True)
+class ReliabilityMergeConfig:
+    """Automatic merge of a JARVIS pull request.
+
+    The narrowest authority in the system and the last one before production:
+    merging is how JARVIS's work reaches the default branch, and the default
+    branch is what the host deploys. Every field defaults to the closed
+    position, and ``enabled`` is off.
+
+    Merging deploys nothing by itself — JARVIS has no deploy call — but a repo
+    with deploy-on-merge wired up means a merge *becomes* a deployment. Treat
+    this switch as production authority, not as a convenience.
+    """
+
+    enabled: bool = False
+    #: ``squash`` keeps one reviewable commit per incident on the default
+    #: branch. ``merge`` and ``rebase`` are accepted for repositories whose
+    #: settings forbid squashing.
+    method: str = "squash"
+    #: Require the head commit to have a green combined status / check-run
+    #: conclusion on GitHub before merging. Turning this off is only defensible
+    #: where the repository genuinely runs no CI — with it off, the local
+    #: check suite and the preview verification are the only gates, and the
+    #: refusal reason says so rather than implying CI agreed.
+    require_status_checks: bool = True
+    #: Delete the incident branch after a successful merge. Off by default: a
+    #: merged branch is the cheapest way for a human to inspect what landed.
+    delete_branch_on_merge: bool = False
+
+
+@dataclass(slots=True)
 class ReliabilityWatchConfig:
     """The 24/7 supervisor.
 
@@ -1673,6 +1703,7 @@ class ReliabilityConfig:
     github: ReliabilityGitHubConfig = field(default_factory=ReliabilityGitHubConfig)
     repair: ReliabilityRepairConfig = field(default_factory=ReliabilityRepairConfig)
     policy: ReliabilityPolicyConfig = field(default_factory=ReliabilityPolicyConfig)
+    merge: ReliabilityMergeConfig = field(default_factory=ReliabilityMergeConfig)
     notify: ReliabilityNotifyConfig = field(default_factory=ReliabilityNotifyConfig)
     watch: ReliabilityWatchConfig = field(default_factory=ReliabilityWatchConfig)
     flapping: ReliabilityFlappingConfig = field(

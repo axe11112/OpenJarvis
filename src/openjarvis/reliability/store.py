@@ -322,6 +322,38 @@ class IncidentStore:
         )
         return incident
 
+    def record_audit(
+        self, incident: Incident, *, actor: str, reason: str
+    ) -> IncidentTransition:
+        """Append a hash-chained audit entry without moving the incident.
+
+        Some decisions must be tamper-evident but are not lifecycle changes. A
+        refused merge is the motivating case: nothing about the incident
+        changed, and yet "JARVIS considered merging and would not" is exactly
+        the kind of fact an audit log exists to preserve — arguably more so than
+        the merges that went ahead.
+
+        The entry is written into the same append-only chain as every
+        transition, with ``from_state == to_state``, so ``verify-audit`` covers
+        it and ``incident show`` displays it in order alongside everything else.
+        It deliberately does not go through :meth:`Incident.transition_to`: that
+        method enforces the lifecycle graph, which has no self-edges, and
+        loosening the graph to allow bookkeeping would also allow a real
+        state machine bug to go unnoticed.
+        """
+        transition = IncidentTransition(
+            from_state=incident.state,
+            to_state=incident.state,
+            actor=actor,
+            reason=reason,
+        )
+        incident.transitions.append(transition)
+        with self._lock:
+            self._append_transition(incident.id, transition)
+            self._conn.commit()
+        logger.info("Incident %s audit (%s): %s", incident.id, actor, reason)
+        return transition
+
     def add_evidence(self, incident: Incident, evidence: Evidence) -> Evidence:
         """Attach evidence to *incident* and persist it."""
         incident.add_evidence(evidence)

@@ -22,8 +22,14 @@ watching:
   anything already recorded.
 
 The endpoint of everything here is a pull request and a notification. Nothing in
-this module can deploy, merge, or write to production, and the startup gate
-refuses to run if the configuration says otherwise.
+this module can deploy or write to production, and the startup gate refuses to
+run if the configuration says otherwise.
+
+Merging is the one endpoint beyond the pull request, added separately in
+:mod:`openjarvis.reliability.merge` and off unless
+``[reliability.merge] enabled`` says otherwise. It still deploys nothing — but
+it does put code on the default branch without a human, so the startup banner
+reports its real state rather than a constant.
 """
 
 from __future__ import annotations
@@ -141,6 +147,25 @@ def assert_safe_to_start(config: Any) -> None:
                 "is unset — there is nowhere safe to work"
             )
 
+    if rc.merge.enabled:
+        # Validated at startup rather than at merge time. The merge verb comes
+        # from configuration, and discovering it is invalid at the moment of the
+        # most privileged call in the system means discovering it during an
+        # outage, with a verified fix sitting unmerged.
+        from openjarvis.reliability.sources.github import MERGE_METHODS
+
+        if rc.merge.method not in MERGE_METHODS:
+            problems.append(
+                f"[reliability.merge] method is '{rc.merge.method}', which is not "
+                f"a merge method GitHub accepts "
+                f"({', '.join(sorted(MERGE_METHODS))})"
+            )
+        if not rc.github.enabled or not rc.github.repo:
+            problems.append(
+                "automatic merge is enabled but GitHub is not configured — "
+                "there is no pull request to merge"
+            )
+
     if problems:
         raise UnsafeConfigurationError(
             "JARVIS refuses to start:\n"
@@ -164,7 +189,11 @@ def startup_banner(config: Any) -> str:
             "Default branch push",
             "ON" if rc.policy.allow_push_to_default_branch else "OFF",
         ),
-        ("Automatic PR merge", "OFF"),
+        # Read, not asserted. This line was a constant "OFF" for as long as no
+        # merge code existed; leaving it constant after the code landed would
+        # have made the startup banner reassure the operator about the one
+        # capability it could no longer see.
+        ("Automatic PR merge", "ON" if rc.merge.enabled else "OFF"),
         ("Supabase writes", "ON" if rc.supabase.allow_production_writes else "OFF"),
         ("Deploy mode", rc.policy.deploy_mode),
         ("Maximum repair attempts", str(rc.repair.max_attempts)),

@@ -39,6 +39,8 @@ __all__ = [
     "TelegramNotifier",
     "render_alert",
     "render_human_required",
+    "render_merge_attempt",
+    "render_merge_outcome",
     "render_recovered",
     "render_progress",
     "render_resolved",
@@ -226,6 +228,86 @@ def render_rolled_back(incident: Incident, *, reason: str, persona: bool = True)
             f"Reason: {reason}",
         ]
     )
+
+
+def render_merge_attempt(
+    incident: Incident,
+    *,
+    pr_number: int,
+    head_sha: str,
+    method: str,
+    persona: bool = True,
+) -> str:
+    """Sent immediately before JARVIS merges anything.
+
+    Deliberately sent *before* rather than only after. This is the moment the
+    owner can still intervene, and a notification that only ever arrives once
+    the code is on the default branch is a report, not a warning.
+    """
+    lead = _sir(persona, "every merge gate has passed and I am merging.")
+    return "\n".join(
+        [
+            "⏳ JARVIS — merging",
+            "",
+            lead,
+            "",
+            f"Incident: {incident.id}",
+            f"Pull request: #{pr_number}",
+            f"Commit: {head_sha[:12]}",
+            f"Method: {method}",
+            "",
+            "This merges verified work into the default branch. It does not "
+            "deploy: JARVIS has no deploy authority.",
+        ]
+    )
+
+
+def render_merge_outcome(
+    incident: Incident, *, record: Any, persona: bool = True
+) -> str:
+    """Sent after a merge attempt, whichever way it went.
+
+    A refusal is reported as an ordinary outcome rather than as a failure. The
+    gates refusing is the system working, and phrasing it as an error would
+    train the owner to ignore exactly the message that matters.
+    """
+    if getattr(record, "merged", False):
+        lead = _sir(persona, "the pull request is merged.")
+        lines = [
+            "🟢 JARVIS — merged",
+            "",
+            lead,
+            "",
+            f"Incident: {incident.id}",
+            f"Pull request: #{record.pr_number}",
+            f"Verified commit: {record.verified_head_sha[:12]}",
+            f"Merge commit: {record.merge_commit_sha[:12]}",
+            f"Method: {record.method}",
+            "",
+            "No production deployment was performed by JARVIS.",
+        ]
+        return "\n".join(lines)
+
+    decision = getattr(record, "decision", None)
+    failures = list(getattr(decision, "failures", []) or [])
+    lead = _sir(persona, "I did not merge.")
+    lines = [
+        "⛔ JARVIS — merge refused",
+        "",
+        lead,
+        "",
+        f"Incident: {incident.id}",
+        f"Pull request: #{record.pr_number or 'none recorded'}",
+        "",
+        "Refused because:",
+    ]
+    lines += [f"  • {g.name}: {g.detail}" for g in failures[:8]] or [
+        f"  • {getattr(record, 'error', '') or 'unknown'}"
+    ]
+    if len(failures) > 8:
+        lines.append(f"  … and {len(failures) - 8} more")
+    lines += ["", "Nothing was merged and nothing was deployed."]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +586,34 @@ class NotificationRouter:
         return self.notify(
             render_rolled_back(incident, reason=reason, persona=self.persona),
             severity=Severity.CRITICAL,
+        )
+
+    def merge_attempt(
+        self, incident: Incident, *, pr_number: int, head_sha: str, method: str
+    ) -> bool:
+        """Notify that a merge is about to happen.
+
+        HIGH regardless of the incident's severity: this is the last message
+        before code reaches the default branch without a human, and the rate cap
+        deciding the owner does not need to know would defeat the point.
+        """
+        return self.notify(
+            render_merge_attempt(
+                incident,
+                pr_number=pr_number,
+                head_sha=head_sha,
+                method=method,
+                persona=self.persona,
+            ),
+            severity=Severity.HIGH,
+        )
+
+    def merge_outcome(self, incident: Incident, *, record: Any) -> bool:
+        """Notify how a merge attempt ended, including a refusal."""
+        merged = bool(getattr(record, "merged", False))
+        return self.notify(
+            render_merge_outcome(incident, record=record, persona=self.persona),
+            severity=Severity.HIGH if merged else Severity.MEDIUM,
         )
 
     # -- internals --------------------------------------------------------

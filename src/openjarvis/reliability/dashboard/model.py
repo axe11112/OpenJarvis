@@ -404,11 +404,16 @@ def target_display_name(target: Any) -> str:
 def safety_panel(config: Any, *, stop_flag_engaged: bool) -> SafetyPanel:
     """Read every interlock out of the live configuration.
 
-    Nothing here is a constant string chosen by the UI. ``Production
-    deployment`` and ``Automatic PR merge`` are reported as OFF because the
-    repair path has no code that can deploy or merge — the same claim
-    ``startup_banner`` makes — and the deploy mode that would be the first step
-    towards either is shown next to them so the reader can check the claim.
+    Nothing here is a constant string chosen by the UI, and ``Automatic PR
+    merge`` stopped being one the moment merging was implemented. It used to be
+    hardcoded ``OFF`` with the detail "no merge path exists in the repair loop",
+    which was true and then, on the commit that added
+    :mod:`openjarvis.reliability.merge`, silently was not. A safety panel that
+    reassures from a constant is worse than no panel, so it now reads the flag.
+
+    ``Production deployment`` is still a constant, and still accurate: nothing
+    in this codebase can trigger a deployment. The detail names the deploy mode
+    beside it so a reader can check the claim rather than take it.
     """
     rc = config.reliability
     deploy_mode = rc.policy.deploy_mode
@@ -432,8 +437,14 @@ def safety_panel(config: Any, *, stop_flag_engaged: bool) -> SafetyPanel:
         ),
         SafetyRow(
             label="Automatic PR merge",
-            value="OFF",
-            detail="no merge path exists in the repair loop",
+            value="ON" if rc.merge.enabled else "OFF",
+            dangerous=bool(rc.merge.enabled),
+            detail=(
+                f"{rc.merge.method} merge of the incident PR at the verified SHA"
+                + ("" if rc.merge.require_status_checks else "; CI checks NOT required")
+                if rc.merge.enabled
+                else "[reliability.merge] enabled = false"
+            ),
         ),
         SafetyRow(
             label="Supabase writes",

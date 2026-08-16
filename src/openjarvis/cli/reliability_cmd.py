@@ -360,6 +360,35 @@ def _build_repair_loop(config: Any, store: Any, sources: list) -> Any:
         preview_wait_seconds=rc.repair.preview_wait_seconds,
         protected_paths=list(rc.policy.protected_paths),
         notifier=_build_notifier(config),
+        auto_merger=_build_auto_merger(config, store, github),
+    )
+
+
+def _build_auto_merger(config: Any, store: Any, github: Any) -> Any:
+    """Build the auto-merger, or ``None`` when merging is disabled.
+
+    Returning ``None`` rather than a disabled instance is deliberate. A disabled
+    merger would still be called on every resolved incident, and would still
+    write an audit entry and a notification saying it refused because it was
+    switched off — turning the off position into a source of noise, which is how
+    an off switch ends up being flipped for the wrong reason.
+    """
+    rc = config.reliability
+    if not rc.merge.enabled or github is None:
+        return None
+
+    from openjarvis.reliability.merge import AutoMerger
+
+    return AutoMerger(
+        github=github,
+        store=store,
+        enabled=True,
+        method=rc.merge.method,
+        base_branch=rc.github.base_branch,
+        branch_prefix=rc.github.branch_prefix,
+        require_status_checks=rc.merge.require_status_checks,
+        delete_branch_on_merge=rc.merge.delete_branch_on_merge,
+        notifier=_build_notifier(config),
     )
 
 
@@ -1699,8 +1728,7 @@ def reliability_dashboard(
     console.print()
     rc = config.reliability
     console.print(
-        f"[dim]Target        "
-        f"{escape(rc.site.base_url or 'not configured')}[/dim]"
+        f"[dim]Target        {escape(rc.site.base_url or 'not configured')}[/dim]"
     )
     console.print("[dim]Mode          read-only · loopback only[/dim]")
     console.print(
@@ -1776,9 +1804,7 @@ def service_group() -> None:
     show_default=True,
     help="Load it into launchd now.",
 )
-def service_install(
-    working_directory: str, capture_env: bool, load: bool
-) -> None:
+def service_install(working_directory: str, capture_env: bool, load: bool) -> None:
     """Install the LaunchAgent that supervises the watcher."""
     from pathlib import Path
 
@@ -1852,8 +1878,7 @@ def service_uninstall() -> None:
         f"Unloaded: {report['unloaded']} · plist removed: {report['plist_removed']}"
     )
     console.print(
-        f"[dim]Kept {escape(report['env_file_kept'])} "
-        "(it holds credentials).[/dim]"
+        f"[dim]Kept {escape(report['env_file_kept'])} (it holds credentials).[/dim]"
     )
 
 

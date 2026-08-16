@@ -204,6 +204,12 @@ class RepairLoop:
     base_ref: str = "HEAD"
     base_branch: str = "main"
     push_branch: bool = True
+    #: Optional :class:`~openjarvis.reliability.merge.AutoMerger`. ``None`` — the
+    #: default — means the pull request is the end of the line, which is what
+    #: this loop did for its whole existence before merging was implemented.
+    #: Consulted only after a pull request has actually been opened, and it
+    #: re-derives every gate itself rather than trusting this loop's word for it.
+    auto_merger: Any = None
 
     def __post_init__(self) -> None:
         if self.checks is None:
@@ -530,6 +536,7 @@ class RepairLoop:
             )
 
         self._notify("resolved", incident, attempt=attempt, verification=verification)
+        self._maybe_merge(incident, pull_request_url)
 
         return RepairOutcome(
             resolved=True,
@@ -540,6 +547,27 @@ class RepairLoop:
             pull_request_url=pull_request_url,
             verification=verification,
         )
+
+    def _maybe_merge(self, incident: Incident, pull_request_url: str) -> None:
+        """Hand a freshly opened pull request to the merge gates, if configured.
+
+        Only reached when a pull request actually exists: with no PR there is
+        nothing to merge, and calling the merger anyway would record a refusal
+        for a decision nobody asked it to make.
+
+        Nothing is passed to the merger about *why* this repair succeeded. It
+        re-reads the incident, re-reads the pull request from GitHub, and
+        re-derives every gate from the recorded attempt. This loop having just
+        concluded the repair is good is not evidence, for the same reason the
+        coding agent's claim is not: the value of an independent check is
+        exactly that it does not inherit the caller's conclusion.
+        """
+        if self.auto_merger is None or not pull_request_url:
+            return
+        try:
+            self.auto_merger.merge_for(incident)
+        except Exception:  # pragma: no cover - a merge must never break a repair
+            logger.exception("the merge gate raised for %s", incident.id)
 
     def _escalate(self, incident: Incident, reason: str) -> None:
         """Stop touching code and hand the incident to a human."""

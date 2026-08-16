@@ -457,13 +457,80 @@ enabled on a real machine.
 
 ---
 
-## 15. What Phase 12 deliberately does not do
+## 15. Automatic merge
 
-No automatic production deployment. No automatic rollback — unnecessary, because
-production is never changed: the failure mode is "no pull request", not "a bad
-deployment". No automatic merge. No voice interface, no conversational
-dashboard, no SMS.
+Off by default, and separate from everything above. The repair loop's endpoint is
+still a pull request; merging is an additional capability that must be switched
+on deliberately.
 
-The single goal is: detect a real problem, give the coding agent the right
-context, fix it in isolation, prove the fix works, open a pull request. The human
-remains responsible for reviewing it, merging it, and deploying.
+```toml
+[reliability.merge]
+enabled = false               # the master switch
+method = "squash"             # squash | merge | rebase
+require_status_checks = true  # refuse if CI is red, pending, or absent
+delete_branch_on_merge = false
+```
+
+### The gates
+
+A merge happens only when **every** gate passes. They are evaluated in full
+rather than short-circuiting, so the audit record shows all of them:
+
+| Gate | Refuses when |
+|---|---|
+| `merge_enabled` | `[reliability.merge] enabled = false` |
+| `incident_state` | The incident is HUMAN_REQUIRED, RECOVERY_REQUIRED, FAILED or ROLLED_BACK |
+| `not_flapping` | The probe alternates pass/fail, so a green verification proves nothing |
+| `attempt_recorded` / `verified` | Nothing was verified — **the agent's claim is never read** |
+| `verified_sha_known` | The attempt recorded no commit SHA |
+| `scope` / `no_protected_paths` / `no_secret_like_paths` | The recorded scope verdict refused, or the diff touched a protected or secret-like path |
+| `check_lint`, `check_typecheck`, `check_tests`, `check_build` | Any local check failed **or never ran** |
+| `preview_deployment` | No preview deployment was recorded for the attempt |
+| `original_reproduction` | The probe that was re-run is not the one that opened the incident |
+| `pr_belongs_to_incident` | The PR is not the one recorded on this incident |
+| `pr_head_is_incident_branch` | The head branch is not `<branch_prefix><incident id>` |
+| `pr_base_is_default_branch` | The PR targets something other than the configured base |
+| `pr_open` / `pr_not_draft` | The PR is closed, already merged, or a draft |
+| `no_conflicts` | GitHub reports conflicts, `blocked`, or has not decided yet |
+| `head_sha_unchanged` | The PR head is not the commit that was verified |
+| `base_unchanged` | The base branch moved since verification |
+| `status_checks` | CI is failing, pending, or reported nothing at all |
+
+Note that lint is **advisory for opening a pull request and blocking for merging
+one**. A human reviewing a PR can weigh a style violation against an outage;
+nobody is going to review this one.
+
+### Time-of-check / time-of-use
+
+`head_sha_unchanged` compares the freshly re-read PR head against the verified
+commit, and the merge call then passes that same SHA to GitHub as the `sha`
+parameter. GitHub refuses with 409 if the head moved in between, so the check and
+the use are one server-side operation. Verifying commit A and merging commit B is
+not narrowed, it is impossible.
+
+### Audit trail
+
+Every decision — **including every refusal** — is appended to the incident's
+hash-chained transition log via `IncidentStore.record_audit`, and the full
+gate-by-gate account is attached as evidence. `jarvis reliability verify-audit`
+covers it. A refusal is the entry worth keeping: it is the evidence the gates are
+load-bearing.
+
+Telegram is notified immediately *before* a merge (while intervention is still
+possible) and after it, whichever way it went.
+
+---
+
+## 16. What this deliberately still does not do
+
+No automatic production deployment — there is no code anywhere in this codebase
+that can trigger one. No automatic rollback. No voice interface, no
+conversational dashboard, no SMS.
+
+Merging is not deploying, but on a repository wired for deploy-on-merge the two
+are the same event. Treat `[reliability.merge] enabled` as production authority.
+
+The goal remains: detect a real problem, give the coding agent the right context,
+fix it in isolation, prove the fix works, open a pull request. Merging that pull
+request without a human is an opt-in, and deploying it is still nobody's job but
+the human's.

@@ -546,6 +546,20 @@ class TestOutputStreamSeparation:
     every test here runs with warnings genuinely present rather than mocked in.
     """
 
+    @pytest.fixture(autouse=True)
+    def _isolated_config(self, tmp_path, monkeypatch):
+        """Point the CLI at an empty config instead of the developer's own.
+
+        Without this the assertions read ``~/.openjarvis/config.toml``, so the
+        suite's result depends on how the machine it runs on happens to be
+        configured — and ``Automatic repair: OFF`` started failing on the day
+        somebody enabled automatic repair locally. A test that passes or fails
+        based on a file outside the repository is not testing the CLI.
+        """
+        path = tmp_path / "config.toml"
+        path.write_text("[reliability]\nenabled = true\n", encoding="utf-8")
+        monkeypatch.setenv("OPENJARVIS_CONFIG", str(path))
+
     @staticmethod
     def _diagnostic(*extra):
         return CliRunner().invoke(

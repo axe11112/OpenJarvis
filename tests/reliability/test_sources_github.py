@@ -10,6 +10,7 @@ from openjarvis.reliability.sources.github import (
     GitHubSource,
     ProtectedPathError,
     UnsafeBranchError,
+    UnsafeMergeError,
     is_protected_path,
 )
 from openjarvis.reliability.types import Severity
@@ -107,10 +108,33 @@ class TestBranchSafety:
         source = _source(allow_push_to_default_branch=True)
         assert source.create_branch("main") == "abc123"
 
-    def test_has_no_merge_method(self):
-        """JARVIS opens pull requests; humans merge them."""
-        assert not hasattr(GitHubSource, "merge_pull_request")
+    def test_the_only_merge_method_refuses_without_an_exact_commit(self):
+        """This asserted that no merge method existed. Now one does.
+
+        The property that replaces the absence is the one that made the absence
+        valuable: nothing here can put an *unspecified* commit on the default
+        branch. ``merge_pull_request`` demands the exact SHA the caller verified
+        and hands it to GitHub, which refuses if the head has moved — so a merge
+        can only ever land a commit somebody named in advance.
+        """
         assert not hasattr(GitHubSource, "merge")
+        assert not hasattr(GitHubSource, "push")
+
+        source = _source()
+        with pytest.raises(UnsafeMergeError):
+            source.merge_pull_request(number=1, expected_head_sha="", method="squash")
+        with pytest.raises(UnsafeMergeError):
+            source.merge_pull_request(number=0, expected_head_sha="a" * 40)
+        with pytest.raises(UnsafeMergeError):
+            source.merge_pull_request(
+                number=1, expected_head_sha="a" * 40, method="force"
+            )
+
+    def test_merging_is_off_unless_configuration_says_otherwise(self):
+        """The class can merge; the system does not, unless switched on."""
+        from openjarvis.core.config import JarvisConfig
+
+        assert JarvisConfig().reliability.merge.enabled is False
 
     def test_rejects_a_malformed_repo(self):
         with pytest.raises(ValueError, match="owner/name"):
