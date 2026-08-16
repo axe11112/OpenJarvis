@@ -18,6 +18,13 @@ So matching is deterministic: lowercase, strip, and look for phrases. The cost
 is that unusual phrasings fall through to "I don't understand", which is a bad
 minute for the operator and a safe one for production.
 
+Where a phrase list is *tolerant* — carrying spellings a speech model actually
+produces, like "is production done" for "is production down" — that tolerance is
+only ever added to ``READ`` intents. The asymmetry is deliberate. Mishearing a
+question costs a wrong answer the operator hears immediately and corrects;
+mishearing a command runs something. Questions may be generous, anything that
+acts may not.
+
 Risk is a property of the intent, not of how it was asked for. ``READ`` and
 ``SAFE`` intents run immediately. ``CONFIRM`` intents never run from voice at
 all — they raise a pending confirmation in the Control Center, where a human
@@ -98,6 +105,14 @@ INTENTS: Tuple[Intent, ...] = (
             "production status",
             "is the website down",
             "is it down",
+            # Mishearings observed from tiny.en on real speech. Added only to
+            # READ intents, and that asymmetry is the point: mishearing a
+            # *question* costs a wrong answer, which the operator hears
+            # immediately and can correct. Mishearing a *command* runs something.
+            # So questions get tolerant matching and anything that acts does not.
+            "is production done",
+            "is the site done",
+            "is the website done",
         ),
         "whether production is healthy",
     ),

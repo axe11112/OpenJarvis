@@ -251,10 +251,22 @@ def _degraded_report():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.20", "example.com", "::"])
+@pytest.mark.parametrize("host", ["192.168.1.20", "example.com"])
 def test_refuses_to_bind_anything_but_loopback(service, host):
     """A non-loopback bind is refused at construction, not at request time."""
     with pytest.raises(ValueError, match="local-only"):
+        ControlCenterServer(service, host=host, port=0)
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::"])
+def test_a_wildcard_bind_is_refused_by_name(service, host):
+    """The dangerous one gets its own message.
+
+    ``0.0.0.0`` is what someone types when a phone will not connect, and on a
+    laptop it means "answer on every café network I ever join". The refusal says
+    so rather than repeating the generic line.
+    """
+    with pytest.raises(ValueError, match="every network this machine joins"):
         ControlCenterServer(service, host=host, port=0)
 
 
