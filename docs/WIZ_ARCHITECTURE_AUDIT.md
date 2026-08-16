@@ -288,10 +288,62 @@ implementation would, so they deserve explicit tests.
 
 ---
 
+## 9b. Test baseline before Phase 1 — read this first
+
+The brief requires that reliability and security tests run after every phase with no regression.
+So the baseline needs to be known before anything is built. It is **not currently green**:
+
+```
+tests/reliability + tests/security
+21 failed · 1391 passed · 14 skipped · 12m11s
+```
+
+All 21 failures are in the repair end-to-end paths (`test_repair_e2e.py`, `test_watch_e2e.py`,
+`test_claude_live.py`). They reproduce in isolation, so they are not interference from the
+parallel session that was running the same suite.
+
+**They are environmental, not a code regression.** The harness runs the fixture project's checks
+with `python3 -m pytest tests -q`, which resolves to the *system* python3 (Homebrew 3.14) — and
+that interpreter has no pytest:
+
+```
+$ python3 -m pytest --version
+/usr/local/opt/python@3.14/bin/python3.14: No module named pytest
+```
+
+The repair loop's local check therefore fails, `_publish_branch` is never reached, `commit_sha`
+stays empty, no verification happens, and the incident ends in `HUMAN_REQUIRED`. Every assertion
+downstream of "a repair was verified" fails as a consequence — which is why one missing module
+produces 21 failures.
+
+Confirmed by re-running `test_repair_e2e.py` with `python3` shimmed to the venv interpreter:
+
+```
+without shim   12 failed, 21 passed
+with shim      33 passed, 0 failed   (92s)
+```
+
+**This does not affect live operation.** The real repair loop targets Wize with npm/Node
+commands from `package.json`, not `python3`, so production monitoring is unaffected.
+
+**Fix before Phase 1** — one of:
+
+1. make the harness use `sys.executable` instead of a bare `python3` (preferred: it makes the
+   suite independent of what happens to be on PATH), or
+2. install pytest for the system interpreter (fragile — it re-breaks whenever Homebrew bumps the
+   default python).
+
+Recommend option 1, as a standalone commit before any Wiz work, so that Phase 1 starts from a
+genuinely green baseline and "no regression" means something.
+
+---
+
 ## 10. What I recommend implementing first
 
 **Phase 1, in this order:**
 
+0. **Green the test baseline (§9b).** A one-line harness fix. Everything below claims "no
+   regression", and that claim is meaningless against a red baseline.
 1. **Identity (§0).** Small, entirely user-facing, zero risk — rename the `JARVIS`/`ALERT`
    headers in `notify.py` to plain language, keep JARVIS internally. Good first commit because
    it is visible and provably harmless.
