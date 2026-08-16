@@ -210,6 +210,12 @@ class RepairLoop:
     #: Consulted only after a pull request has actually been opened, and it
     #: re-derives every gate itself rather than trusting this loop's word for it.
     auto_merger: Any = None
+    #: Optional :class:`~openjarvis.reliability.postmerge.PostMergeVerifier`.
+    #: Required once ``auto_merger`` can actually merge: without it a merged
+    #: incident has no way to reach RESOLVED and escalates instead, because
+    #: "merged" is not "production works" and nothing else here can tell the
+    #: difference.
+    post_merge_verifier: Any = None
 
     def __post_init__(self) -> None:
         if self.checks is None:
@@ -222,6 +228,21 @@ class RepairLoop:
 
     def run(self, incident: Incident, spec: ProbeSpec) -> RepairOutcome:
         """Attempt to repair *incident*, verifying every attempt independently."""
+        # Checked before the policy, because it outranks it. A merge that broke
+        # production keeps the probe failing, which opens a *fresh* incident
+        # with a clean attempt count and a clean state — one that every other
+        # gate would happily wave through. Repairing it would stack a second
+        # unreviewed change on a live one already known to be bad.
+        storm = self._post_merge_block(incident)
+        if storm:
+            self._escalate(incident, storm)
+            return RepairOutcome(
+                resolved=False,
+                attempts=incident.attempts_used,
+                final_state=incident.state,
+                reason=storm,
+            )
+
         gate = self.policy.may_attempt_repair(incident)
         if not gate:
             self._escalate(incident, gate.reason)
@@ -243,7 +264,7 @@ class RepairLoop:
             last_verification = verification
 
             if attempt.outcome == OUTCOME_VERIFIED:
-                return self._succeed(incident, attempt, verification)
+                return self._succeed(incident, attempt, verification, spec)
 
             if stop_reason:
                 self._escalate(incident, stop_reason)
@@ -461,6 +482,7 @@ class RepairLoop:
         incident: Incident,
         attempt: RepairAttempt,
         verification: Optional[VerificationResult],
+        spec: Any = None,
     ) -> RepairOutcome:
         """Handle a verified repair: PR by default, deploy only if permitted.
 
@@ -521,6 +543,31 @@ class RepairLoop:
         incident.resolution.attempts_used = incident.attempts_used
         self.store.save(incident)
 
+        # The merge is attempted *before* any resolution is recorded. Resolving
+        # first and merging afterwards — which this loop did until post-merge
+        # verification existed — meant a merge could land on the default branch,
+        # trigger a production deployment, and find the incident already marked
+        # RESOLVED on the strength of a preview of a commit that no longer
+        # exists. Nothing downstream could then tell a verified production from
+        # an unexamined one.
+        merge_record = self._maybe_merge(incident, pull_request_url)
+        merged = bool(getattr(merge_record, "merged", False))
+
+        if merged:
+            # Live on the default branch, unproven in production. The incident
+            # is neither resolved nor failed until production says so.
+            self._transition(
+                incident,
+                IncidentState.MERGED,
+                f"merged at {str(getattr(merge_record, 'merge_commit_sha', ''))[:12]}; "
+                "production not yet verified",
+            )
+            return self._verify_production(
+                incident, attempt, verification, merge_record, pull_request_url, spec
+            )
+
+        # Not merged — refused by the gates, not configured, or no pull request.
+        # The pull request is the deliverable, exactly as before.
         if deploy:
             self._transition(
                 incident,
@@ -536,7 +583,6 @@ class RepairLoop:
             )
 
         self._notify("resolved", incident, attempt=attempt, verification=verification)
-        self._maybe_merge(incident, pull_request_url)
 
         return RepairOutcome(
             resolved=True,
@@ -548,7 +594,148 @@ class RepairLoop:
             verification=verification,
         )
 
-    def _maybe_merge(self, incident: Incident, pull_request_url: str) -> None:
+    def _verify_production(
+        self,
+        incident: Incident,
+        attempt: RepairAttempt,
+        verification: Any,
+        merge_record: Any,
+        pull_request_url: str,
+        spec: Any = None,
+    ) -> RepairOutcome:
+        """Prove production after a merge, or hand the incident to a human.
+
+        The one path out of ``MERGED``. With no verifier configured there is no
+        honest way to claim production is good, so the incident escalates rather
+        than resolving — an operator who enabled automatic merge without
+        automatic production verification has asked for something JARVIS should
+        refuse to fake.
+        """
+        if self.post_merge_verifier is None:
+            reason = (
+                "the merge landed but no post-merge production verifier is "
+                "configured, so production cannot be proved"
+            )
+            self._fail_after_merge(incident, merge_record, result=None, reason=reason)
+            return RepairOutcome(
+                resolved=False,
+                attempts=incident.attempts_used,
+                final_state=incident.state,
+                reason=reason,
+                branch=attempt.branch,
+                pull_request_url=pull_request_url,
+                verification=verification,
+            )
+
+        try:
+            result = self.post_merge_verifier.verify(
+                incident, merge_record=merge_record, spec=spec
+            )
+        except Exception as exc:  # noqa: BLE001 - unproven, never assumed good
+            logger.exception("post-merge verification raised for %s", incident.id)
+            reason = f"post-merge production verification could not run: {exc}"
+            self._fail_after_merge(incident, merge_record, result=None, reason=reason)
+            return RepairOutcome(
+                resolved=False,
+                attempts=incident.attempts_used,
+                final_state=incident.state,
+                reason=reason,
+                branch=attempt.branch,
+                pull_request_url=pull_request_url,
+                verification=verification,
+            )
+
+        if not result.verified:
+            self._fail_after_merge(
+                incident, merge_record, result=result, reason=result.reason
+            )
+            return RepairOutcome(
+                resolved=False,
+                attempts=incident.attempts_used,
+                final_state=incident.state,
+                reason=result.reason,
+                branch=attempt.branch,
+                pull_request_url=pull_request_url,
+                verification=verification,
+            )
+
+        # Production itself proved it. This is the only automatic route from
+        # MERGED to RESOLVED.
+        self._transition(incident, IncidentState.RESOLVED, result.reason)
+        if self.notifier is not None:
+            try:
+                self.notifier.production_verified(
+                    incident, record=merge_record, result=result
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("could not send the production-verified notification")
+        return RepairOutcome(
+            resolved=True,
+            attempts=incident.attempts_used,
+            final_state=incident.state,
+            reason=result.reason,
+            branch=attempt.branch,
+            pull_request_url=pull_request_url,
+            verification=verification,
+        )
+
+    def _fail_after_merge(
+        self,
+        incident: Incident,
+        merge_record: Any,
+        *,
+        result: Any,
+        reason: str,
+    ) -> None:
+        """Escalate a merge that landed and did not come good in production.
+
+        Four things happen here and the order matters. The durable marker is
+        written *first*: if the process dies immediately afterwards, the guard
+        that stops a second merge for this fingerprint must already be on disk.
+        Only then is the incident moved, the owner told, and the evidence
+        recorded.
+
+        No rollback is attempted. Reverting a merge is a write to the default
+        branch, and there is no tested rollback mechanism here to invoke — an
+        untested one, run automatically against a production already known to be
+        unhealthy, is how a bad deployment becomes an outage.
+        """
+        from openjarvis.reliability.postmerge import (
+            POST_MERGE_FAILURE_KEY,
+            PostMergeResult,
+            failure_marker,
+        )
+
+        verdict = result if result is not None else PostMergeResult(reason=reason)
+        try:
+            incident.metadata[POST_MERGE_FAILURE_KEY] = failure_marker(
+                merge_record=merge_record, result=verdict
+            )
+            self.store.save(incident)
+        except Exception:  # noqa: BLE001
+            logger.exception("could not write the post-merge guard for %s", incident.id)
+
+        self._add_note(
+            incident,
+            "Production verification failed after merge",
+            content=(
+                f"{reason}\n\n"
+                f"Merge commit: {getattr(merge_record, 'merge_commit_sha', '')}\n"
+                f"Pull request: #{getattr(merge_record, 'pr_number', 0)}\n"
+                "No rollback was attempted and no database was written."
+            ),
+        )
+        self._escalate(incident, reason)
+
+        if self.notifier is not None:
+            try:
+                self.notifier.post_merge_failed(
+                    incident, record=merge_record, result=verdict
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("could not send the CRITICAL post-merge notification")
+
+    def _maybe_merge(self, incident: Incident, pull_request_url: str) -> Any:
         """Hand a freshly opened pull request to the merge gates, if configured.
 
         Only reached when a pull request actually exists: with no PR there is
@@ -561,13 +748,39 @@ class RepairLoop:
         concluded the repair is good is not evidence, for the same reason the
         coding agent's claim is not: the value of an independent check is
         exactly that it does not inherit the caller's conclusion.
+
+        Returns the merge record, or ``None`` when no merge was attempted. A
+        raised merge still returns ``None``, which reads downstream as "not
+        merged" — the safe direction, since the alternative is treating an
+        unknown outcome as a landed one.
         """
         if self.auto_merger is None or not pull_request_url:
-            return
+            return None
         try:
-            self.auto_merger.merge_for(incident)
+            return self.auto_merger.merge_for(incident)
         except Exception:  # pragma: no cover - a merge must never break a repair
             logger.exception("the merge gate raised for %s", incident.id)
+            return None
+
+    def _post_merge_block(self, incident: Incident) -> str:
+        """Why this incident may not be repaired, given past post-merge failures.
+
+        Empty string means no block. Fingerprint-scoped: the incident that broke
+        production is already ``HUMAN_REQUIRED``, so guarding only that one would
+        guard the only case that needs no guarding.
+        """
+        from openjarvis.reliability.postmerge import post_merge_failure_for
+
+        marker = post_merge_failure_for(self.store, incident.fingerprint)
+        if not marker:
+            return ""
+        return (
+            "a previous repair for this fingerprint was merged and production "
+            f"did not verify ({marker.get('incident_id', 'unknown')}, merge "
+            f"{str(marker.get('merge_commit_sha', ''))[:12]}). Automatic repair "
+            "is blocked until a human clears it: "
+            f"{str(marker.get('reason', ''))[:200]}"
+        )
 
     def _escalate(self, incident: Incident, reason: str) -> None:
         """Stop touching code and hand the incident to a human."""

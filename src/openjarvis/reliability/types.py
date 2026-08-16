@@ -109,6 +109,19 @@ class IncidentState(str, Enum):
     FIXING = "FIXING"
     TESTING = "TESTING"
     VERIFYING = "VERIFYING"
+    #: The fix is on the default branch and production has not yet proved it.
+    #:
+    #: This window exists whether or not it is named, and it is the most
+    #: dangerous one in the whole lifecycle: the change is live-bound, and the
+    #: only evidence so far came from a preview deployment of a different
+    #: commit. Naming it means an operator can see an incident sitting here, a
+    #: crash cannot leave one silently counted as fixed, and the transition
+    #: graph can enforce that nothing reaches ``RESOLVED`` by merging alone.
+    #:
+    #: Only reached when automatic merge is enabled *and* the merge succeeded.
+    #: The pull-request-only flow goes ``VERIFYING -> RESOLVED`` as it always
+    #: has.
+    MERGED = "MERGED"
     RESOLVED = "RESOLVED"
     FAILED = "FAILED"
     HUMAN_REQUIRED = "HUMAN_REQUIRED"
@@ -195,10 +208,23 @@ LEGAL_TRANSITIONS: Dict[IncidentState, FrozenSet[IncidentState]] = {
     ),
     IncidentState.VERIFYING: frozenset(
         {
-            IncidentState.RESOLVED,  # the ONLY automatic path to RESOLVED
+            IncidentState.RESOLVED,  # preview verified, pull request delivered
+            IncidentState.MERGED,  # ...or the merge gates let it onto main
             IncidentState.FIXING,  # verification failed — next repair attempt
             IncidentState.HUMAN_REQUIRED,
             IncidentState.RECOVERY_REQUIRED,
+            IncidentState.FAILED,
+        }
+    ),
+    #: Deliberately NOT back to FIXING. Once the change is on the default
+    #: branch, "try again" is no longer a repair — it is a second unreviewed
+    #: change stacked on a live one that is already suspect. Production either
+    #: proves the merge or a human takes it.
+    IncidentState.MERGED: frozenset(
+        {
+            IncidentState.RESOLVED,  # production verified the merged fix
+            IncidentState.HUMAN_REQUIRED,
+            IncidentState.RECOVERY_REQUIRED,  # interrupted mid-verification
             IncidentState.FAILED,
         }
     ),

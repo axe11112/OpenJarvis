@@ -405,6 +405,369 @@ class TestRepairLoop:
 
 
 # ---------------------------------------------------------------------------
+# Post-merge production verification
+# ---------------------------------------------------------------------------
+
+
+class _MergingGitHub:
+    """A GitHub double whose pull request always merges."""
+
+    base_branch = "main"
+
+    def __init__(self):
+        self.pull_requests = []
+
+    def branch_name_for(self, incident_id):
+        return f"jarvis/incident-{incident_id}"
+
+    def create_branch(self, branch, **kwargs):
+        return "sha"
+
+    def create_pull_request(self, **kwargs):
+        self.pull_requests.append(kwargs)
+        return {"number": 7, "url": "https://github.com/x/y/pull/7"}
+
+
+class _FakeMerger:
+    """Stands in for AutoMerger: reports a merge without performing one."""
+
+    def __init__(self, *, merged=True, merge_sha="e" * 40):
+        from openjarvis.reliability.merge import MergeRecord
+
+        self.merged = merged
+        self._record = MergeRecord(
+            pr_number=7,
+            verified_head_sha="a" * 40,
+            merge_commit_sha=merge_sha if merged else "",
+            method="squash",
+            merged=merged,
+        )
+        self.calls = 0
+
+    def merge_for(self, incident):
+        self.calls += 1
+        self._record.incident_id = incident.id
+        return self._record
+
+
+class _FakePostMerge:
+    """Returns a scripted production verdict."""
+
+    def __init__(self, *, verified=True, reason="production verified", rule="verified"):
+        from openjarvis.reliability.postmerge import (
+            DeploymentObservation,
+            PostMergeResult,
+        )
+
+        self.result = PostMergeResult(
+            verified=verified,
+            reason=reason,
+            rule=rule,
+            deployment=DeploymentObservation(
+                matched=True, ready=verified, deployment_id="dpl_1", state="READY"
+            ),
+        )
+        self.calls = 0
+
+    def verify(self, incident, *, merge_record, spec=None):
+        self.calls += 1
+        return self.result
+
+
+class _PostMergeNotifier:
+    def __init__(self):
+        self.critical = []
+        self.verified = []
+
+    def __getattr__(self, _name):
+        # Every other notification is irrelevant here and must not blow up.
+        return lambda *a, **kw: True
+
+    def post_merge_failed(self, incident, *, record, result):
+        self.critical.append((incident.id, result.reason))
+        return True
+
+    def production_verified(self, incident, *, record, result):
+        self.verified.append(incident.id)
+        return True
+
+
+def _states(store, incident_id):
+    return [t.to_state.value for t in store.transitions_for(incident_id)]
+
+
+class TestPostMergeStateFlow:
+    """Where RESOLVED happens, and what it now costs to get there."""
+
+    def test_without_a_merger_the_pull_request_flow_is_untouched(self, store, incident):
+        """Requirement: auto-merge disabled preserves the old behaviour exactly."""
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        loop = _loop(store, agent, verifier=_verifier([True]), github=_MergingGitHub())
+        outcome = loop.run(incident, _spec())
+
+        assert outcome.resolved
+        assert outcome.final_state is IncidentState.RESOLVED
+        assert "MERGED" not in _states(store, incident.id)
+
+    def test_a_merged_repair_is_not_resolved_before_production_is_proved(
+        self, store, incident
+    ):
+        """The defect this whole stage exists for: RESOLVED used to be recorded
+        before the merge was even attempted."""
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        merger = _FakeMerger()
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([True]),
+            github=_MergingGitHub(),
+            auto_merger=merger,
+            post_merge_verifier=_FakePostMerge(verified=True),
+        )
+        loop.run(incident, _spec())
+
+        states = _states(store, incident.id)
+        assert "MERGED" in states
+        assert states.index("MERGED") < states.index("RESOLVED"), (
+            "RESOLVED must come after MERGED, never before it"
+        )
+
+    def test_production_verified_resolves(self, store, incident):
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        notifier = _PostMergeNotifier()
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([True]),
+            github=_MergingGitHub(),
+            auto_merger=_FakeMerger(),
+            post_merge_verifier=_FakePostMerge(verified=True),
+            notifier=notifier,
+        )
+        outcome = loop.run(incident, _spec())
+
+        assert outcome.resolved
+        assert outcome.final_state is IncidentState.RESOLVED
+        assert notifier.verified == [incident.id]
+        assert not notifier.critical
+
+    @pytest.mark.parametrize(
+        "rule,reason",
+        [
+            ("deployment_missing", "no production deployment appeared"),
+            ("deployment_not_ready", "the production deployment ended in ERROR"),
+            ("reproduction_failed", "the original probe still fails in production"),
+            ("fleet_failed", "production probe signup failed after the merge"),
+        ],
+    )
+    def test_any_production_failure_escalates(self, store, incident, rule, reason):
+        """Deployment missing, dead, reproduction red, fleet red — one answer."""
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        notifier = _PostMergeNotifier()
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([True]),
+            github=_MergingGitHub(),
+            auto_merger=_FakeMerger(),
+            post_merge_verifier=_FakePostMerge(
+                verified=False, reason=reason, rule=rule
+            ),
+            notifier=notifier,
+        )
+        outcome = loop.run(incident, _spec())
+
+        assert not outcome.resolved
+        reloaded = store.get(incident.id)
+        assert reloaded.state is IncidentState.HUMAN_REQUIRED
+        assert "RESOLVED" not in _states(store, incident.id)
+        assert notifier.critical, "a post-merge failure must send CRITICAL"
+
+    def test_a_merge_with_no_verifier_configured_escalates(self, store, incident):
+        """Merging without production verification is not something to fake."""
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([True]),
+            github=_MergingGitHub(),
+            auto_merger=_FakeMerger(),
+            post_merge_verifier=None,
+        )
+        outcome = loop.run(incident, _spec())
+
+        assert not outcome.resolved
+        assert store.get(incident.id).state is IncidentState.HUMAN_REQUIRED
+
+    def test_a_verifier_that_raises_escalates(self, store, incident):
+        class _Exploding:
+            def verify(self, *_a, **_kw):
+                raise RuntimeError("the verifier died")
+
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([True]),
+            github=_MergingGitHub(),
+            auto_merger=_FakeMerger(),
+            post_merge_verifier=_Exploding(),
+        )
+        outcome = loop.run(incident, _spec())
+
+        assert not outcome.resolved
+        assert store.get(incident.id).state is IncidentState.HUMAN_REQUIRED
+
+    def test_a_refused_merge_still_resolves_on_the_pull_request(self, store, incident):
+        """The gates refusing is the system working, not a failed repair."""
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([True]),
+            github=_MergingGitHub(),
+            auto_merger=_FakeMerger(merged=False),
+            post_merge_verifier=_FakePostMerge(verified=True),
+        )
+        outcome = loop.run(incident, _spec())
+
+        assert outcome.resolved
+        assert "MERGED" not in _states(store, incident.id)
+
+    def test_the_agents_claim_never_reaches_the_merge(self, store, incident):
+        """Verification fails, the agent insists it worked: no merge is attempted
+        and production verification never runs."""
+        agent = FakeCodeAgent(
+            [
+                CodeAgentResult(claim="Fixed! All tests pass.", changed_files=["a.ts"])
+                for _ in range(3)
+            ]
+        )
+        merger = _FakeMerger()
+        post = _FakePostMerge()
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([False, False, False]),
+            github=_MergingGitHub(),
+            auto_merger=merger,
+            post_merge_verifier=post,
+        )
+        outcome = loop.run(incident, _spec())
+
+        assert not outcome.resolved
+        assert merger.calls == 0
+        assert post.calls == 0
+
+    def test_the_audit_chain_survives_a_post_merge_failure(self, store, incident):
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([True]),
+            github=_MergingGitHub(),
+            auto_merger=_FakeMerger(),
+            post_merge_verifier=_FakePostMerge(
+                verified=False, reason="production stayed red", rule="fleet_failed"
+            ),
+            notifier=_PostMergeNotifier(),
+        )
+        loop.run(incident, _spec())
+
+        intact, bad_row = store.verify_chain()
+        assert intact, f"audit chain broken at row {bad_row}"
+
+
+class TestRetryStormGuard:
+    """A merge that broke production must not be answered with another merge."""
+
+    def _fail_once(self, store, incident):
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([True]),
+            github=_MergingGitHub(),
+            auto_merger=_FakeMerger(),
+            post_merge_verifier=_FakePostMerge(
+                verified=False, reason="production stayed red", rule="fleet_failed"
+            ),
+            notifier=_PostMergeNotifier(),
+        )
+        loop.run(incident, _spec())
+
+    def test_the_marker_is_written_durably(self, store, incident):
+        from openjarvis.reliability.postmerge import POST_MERGE_FAILURE_KEY
+
+        self._fail_once(store, incident)
+        reloaded = store.get(incident.id)
+        marker = reloaded.metadata.get(POST_MERGE_FAILURE_KEY)
+        assert marker and marker["reason"].startswith("production stayed red")
+
+    def test_a_fresh_incident_for_the_same_fingerprint_is_not_repaired(
+        self, store, incident
+    ):
+        """Production is still broken, so the probe opens a new incident with a
+        clean attempt count. It must not be repaired, let alone merged."""
+        self._fail_once(store, incident)
+
+        recurrence = store.create(
+            Incident(
+                fingerprint="fp_x",
+                severity=Severity.HIGH,
+                component="authentication",
+                title="Login redirects back to /login",
+                probe_id="auth-login",
+            )
+        )
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        merger = _FakeMerger()
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([True]),
+            github=_MergingGitHub(),
+            auto_merger=merger,
+            post_merge_verifier=_FakePostMerge(verified=True),
+        )
+        outcome = loop.run(recurrence, _spec())
+
+        assert not outcome.resolved
+        assert merger.calls == 0, "no second merge for a fingerprint that broke prod"
+        assert agent.calls == [], "the coding agent must not even be started"
+        assert store.get(recurrence.id).state is IncidentState.HUMAN_REQUIRED
+
+    def test_clearing_the_escalated_incident_lifts_the_block(self, store, incident):
+        self._fail_once(store, incident)
+        failed = store.get(incident.id)
+        store.transition(failed, IncidentState.RESOLVED, reason="human dealt with it")
+
+        recurrence = store.create(
+            Incident(
+                fingerprint="fp_x",
+                severity=Severity.HIGH,
+                component="authentication",
+                title="Login redirects back to /login",
+                probe_id="auth-login",
+            )
+        )
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        merger = _FakeMerger()
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([True]),
+            github=_MergingGitHub(),
+            auto_merger=merger,
+            post_merge_verifier=_FakePostMerge(verified=True),
+        )
+        outcome = loop.run(recurrence, _spec())
+
+        assert outcome.resolved
+        assert merger.calls == 1
+
+
+# ---------------------------------------------------------------------------
 # Policy
 # ---------------------------------------------------------------------------
 

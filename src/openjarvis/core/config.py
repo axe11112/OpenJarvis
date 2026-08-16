@@ -1633,6 +1633,13 @@ class ReliabilityMergeConfig:
     #: Empty is the conservative default: both APIs must be readable and
     #: everything they report must be green.
     required_status_contexts: List[str] = field(default_factory=list)
+    #: How long to wait for the production deployment carrying the merge commit
+    #: to reach READY. Bounded on purpose: an unbounded wait is indistinguishable
+    #: from a hang, and "still building" is not "verified". On timeout the
+    #: incident escalates rather than resolving.
+    production_timeout_seconds: float = 900.0
+    #: How often to ask Vercel which production deployments exist.
+    production_poll_seconds: float = 15.0
     #: Delete the incident branch after a successful merge. Off by default: a
     #: merged branch is the cheapest way for a human to inspect what landed.
     delete_branch_on_merge: bool = False

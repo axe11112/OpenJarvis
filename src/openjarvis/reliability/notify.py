@@ -41,6 +41,10 @@ __all__ = [
     "render_human_required",
     "render_merge_attempt",
     "render_merge_outcome",
+    "render_post_merge_failed",
+    "render_production_deployment",
+    "render_production_verification_started",
+    "render_production_verified",
     "render_recovered",
     "render_progress",
     "render_resolved",
@@ -284,7 +288,12 @@ def render_merge_outcome(
             f"Merge commit: {record.merge_commit_sha[:12]}",
             f"Method: {record.method}",
             "",
-            "No production deployment was performed by JARVIS.",
+            # Deliberately not "no production deployment happened". JARVIS has
+            # no deploy call, but a repository with deploy-on-merge turns this
+            # merge into a deployment, and saying otherwise would be reassuring
+            # and wrong. What follows is the verification of that deployment.
+            "JARVIS deployed nothing itself. If the repository deploys on "
+            "merge, production verification follows.",
         ]
         return "\n".join(lines)
 
@@ -307,6 +316,109 @@ def render_merge_outcome(
     if len(failures) > 8:
         lines.append(f"  … and {len(failures) - 8} more")
     lines += ["", "Nothing was merged and nothing was deployed."]
+    return "\n".join(lines)
+
+
+def render_production_deployment(
+    incident: Incident, *, observation: Any, persona: bool = True
+) -> str:
+    """Sent when the production deployment carrying the merge is identified."""
+    lead = _sir(persona, "the merge is building in production.")
+    return "\n".join(
+        [
+            "🚀 JARVIS — production deployment detected",
+            "",
+            lead,
+            "",
+            f"Incident: {incident.id}",
+            f"Deployment: {observation.deployment_id or 'unknown'}",
+            f"State: {observation.state or 'unknown'}",
+            f"Commit: {observation.commit_sha[:12] or 'unknown'}",
+            "",
+            "Matched by commit SHA, not by recency.",
+        ]
+    )
+
+
+def render_production_verification_started(
+    incident: Incident, *, observation: Any, target_url: str, persona: bool = True
+) -> str:
+    """Sent when the deployment is READY and probes are about to run."""
+    lead = _sir(persona, "production is ready; verifying it now.")
+    return "\n".join(
+        [
+            "🔎 JARVIS — production verification started",
+            "",
+            lead,
+            "",
+            f"Incident: {incident.id}",
+            f"Deployment: {observation.deployment_id or 'unknown'} (READY)",
+            f"Target: {target_url or 'unknown'}",
+            "",
+            "Re-running the original reproduction and the production probe fleet.",
+        ]
+    )
+
+
+def render_production_verified(
+    incident: Incident, *, record: Any, result: Any, persona: bool = True
+) -> str:
+    """Sent when production itself has proved the merged fix."""
+    lead = _sir(persona, "production is verified. The incident is resolved.")
+    passed = [p for p in getattr(result, "fleet", []) if p.passed]
+    lines = [
+        "✅ JARVIS — production verified",
+        "",
+        lead,
+        "",
+        f"Incident: {incident.id}",
+        f"Pull request: #{getattr(record, 'pr_number', 0) or 'none'}",
+        f"Merge commit: {str(getattr(record, 'merge_commit_sha', ''))[:12] or '-'}",
+        f"Deployment: {result.deployment.deployment_id or 'unknown'}",
+        "",
+    ]
+    if getattr(result, "reproduction", None) is not None:
+        lines.append(f"Original reproduction: {result.reproduction.probe_id} PASS")
+    lines.append(f"Production probes: {len(passed)}/{len(result.fleet)} pass")
+    return "\n".join(lines)
+
+
+def render_post_merge_failed(
+    incident: Incident, *, record: Any, result: Any, persona: bool = True
+) -> str:
+    """Sent when a merge landed and production did not come good.
+
+    The worst message JARVIS can send, and written to be acted on: unreviewed
+    code is on the default branch, production is not verified, and the loop has
+    stopped itself rather than trying again.
+    """
+    lead = _sir(persona, "the merge landed and production did NOT verify.")
+    lines = [
+        "🔴 JARVIS — CRITICAL: production not verified after merge",
+        "",
+        lead,
+        "",
+        f"Incident: {incident.id}",
+        f"Pull request: #{getattr(record, 'pr_number', 0) or 'none'}",
+        f"Verified commit: {str(getattr(record, 'verified_head_sha', ''))[:12] or '-'}",
+        f"Merge commit: {str(getattr(record, 'merge_commit_sha', ''))[:12] or '-'}",
+        f"Deployment: {result.deployment.deployment_id or 'none found'} "
+        f"({result.deployment.state or 'no state'})",
+        "",
+        f"Why: {result.reason}",
+    ]
+    failures = list(getattr(result, "failures", []) or [])
+    if failures:
+        lines += ["", "Failed checks:"]
+        lines += [f"  • {p.probe_id}: {p.summary[:120]}" for p in failures[:8]]
+        if len(failures) > 8:
+            lines.append(f"  … and {len(failures) - 8} more")
+    lines += [
+        "",
+        "The incident is HUMAN_REQUIRED. Automatic repair and automatic merge "
+        "are blocked for this fingerprint until you clear it.",
+        "Nothing was rolled back and no database was touched.",
+    ]
     return "\n".join(lines)
 
 
@@ -614,6 +726,58 @@ class NotificationRouter:
         return self.notify(
             render_merge_outcome(incident, record=record, persona=self.persona),
             severity=Severity.HIGH if merged else Severity.MEDIUM,
+        )
+
+    # -- post-merge production verification -------------------------------
+
+    def production_deployment(self, incident: Incident, *, observation: Any) -> bool:
+        """Notify that the merge's production deployment has been identified."""
+        return self.notify(
+            render_production_deployment(
+                incident, observation=observation, persona=self.persona
+            ),
+            severity=Severity.HIGH,
+        )
+
+    def production_verification_started(
+        self, incident: Incident, *, observation: Any, target_url: str = ""
+    ) -> bool:
+        """Notify that production is READY and probes are running against it."""
+        return self.notify(
+            render_production_verification_started(
+                incident,
+                observation=observation,
+                target_url=target_url,
+                persona=self.persona,
+            ),
+            severity=Severity.MEDIUM,
+        )
+
+    def production_verified(
+        self, incident: Incident, *, record: Any, result: Any
+    ) -> bool:
+        """Notify that production itself proved the merged fix."""
+        return self.notify(
+            render_production_verified(
+                incident, record=record, result=result, persona=self.persona
+            ),
+            severity=Severity.HIGH,
+        )
+
+    def post_merge_failed(
+        self, incident: Incident, *, record: Any, result: Any
+    ) -> bool:
+        """Notify that a merge landed and production did not verify.
+
+        CRITICAL unconditionally. The rate limiter lets CRITICAL through by
+        design, and this is the message that exists for that exemption: the
+        change is live, unreviewed, and unproven.
+        """
+        return self.notify(
+            render_post_merge_failed(
+                incident, record=record, result=result, persona=self.persona
+            ),
+            severity=Severity.CRITICAL,
         )
 
     # -- internals --------------------------------------------------------

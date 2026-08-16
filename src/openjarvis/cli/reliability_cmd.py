@@ -361,6 +361,42 @@ def _build_repair_loop(config: Any, store: Any, sources: list) -> Any:
         protected_paths=list(rc.policy.protected_paths),
         notifier=_build_notifier(config),
         auto_merger=_build_auto_merger(config, store, github),
+        post_merge_verifier=_build_post_merge_verifier(config, store, vercel),
+    )
+
+
+def _build_post_merge_verifier(config: Any, store: Any, vercel: Any) -> Any:
+    """Build the post-merge production verifier, or ``None``.
+
+    ``None`` when merging is off (nothing can reach the stage) or when Vercel is
+    unavailable (no way to identify the deployment a merge produced). The second
+    case does not silently degrade: with merging enabled and no verifier, a
+    merged incident escalates rather than resolving, so a missing verifier costs
+    an operator a phone call and never a false "resolved".
+    """
+    rc = config.reliability
+    if not rc.merge.enabled or vercel is None:
+        return None
+
+    from openjarvis.reliability.postmerge import PostMergeVerifier
+    from openjarvis.reliability.probes.spec import load_probes
+    from openjarvis.reliability.verify import Verifier
+
+    def _fleet() -> Any:
+        # Loaded at verification time rather than at construction: the probe
+        # that opened the incident may have been edited while the repair ran,
+        # and the fleet that proves production should be the current one.
+        return load_probes(_probe_dir(config))
+
+    return PostMergeVerifier(
+        vercel=vercel,
+        verifier=Verifier(evidence_dir=_evidence_dir(config)),
+        store=store,
+        fleet_provider=_fleet,
+        production_url=rc.site.base_url,
+        notifier=_build_notifier(config),
+        deployment_timeout_seconds=rc.merge.production_timeout_seconds,
+        poll_interval_seconds=rc.merge.production_poll_seconds,
     )
 
 

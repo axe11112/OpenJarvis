@@ -26,6 +26,7 @@ import pytest
 from openjarvis.reliability.merge import (
     REQUIRED_CHECKS,
     AutoMerger,
+    MergeRecord,
     evaluate_merge,
     pull_request_number,
 )
@@ -1089,5 +1090,87 @@ class TestRequiredContextsReachGitHub:
             enabled=True,
             required_status_contexts=["Vercel"],
         ).merge_for(incident)
+        assert not record.decision.allowed
+        assert not github.merge_calls
+
+
+# ---------------------------------------------------------------------------
+# The post-merge retry-storm guard, at the merge gate
+# ---------------------------------------------------------------------------
+
+
+class TestPriorPostMergeFailureGate:
+    """One bad merge is a bad day. Two is a pattern the gates should prevent."""
+
+    def test_a_prior_failure_refuses_the_merge(self):
+        decision = _decide(
+            prior_post_merge_failure={
+                "incident_id": "INC-00001",
+                "merge_commit_sha": "e" * 40,
+                "reason": "production stayed red",
+            }
+        )
+        assert _refused(decision, "no_prior_post_merge_failure")
+
+    def test_no_prior_failure_passes(self):
+        assert _decide(prior_post_merge_failure=None).allowed
+
+    def test_an_already_merged_incident_is_not_merged_again(self):
+        """MERGED means production has not had its say yet. Merging again would
+        stack a change on one whose effect nobody has measured."""
+        decision = _decide(incident=_incident(state=IncidentState.MERGED))
+        assert _refused(decision, "incident_state")
+
+    def test_the_gate_outranks_a_clean_new_attempt(self):
+        """Every other gate passes — that is exactly the dangerous case. The
+        recurrence looks pristine because it *is* pristine; what is broken is
+        the production the last merge left behind."""
+        decision = _decide(
+            prior_post_merge_failure={"incident_id": "INC-00001", "reason": "red"}
+        )
+        failed = [g.name for g in decision.gates if not g.passed]
+        assert failed == ["no_prior_post_merge_failure"]
+
+    def test_a_successful_merge_records_what_post_merge_needs(self, store):
+        """Requirement: incident, PR, verified SHA, merge SHA, merge timestamp."""
+        incident = store.create(_incident())
+        record = AutoMerger(github=_FakeGitHub(), store=store, enabled=True).merge_for(
+            incident
+        )
+        assert record.merged
+        assert record.incident_id == incident.id
+        assert record.pr_number == 42
+        assert record.verified_head_sha == VERIFIED_SHA
+        assert record.merge_commit_sha == MERGE_SHA
+        assert record.merged_at, "the moment it landed must be recorded"
+        assert record.to_dict()["merged_at"] == record.merged_at
+
+    def test_a_refused_merge_records_no_merge_time(self):
+        """`at` is when it was decided; `merged_at` is when it landed. A refusal
+        has the first and must not have the second."""
+        record = MergeRecord()
+        assert record.at and not record.merged_at
+
+    def test_the_merger_consults_the_store(self, store):
+        """The guard has to survive a restart, so it is read from the store
+        rather than carried in memory."""
+        from openjarvis.reliability.postmerge import POST_MERGE_FAILURE_KEY
+
+        # The escalated incident: HUMAN_REQUIRED, carrying the marker. Not
+        # RESOLVED — a resolved one means a human dealt with it and the guard is
+        # meant to lift.
+        first = store.create(_incident(id="INC-00001", state=IncidentState.DETECTED))
+        store.transition(first, IncidentState.HUMAN_REQUIRED, reason="post-merge")
+        first.metadata[POST_MERGE_FAILURE_KEY] = {
+            "incident_id": first.id,
+            "reason": "production stayed red",
+        }
+        store.save(first)
+
+        recurrence = store.create(_incident(id="INC-00002"))
+        github = _FakeGitHub()
+        record = AutoMerger(github=github, store=store, enabled=True).merge_for(
+            recurrence
+        )
         assert not record.decision.allowed
         assert not github.merge_calls

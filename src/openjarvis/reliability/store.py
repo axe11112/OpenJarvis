@@ -263,6 +263,32 @@ class IncidentStore:
             ).fetchall()
             return [self._hydrate(row) for row in rows]
 
+    def list_by_fingerprint(
+        self,
+        fingerprint: str,
+        *,
+        include_resolved: bool = False,
+        limit: int = 50,
+    ) -> List[Incident]:
+        """Every incident matching *fingerprint*, newest first.
+
+        Distinct from :meth:`find_by_fingerprint`, which answers "is this
+        recurrence already open" and so returns only the newest. Callers that
+        need the *history* of a fingerprint — has a repair for this ever gone
+        wrong? — must not be handed the newest one, because the newest is
+        usually the fresh incident asking the question.
+        """
+        query = "SELECT * FROM incidents WHERE fingerprint = ?"
+        params: List[Any] = [fingerprint]
+        if not include_resolved:
+            query += " AND state != ?"
+            params.append(IncidentState.RESOLVED.value)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(int(limit))
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+            return [self._hydrate(row) for row in rows]
+
     def find_by_fingerprint(
         self,
         fingerprint: str,

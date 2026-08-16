@@ -288,13 +288,47 @@ DETECTED → INVESTIGATING → REPRODUCING → FIXING → TESTING → VERIFYING
                                             ▲                   │
                                             └─── failed ────────┘
                                                                 │ passed
-                                                                ▼
-                                                            RESOLVED
+                                    ┌───────────────────────────┤
+                                    │                           │
+                      auto-merge ON │                           │ auto-merge OFF
+                      and merged    ▼                           ▼  (or refused)
+                                 MERGED ──── production ───► RESOLVED
+                                    │         verified
+                                    │ production failed,
+                                    │ deployment missing,
+                                    ▼ or timed out
+                             HUMAN_REQUIRED
 ```
 
-`VERIFYING → RESOLVED` is the only automatic path to `RESOLVED`; the state
-machine rejects anything else. After `max_attempts` (default 3) without a
-verified fix, or on any hard stop, the incident goes to `HUMAN_REQUIRED`.
+There are exactly two automatic paths to `RESOLVED`, and the state machine
+rejects everything else:
+
+* `VERIFYING → RESOLVED` — the pull-request flow. The preview was verified and
+  the pull request is the deliverable. This is what runs whenever automatic
+  merge is off, and whenever the merge gates refuse.
+* `MERGED → RESOLVED` — the auto-merge flow. The change is on the default
+  branch, the production deployment carrying *that merge commit* went `READY`,
+  the probe that opened the incident passes against production, and every
+  enabled production probe passes with it.
+
+`MERGED` is the window between landing on the default branch and production
+proving it. Nothing else may close that window: there is no `MERGED → FIXING`
+edge, because "try again" after a merge means stacking a second unreviewed
+change on a live one already under suspicion. A process that dies in `MERGED`
+is parked in `RECOVERY_REQUIRED` on the next start, like any other in-flight
+state.
+
+A post-merge failure escalates to `HUMAN_REQUIRED`, sends a CRITICAL
+notification, and writes a durable marker against the incident's *fingerprint*.
+That marker blocks both automatic repair and automatic merge for anything with
+the same fingerprint — including the fresh incident the still-broken production
+is about to open, which would otherwise arrive with a clean attempt count and
+pass every other gate. Resolving the escalated incident clears the marker.
+Nothing is rolled back: reverting is a write to the default branch, and there is
+no tested rollback mechanism to invoke.
+
+After `max_attempts` (default 3) without a verified fix, or on any hard stop,
+the incident goes to `HUMAN_REQUIRED`.
 
 Attempt outcomes: `verified`, `verification_failed`, `no_diff`, `tests_failed`,
 `agent_error`, `policy_denied`, `protected_path`, `scope_violation`,

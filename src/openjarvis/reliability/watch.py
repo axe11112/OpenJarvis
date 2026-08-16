@@ -70,10 +70,17 @@ __all__ = [
 ]
 
 #: States that mean a repair was in flight when the process stopped.
+#:
+#: ``MERGED`` is the most important entry: a process that died there left a
+#: change on the default branch whose production verification never finished.
+#: Parking it demands a human look, which is the only safe reading — the
+#: alternative is an incident that is neither being verified nor known to be
+#: bad, sitting quietly while the code is live.
 IN_FLIGHT_STATES = (
     IncidentState.FIXING,
     IncidentState.TESTING,
     IncidentState.VERIFYING,
+    IncidentState.MERGED,
 )
 
 

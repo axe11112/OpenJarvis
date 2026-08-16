@@ -86,6 +86,10 @@ _REFUSING_STATES = frozenset(
         IncidentState.RECOVERY_REQUIRED,
         IncidentState.FAILED,
         IncidentState.ROLLED_BACK,
+        # Already on the default branch and awaiting production's verdict.
+        # A second merge here would be merging on top of a change whose effect
+        # nobody has measured yet.
+        IncidentState.MERGED,
     }
 )
 
@@ -173,7 +177,13 @@ class MergeRecord:
     merge_commit_sha: str = ""
     method: str = ""
     actor: str = "jarvis"
+    #: When the decision was made. Stamped at construction, so it is also the
+    #: timestamp of a refusal — the entry a refused merge leaves behind.
     at: str = field(default_factory=now_iso)
+    #: When the merge actually landed, empty if it never did. Kept apart from
+    #: ``at`` because the interval between them is the window a post-merge
+    #: verification has to explain, and one field cannot mean both.
+    merged_at: str = ""
     decision: MergeDecision = field(default_factory=lambda: MergeDecision(False))
     merged: bool = False
     error: str = ""
@@ -192,6 +202,7 @@ class MergeRecord:
             "method": self.method,
             "actor": self.actor,
             "at": self.at,
+            "merged_at": self.merged_at,
             "merged": self.merged,
             "error": self.error,
             "decision": self.decision.to_dict(),
@@ -225,6 +236,7 @@ def evaluate_merge(
     status: Optional[Dict[str, Any]] = None,
     require_status_checks: bool = True,
     required_status_contexts: Sequence[str] = (),
+    prior_post_merge_failure: Optional[Dict[str, Any]] = None,
     base_sha_at_verification: str = "",
     observed_base_sha: str = "",
 ) -> MergeDecision:
@@ -267,6 +279,28 @@ def evaluate_merge(
         "[reliability.merge] enabled = true"
         if enabled
         else "[reliability.merge] enabled = false",
+    )
+
+    # -- 1b. production has not already been broken by a merge like this --
+    #
+    # Ranked with the switch rather than among the evidence gates, because it
+    # is not a judgement about *this* repair: a fingerprint whose last merge
+    # left production unverified does not get a second automatic attempt, no
+    # matter how clean the new attempt looks. The failure that motivates this
+    # is the tidy one — production stays broken, the probe keeps failing, a
+    # fresh incident opens with a clean slate, and every evidence gate passes.
+    gate(
+        "no_prior_post_merge_failure",
+        not prior_post_merge_failure,
+        (
+            "a previous merge for this fingerprint left production unverified "
+            f"({(prior_post_merge_failure or {}).get('incident_id', 'unknown')}, "
+            f"merge "
+            f"{str((prior_post_merge_failure or {}).get('merge_commit_sha', ''))[:12]}"
+            "); a human must clear it before another automatic merge"
+        )
+        if prior_post_merge_failure
+        else "no prior post-merge failure for this fingerprint",
     )
 
     # -- 2. the incident is in a state that permits acting ----------------
@@ -713,6 +747,7 @@ class AutoMerger:
             status=status,
             require_status_checks=self.require_status_checks,
             required_status_contexts=list(self.required_status_contexts),
+            prior_post_merge_failure=self._prior_post_merge_failure(incident),
             base_sha_at_verification=record.base_sha_at_verification,
             observed_base_sha=observed_base,
         )
@@ -738,6 +773,8 @@ class AutoMerger:
             )
             record.merged = bool(result.get("merged"))
             record.merge_commit_sha = str(result.get("sha") or "")
+            if record.merged:
+                record.merged_at = now_iso()
             if not record.merged:
                 record.error = str(result.get("message") or "GitHub declined the merge")
         except Exception as exc:  # noqa: BLE001 - reported, never swallowed
@@ -750,6 +787,12 @@ class AutoMerger:
         return record
 
     # -- internals --------------------------------------------------------
+
+    def _prior_post_merge_failure(self, incident: Incident) -> Optional[Dict[str, Any]]:
+        """Any recorded post-merge production failure for this fingerprint."""
+        from openjarvis.reliability.postmerge import post_merge_failure_for
+
+        return post_merge_failure_for(self.store, incident.fingerprint)
 
     @staticmethod
     def _last_attempt(incident: Incident) -> Optional[RepairAttempt]:
