@@ -358,3 +358,31 @@ def test_a_page_that_serves_nothing_is_still_critical():
     )
     verdict = classify(component="website", result=down, declared=Severity.CRITICAL)
     assert verdict.severity is Severity.CRITICAL
+
+
+def test_an_incident_that_woke_you_and_then_cleared_is_not_clean_autonomy(store):
+    """The night the metric would have reported 100%.
+
+    INC-00020 and INC-00021 both escalated to HUMAN_REQUIRED and both later
+    resolved themselves. Counting only their final state made a night that woke
+    the owner twice look like flawless autonomous handling.
+    """
+    incident = _incident(store)
+    store.transition(incident, IncidentState.HUMAN_REQUIRED, reason="flapping")
+    store.transition(incident, IncidentState.RESOLVED, reason="recovered")
+
+    metrics = AutonomyMetrics(store).snapshot()
+    assert metrics["closed"] == 1
+    assert metrics["escalated"] == 1
+    assert metrics["woke_you_then_cleared"] == 1
+    assert metrics["still_waiting_for_you"] == 0
+    assert metrics["handled_without_a_human"] == 0
+    assert metrics["autonomy_rate"] == 0.0
+
+
+def test_something_still_waiting_is_counted_separately(store):
+    incident = _incident(store)
+    store.transition(incident, IncidentState.HUMAN_REQUIRED, reason="stuck")
+    metrics = AutonomyMetrics(store).snapshot()
+    assert metrics["still_waiting_for_you"] == 1
+    assert metrics["woke_you_then_cleared"] == 0

@@ -395,6 +395,12 @@ away.
 The Control Center shows how many closed incidents were handled without a
 person, split into repaired-by-JARVIS and cleared-on-their-own.
 
+"Without a person" means *never reached one*, not *is not sitting with one now*.
+Counting only the final state made this read 100% on a night that woke the owner
+twice: both incidents escalated, then resolved themselves, and by morning they
+looked like flawless autonomous handling. Incidents that woke somebody and then
+cleared are counted separately, because that is the number most worth reducing.
+
 This is not a number to maximise. Escalating a genuine outage is correct
 behaviour, and a system tuned to keep this figure up is a system that hides
 problems. It exists so that "Sir gives up too easily" is something that can be

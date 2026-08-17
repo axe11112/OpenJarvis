@@ -569,12 +569,24 @@ class AutonomyMetrics:
             return {"available": False}
 
         closed = [i for i in incidents if _is_terminal(i)]
-        escalated = [i for i in closed if _needs_human(i)]
+        # "Ever reached a person", not "is sitting with a person now".
+        #
+        # Counting only the final state made this read 100% on a night that
+        # woke the owner twice: both incidents escalated, then resolved
+        # themselves, and by the morning they looked like clean autonomous
+        # handling. A metric that forgets the phone call is worse than no
+        # metric, because it will be quoted.
+        escalated = [i for i in closed if _ever_needed_human(i)]
         repaired = [
             i for i in closed if _is_resolved(i) and getattr(i, "attempts", None)
         ]
         recovered = [
             i for i in closed if _is_resolved(i) and not getattr(i, "attempts", None)
+        ]
+        # Resolved in the end, but only after somebody was told. Counted apart
+        # from both, because it is the case worth reducing.
+        woke_you_then_cleared = [
+            i for i in closed if _is_resolved(i) and _ever_needed_human(i)
         ]
         handled = len(closed) - len(escalated)
         with_handover = sum(
@@ -589,6 +601,8 @@ class AutonomyMetrics:
             "closed": len(closed),
             "handled_without_a_human": handled,
             "escalated": len(escalated),
+            "still_waiting_for_you": sum(1 for i in closed if _needs_human(i)),
+            "woke_you_then_cleared": len(woke_you_then_cleared),
             "repaired_by_jarvis": len(repaired),
             "recovered_on_their_own": len(recovered),
             "escalations_with_a_full_handover": with_handover,
@@ -606,9 +620,21 @@ def _is_terminal(incident: Any) -> bool:
     )
 
 
+#: States that mean a person was asked for something.
+_HUMAN_STATES = frozenset({"HUMAN_REQUIRED", "FAILED", "ROLLED_BACK"})
+
+
 def _needs_human(incident: Any) -> bool:
-    return str(getattr(getattr(incident, "state", None), "value", "")) in (
-        "HUMAN_REQUIRED",
-        "FAILED",
-        "ROLLED_BACK",
-    )
+    """Whether the incident is *currently* waiting on a person."""
+    return str(getattr(getattr(incident, "state", None), "value", "")) in _HUMAN_STATES
+
+
+def _ever_needed_human(incident: Any) -> bool:
+    """Whether it ever asked for one, including if it later resolved itself."""
+    if _needs_human(incident):
+        return True
+    for transition in getattr(incident, "transitions", []) or []:
+        to_state = getattr(transition, "to_state", None)
+        if str(getattr(to_state, "value", to_state) or "") in _HUMAN_STATES:
+            return True
+    return False

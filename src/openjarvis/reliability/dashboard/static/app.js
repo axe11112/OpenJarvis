@@ -201,11 +201,17 @@
       ? "—"
       : Math.round(a.autonomy_rate * 100) + "%";
     host.appendChild(node("span", "autonomy-rate", rate));
-    host.appendChild(node("span", "autonomy-label",
-      "handled without you · " + a.closed + " closed · "
+    var label = "handled without you · " + a.closed + " closed · "
       + a.repaired_by_jarvis + " repaired · "
       + a.recovered_on_their_own + " cleared on their own · "
-      + a.escalated + " came to you"));
+      + a.escalated + " came to you";
+    if (a.woke_you_then_cleared) {
+      // Named rather than folded into "cleared on their own": an incident that
+      // woke somebody and then fixed itself cost a phone call, and it is the
+      // number most worth reducing.
+      label += " (" + a.woke_you_then_cleared + " of those cleared afterwards)";
+    }
+    host.appendChild(node("span", "autonomy-label", label));
     if (a.escalated && a.escalations_with_a_full_handover < a.escalated) {
       // Surfaced rather than smoothed over. An escalation that could not say
       // what it tried is a defect in the loop and belongs on the page.
