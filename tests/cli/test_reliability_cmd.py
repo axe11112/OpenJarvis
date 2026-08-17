@@ -832,3 +832,58 @@ class TestIncidentClose:
         self._close(incident.id, "--reason", "stale")
         assert store.get(incident.id) is not None
         assert len(store.transitions_for(incident.id)) >= 2
+
+
+# ---------------------------------------------------------------------------
+# The status table must not hard-code a production authority
+#
+# Two rows of it were literal "DISABLED" strings, written before automatic merge
+# existed. They kept printing DISABLED after merging was switched on. A control
+# panel that says an authority is off while it is on is worse than no panel: it
+# is read precisely when somebody is deciding whether it is safe to walk away.
+# ---------------------------------------------------------------------------
+
+
+class TestProductionAuthorityIsReportedHonestly:
+    def _render(self, wired, **merge):
+        from click.testing import CliRunner
+
+        config, _store = wired
+        config.reliability.merge.enabled = merge.get("enabled", False)
+        config.reliability.merge.method = merge.get("method", "squash")
+        config.reliability.merge.required_status_contexts = merge.get(
+            "contexts", ["Vercel"]
+        )
+        result = CliRunner().invoke(cli, ["reliability", "status"])
+        assert result.exit_code == 0, result.output
+        return result.output
+
+    @staticmethod
+    def _row(output: str, label: str) -> str:
+        return next(line for line in output.splitlines() if label in line)
+
+    def test_merge_off_reads_disabled(self, wired):
+        output = self._render(wired, enabled=False)
+        assert "DISABLED" in self._row(output, "Automatic PR merge")
+
+    def test_merge_on_never_reads_disabled(self, wired):
+        """The whole point. This row was a hard-coded string."""
+        output = self._render(wired, enabled=True)
+        row = self._row(output, "Automatic PR merge")
+        assert "DISABLED" not in row
+        assert "ENABLED" in row
+
+    def test_merge_on_names_the_required_context(self, wired):
+        output = self._render(wired, enabled=True, contexts=["Vercel"])
+        assert "Vercel" in self._row(output, "Automatic PR merge")
+
+    def test_merge_on_says_it_is_production_authority(self, wired):
+        """Because a merge to the default branch deploys production via Git."""
+        assert "production authority" in self._render(wired, enabled=True)
+
+    def test_the_deploy_mode_row_is_read_from_config(self, wired):
+        config, _store = wired
+        config.reliability.policy.deploy_mode = "never"
+        assert "DISABLED" in self._row(
+            self._render(wired), "Production deployment API"
+        )

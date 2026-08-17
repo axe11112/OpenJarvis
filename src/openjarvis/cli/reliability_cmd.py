@@ -537,12 +537,39 @@ def reliability_status() -> None:
     console.print()
     console.print(availability)
 
-    # The four questions an operator actually has, answered unambiguously.
+    # The questions an operator actually has, answered unambiguously — and
+    # answered from configuration rather than from what was true when this table
+    # was written. Two of these rows were literal "DISABLED" strings, dating from
+    # before automatic merge existed. They kept printing DISABLED after merging
+    # was switched on, which is the same failure as a dashboard reporting a
+    # healthy microphone nobody had spoken into: a control panel that states a
+    # production authority is off while it is on is worse than no panel, because
+    # it is consulted precisely when somebody is deciding whether it is safe to
+    # walk away.
     safety = Table(title="Production safety", show_header=False, box=None)
     safety.add_column("key", style="dim")
     safety.add_column("value")
-    safety.add_row("Production deployment", "DISABLED")
-    safety.add_row("Automatic PR merge", "DISABLED")
+    deploy_mode = str(rc.policy.deploy_mode or "never")
+    safety.add_row(
+        "Production deployment API",
+        "DISABLED" if deploy_mode == "never" else f"[red]{deploy_mode}[/]",
+    )
+    if rc.merge.enabled:
+        # Named for what it actually grants. Merging to the default branch
+        # triggers a production deployment through the Git integration, so this
+        # is production authority however "never" the deploy mode reads.
+        contexts = ", ".join(rc.merge.required_status_contexts) or "none named"
+        safety.add_row(
+            "Automatic PR merge",
+            f"[red]ENABLED[/] ({rc.merge.method}; requires {contexts})",
+        )
+        safety.add_row(
+            "  → production authority",
+            "[red]YES[/] — a merge to "
+            f"{rc.github.base_branch or 'main'} deploys production via Git",
+        )
+    else:
+        safety.add_row("Automatic PR merge", "DISABLED")
     safety.add_row(
         "Default branch push",
         "[red]ENABLED[/]" if rc.policy.allow_push_to_default_branch else "DISABLED",
