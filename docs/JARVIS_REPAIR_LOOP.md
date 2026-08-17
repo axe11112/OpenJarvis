@@ -688,25 +688,39 @@ Actions workflows can still have a meaningful `status_checks` gate.
 
 #### Current state on this deployment (2026-08-17)
 
-Automatic merge is **configured, tested end to end, and switched off**, and the
-reason is this section rather than a change of heart. `GITHUB_READONLY_TOKEN`
-403s on **both** endpoints:
+Automatic merge is **ON**. `require_status_checks = true`,
+`required_status_contexts = ["Vercel"]`, squash method, and post-merge
+production verification is wired and mandatory.
 
-    GET /repos/axe11112/Wize-Performance/commits/{sha}/status      403
-    GET /repos/axe11112/Wize-Performance/commits/{sha}/check-runs  403
+It was briefly reported here as blocked by a missing `Commit statuses: Read`
+permission. That was wrong, and the way it was wrong is the part worth keeping.
 
-The same token reads repository metadata, pull requests, contents and Actions, so
-this is two missing permissions and not a broken token. With `status_checks`
-permanently `unreadable` the gate refuses every merge — correct, and the reason
-the switch went back off: safe but inert is not a capability worth presenting as
-one.
+The checks that produced the 403 ran in a shell that had inherited an **older**
+`GITHUB_READONLY_TOKEN` from its parent process, and one of them asked about an
+abbreviated SHA. Measured instead with the credential the launchd watcher
+actually holds — confirmed by reading the live process environment rather than
+by trusting the shell — and with a full 40-character SHA:
 
-`jarvis reliability live-diagnostic` reports it and opens a HIGH `github`
-incident naming the missing permissions. To finish: grant **Commit statuses:
-Read**, confirm the diagnostic goes green, set `[reliability.merge] enabled =
-true`. All twenty-five gates are already wired, and
-`tests/reliability/test_merge.py::TestPreActivationAudit` asserts that none of
-them has gone missing.
+    GET /repos/axe11112/Wize-Performance/commits/093896b9…/status   200
+        context = Vercel, state = success
+
+    statuses_api : readable
+    required     : {"Vercel": "success"}
+
+Two lessons, both cheap to reuse:
+
+* **Verify a credential from the environment the service runs in.** The watcher
+  sources `reliability.env` under `set -a`, which overwrites; an interactive
+  shell that already exported the name does not. `ps eww` on the running process
+  settles it in one command.
+* **The gate was right the whole time.** Asked about `b46727ac`, an eight-character
+  SHA, `combined_status` refused with "commit status answered for b46727ac0561,
+  not b46727ac" — it checks that the answer is about the commit it asked for.
+  That refusal was misread as a permission failure.
+
+`Checks: Read` remains unavailable, as it is to every fine-grained PAT. It is
+reported as unavailable rather than read as consent, and the merge contract names
+a Commit Status context, so it is not in the way.
 
 ### Time-of-check / time-of-use
 
