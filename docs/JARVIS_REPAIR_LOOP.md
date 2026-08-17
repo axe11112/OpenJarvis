@@ -328,7 +328,7 @@ Nothing is rolled back: reverting is a write to the default branch, and there is
 no tested rollback mechanism to invoke.
 
 After `max_attempts` (default 3) without a verified fix, or on any hard stop,
-the incident goes to `HUMAN_REQUIRED`.
+the incident goes to `HUMAN_REQUIRED` — carrying a handover (§10.2).
 
 Attempt outcomes: `verified`, `verification_failed`, `no_diff`, `tests_failed`,
 `agent_error`, `policy_denied`, `protected_path`, `scope_violation`,
@@ -337,6 +337,69 @@ Attempt outcomes: `verified`, `verification_failed`, `no_diff`, `tests_failed`,
 Each retry's briefing carries the previous verification's evidence under
 "Previous attempt failed verification", which is what makes attempt two a better
 attempt rather than the same one again.
+
+Not every refusal is an escalation. `Decision.needs_human` separates "JARVIS may
+not repair this" from "a person must deal with this": repair being switched off,
+a severity outside the auto-repair list, or an incident a human already owns all
+leave the incident open and watched, and wake nobody. Conflating those was how a
+login page that answered correctly in 41 seconds reached `HUMAN_REQUIRED` one
+second after detection, having never been looked at.
+
+### 10.1 The playbook — different ideas, not louder ones
+
+Three attempts at one hypothesis is one attempt with extra steps, and it was the
+shape of "Sir gives up too easily" from the inside: the loop ran out of permitted
+attempts without ever running out of ideas.
+
+`openjarvis.reliability.playbook` gives each attempt a different working
+hypothesis, drawn from an ordered list and never repeated:
+
+| Strategy | Hypothesis |
+| --- | --- |
+| `recent_change` | a recent change broke it |
+| `data_shape` | the logic is right and its input is not what it expects |
+| `dependency_or_config` | the code did not change and its environment did |
+| `reproduce_first` | the failure is not what the probe says it is |
+
+The chosen strategy is written into the briefing under "Where to look this
+time", recorded on the attempt, and persisted — so a *later occurrence of the
+same fingerprint* also knows which ideas have already been eliminated. Running
+out of hypotheses is itself a reason to stop, and unlike "3 attempts failed" it
+is one a person can read: every idea JARVIS had was tried, and named.
+
+Classification reorders the list where the evidence already points: a 403 starts
+at `dependency_or_config` rather than at application logic.
+
+### 10.2 Handover — what is owed when it stops
+
+`HUMAN_REQUIRED` carries a `Handover` with six fields, because those are the six
+questions somebody woken at 3am asks in order:
+
+1. **What failed** — the observable fact.
+2. **Cause** — the best current explanation, or an explicit "not established".
+3. **Evidence** — measurements and identifiers, one per line, never prose.
+4. **What I tried** — each hypothesis, named, in order.
+5. **Why that did not work** — per attempt, from the verifier's own words.
+6. **What I need from you** — the specific ask, never "please investigate".
+
+Every field is assembled from stored facts. Nothing is generated for the
+occasion, for the same reason no model writes a notification: an explanation
+nobody checked is worse than none, because it will be believed.
+
+A handover that cannot be filled in is logged as a defect and the count is shown
+on the Control Center, next to the autonomy rate. It is not silently tidied
+away.
+
+### 10.3 Autonomy, measured
+
+The Control Center shows how many closed incidents were handled without a
+person, split into repaired-by-JARVIS and cleared-on-their-own.
+
+This is not a number to maximise. Escalating a genuine outage is correct
+behaviour, and a system tuned to keep this figure up is a system that hides
+problems. It exists so that "Sir gives up too easily" is something that can be
+watched rather than argued about — and so the opposite failure, Sir carrying on
+when it should have stopped, is equally visible.
 
 ---
 

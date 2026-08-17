@@ -411,6 +411,36 @@ class TestFlappingEscalation:
         supervisor.escalate_flapping(incident, verdict)
         assert not supervisor.flapping.verdict("dashboard").flapping
 
+    def test_a_low_severity_flap_is_left_to_settle(self, store, supervisor):
+        """INC-00020, as the live database recorded it.
+
+        A homepage that answered 200 the whole time, once slowly, escalated to
+        HUMAN_REQUIRED 27 seconds after it opened — with the flapping reason
+        reporting its three most recent results as "PPP". Three passes. A check
+        that cannot make up its mind at LOW severity is an unreliable check, not
+        a production fault, and it must not wake anybody.
+        """
+        incident = _incident(store, severity=Severity.LOW)
+        for char in "PFPFPF":
+            verdict = supervisor.record_result("dashboard", failed=char == "F")
+
+        assert verdict.flapping
+        assert supervisor.escalate_flapping(incident, verdict) is False
+        assert store.get(incident.id).state is not IncidentState.HUMAN_REQUIRED
+        # Recorded rather than ignored — a suppressed escalation still has to
+        # leave a trace somebody can find.
+        assert store.get(incident.id).metadata["flapping"]
+        assert not supervisor.flapping.verdict("dashboard").flapping
+
+    def test_a_severe_flapping_fault_still_reaches_a_human(self, store, supervisor):
+        """The control: quietening LOW must not quieten a real outage."""
+        incident = _incident(store, severity=Severity.CRITICAL)
+        for char in "PFPFPF":
+            verdict = supervisor.record_result("dashboard", failed=char == "F")
+
+        assert supervisor.escalate_flapping(incident, verdict)
+        assert store.get(incident.id).state is IncidentState.HUMAN_REQUIRED
+
     def test_an_already_escalated_incident_is_not_escalated_twice(
         self, store, supervisor
     ):

@@ -366,7 +366,18 @@ class DashboardService:
             probe_verification=self._probe_verification,
             watcher=watcher.to_dict(),
             notes=notes,
+            autonomy=self._autonomy(),
         )
+
+    def _autonomy(self) -> Dict[str, Any]:
+        """How much JARVIS is actually handling. Never fatal to the page."""
+        from openjarvis.reliability.playbook import AutonomyMetrics
+
+        try:
+            return AutonomyMetrics(self._store).snapshot()
+        except Exception:  # noqa: BLE001
+            logger.exception("could not compute autonomy metrics")
+            return {"available": False}
 
     def _incidents(self) -> List[Any]:
         try:

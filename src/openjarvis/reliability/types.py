@@ -635,6 +635,7 @@ class RepairAttempt:
             "checks": dict(self.checks),
             "scope": dict(self.scope),
             "lines_changed_total": self.lines_changed_total,
+            "strategy": self.strategy,
             "regression_tests": list(self.regression_tests),
         }
 
@@ -666,6 +667,7 @@ class RepairAttempt:
             checks=dict(d.get("checks") or {}),
             scope=dict(d.get("scope") or {}),
             lines_changed_total=int(d.get("lines_changed_total", 0) or 0),
+            strategy=d.get("strategy", ""),
             regression_tests=list(d.get("regression_tests") or []),
         )
 

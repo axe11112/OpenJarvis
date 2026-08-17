@@ -251,7 +251,12 @@ class IncidentHistory:
         if not fingerprint or self.store is None:
             return []
         try:
-            found = self.store.list_by_fingerprint(fingerprint, limit=limit)
+            # Resolved ones included deliberately: "this cleared itself the
+            # last four times" is the single most useful thing history knows,
+            # and excluding resolved incidents would hide exactly that.
+            found = self.store.list_by_fingerprint(
+                fingerprint, include_resolved=True, limit=limit
+            )
         except Exception:  # noqa: BLE001 - history is an improvement, not a
             logger.exception("could not read incident history")  # ...dependency
             return []
@@ -491,7 +496,8 @@ def _why_failed(attempts: Sequence[Any], reason: str, max_attempts: int) -> str:
     for attempt in attempts:
         verification = getattr(attempt, "verification", None)
         summary = str(
-            getattr(verification, "summary", "")
+            getattr(verification, "actual", "")
+            or getattr(verification, "notes", "")
             or getattr(attempt, "test_summary", "")
             or getattr(attempt, "outcome", "")
         )

@@ -189,6 +189,32 @@
 
   /* ------------------------------------------------------------ incidents */
 
+  function renderAutonomy(s) {
+    var host = el("autonomy");
+    if (!host) { return; }
+    clear(host);
+    var a = s.autonomy || {};
+    if (!a.available || !a.closed) { host.hidden = true; return; }
+    host.hidden = false;
+
+    var rate = a.autonomy_rate === null || a.autonomy_rate === undefined
+      ? "—"
+      : Math.round(a.autonomy_rate * 100) + "%";
+    host.appendChild(node("span", "autonomy-rate", rate));
+    host.appendChild(node("span", "autonomy-label",
+      "handled without you · " + a.closed + " closed · "
+      + a.repaired_by_jarvis + " repaired · "
+      + a.recovered_on_their_own + " cleared on their own · "
+      + a.escalated + " came to you"));
+    if (a.escalated && a.escalations_with_a_full_handover < a.escalated) {
+      // Surfaced rather than smoothed over. An escalation that could not say
+      // what it tried is a defect in the loop and belongs on the page.
+      host.appendChild(node("span", "autonomy-warn",
+        (a.escalated - a.escalations_with_a_full_handover)
+        + " escalation(s) without a full handover"));
+    }
+  }
+
   function renderIncidents(s) {
     var host = el("incidents");
     clear(host);
@@ -360,6 +386,44 @@
     });
     body.appendChild(facts);
 
+    if (d.handover) {
+      // Placed above everything else. When an incident is waiting on a person,
+      // this is the only part of the page they need, and making them scroll
+      // past the fingerprint to reach it is how a handover goes unread.
+      var h = d.handover;
+      body.appendChild(node("h4", null, "What I need from you"));
+      var hand = node("div", "ev");
+      var hh = node("div", "evh");
+      hh.appendChild(node("span", null, "handover"));
+      if (h.cause_class) { hh.appendChild(node("span", null, h.cause_class)); }
+      if (!h.complete) {
+        // Said out loud rather than hidden: an escalation that could not
+        // explain itself is a defect in the loop, not a tidy summary.
+        hh.appendChild(node("span", "ext", "incomplete"));
+      }
+      hand.appendChild(hh);
+      hand.appendChild(node("p", null, h.what_is_needed));
+      var hd = node("dl", "kv");
+      kv(hd, "What failed", h.what_failed);
+      kv(hd, "Cause", h.cause);
+      if (h.why_failed) { kv(hd, "Why my attempts failed", h.why_failed); }
+      if (h.history) { kv(hd, "History", h.history); }
+      hand.appendChild(hd);
+      if ((h.tried || []).length) {
+        hand.appendChild(node("p", "dsub", "What I tried"));
+        var tried = node("ol");
+        h.tried.forEach(function (t) { tried.appendChild(node("li", null, t)); });
+        hand.appendChild(tried);
+      }
+      if ((h.evidence || []).length) {
+        hand.appendChild(node("p", "dsub", "Evidence"));
+        var ev = node("ul");
+        h.evidence.forEach(function (t) { ev.appendChild(node("li", null, t)); });
+        hand.appendChild(ev);
+      }
+      body.appendChild(hand);
+    }
+
     if (d.repro_steps && d.repro_steps.length) {
       body.appendChild(node("h4", null, "Reproduction"));
       var steps = node("ol");
@@ -395,6 +459,7 @@
         head.appendChild(node("span", null, "attempt " + a.number));
         head.appendChild(node("span", null, localTime(a.started_at)));
         head.appendChild(node("span", null, a.outcome || "no outcome recorded"));
+        if (a.strategy) { head.appendChild(node("span", null, a.strategy)); }
         card.appendChild(head);
         var dl = node("dl", "kv");
         kv(dl, "Branch", a.branch);
@@ -486,6 +551,7 @@
     renderHeader(s);
     renderWatcher(s);
     renderCards(s);
+    renderAutonomy(s);
     renderIncidents(s);
     renderProbes(s);
     renderSafety(s);

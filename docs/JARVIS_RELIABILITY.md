@@ -253,17 +253,57 @@ fresh evidence — an explicit human decision, taken with
 
 ## 10. Notifications
 
-| Stage | Message |
-|---|---|
-| Incident detected | 🔴 severity, component, incident id |
-| Repair started | 🔧 attempt n/3 |
-| Verified | 🟢 tests, build, browser, PR number, "Production: UNCHANGED" |
-| Human required | 🚨 attempts, reason, "Production: UNCHANGED" |
-| Recovered | 🟢 whether a repair was involved |
+The owner hears from JARVIS in exactly three situations:
 
-Delivery goes through the `Notifier` interface. `TelegramNotifier` and
-`ConsoleNotifier` ship; `MultiNotifier` fans out to several. Messages pass the
-outbound redaction guard, are rate-capped, and are deduplicated inside a window.
+1. **It is fixed.** One message, at the end, saying what broke and what is
+   waiting for them.
+2. **Something serious happened** — a CRITICAL fault, a rollback.
+3. **JARVIS stopped and needs a human** — with the handover attached.
+
+Everything else is logged and shown in the Control Center: incidents opening,
+repairs starting, previews building, merges landing, production verification
+running. Those are steps. The owner is told outcomes.
+
+That is a policy, not a tuning knob, and it inverts the obvious design. The
+tempting version narrates — problem found, investigating, repairing, verifying,
+PR opened, merged — and every message is true and the sequence is worthless. An
+owner who gets six messages per incident learns to swipe them away, and the one
+that mattered arrives in a stream they have trained themselves to ignore.
+
+Copy is deterministic: assembled from the component, the outcome, the recorded
+root cause and a PR number. No model writes a notification. Messages pass the
+outbound redaction guard and are rate-capped.
+
+### Saying it once
+
+The in-process dedup window and hourly cap are memory, and the watcher restarts
+whenever the machine sleeps, the code updates, or launchd decides to. The owner
+does not experience a restart as a fresh start; they experience it as being told
+the same thing again.
+
+So the record of what has been said is persisted, next to the incident database,
+keyed by **fingerprint** and by **what the incident means to the owner** rather
+than by its internal state:
+
+| Owner-facing state | Internal states that collapse into it |
+| --- | --- |
+| `fixed` | `RESOLVED` |
+| `needs-you:<SEV>` | `HUMAN_REQUIRED`, `FAILED`, `RECOVERY_REQUIRED`, `ROLLED_BACK` |
+| `working:<SEV>` | everything else |
+
+Two internal states that ask the same thing of the owner produce one message.
+Only four things speak again: it is fixed, JARVIS has stopped when it was
+working, the severity rose, or it broke again after a fix. Everything else is
+silence.
+
+Keying on the fingerprint rather than the incident id matters: a flapping check
+opens a fresh incident every time it fails, and keyed on id every recurrence
+looks new.
+
+A held CRITICAL alert is recorded only at the moment it is actually sent — a
+cancelled one must leave no trace, or it would silence the escalation that
+replaced it. And a ledger that cannot be read costs a duplicate, never a missed
+outage: when in doubt, speak.
 
 ### Escalation
 

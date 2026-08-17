@@ -259,20 +259,47 @@ def render_human_required(
 ) -> str:
     """JARVIS has stopped and needs the owner.
 
-    Short on purpose. The internal reason, the attempt count and the evidence
-    are all in the dashboard; a phone message that reprints them buries the two
-    facts that matter — something is broken, and nothing more will happen until
-    a human looks.
+    Short on purpose. The internal reason, the attempt count and the full
+    handover are all in the dashboard; a phone message that reprints them buries
+    the two facts that matter — something is broken, and nothing more will
+    happen until a human looks.
+
+    One line of cause is the exception, when there is one worth saying. "I need
+    your help" without a subject is a message somebody reads at 3am and then has
+    to go and find the actual information; one clause is the difference between
+    a page and a briefing.
     """
     lines = [
         _sir(persona, "I need your help."),
         f"{plain_subject(incident)} is not working. {_plain_escalation(reason)}",
-        "I stopped making changes.",
     ]
+    cause = _handover_cause(incident) or _short_cause(incident)
+    if cause:
+        lines.append(f"It looks like {cause}.")
+    lines.append("I stopped making changes.")
     reference = _closing_reference(incident)
     if reference:
         lines += ["", reference]
     return "\n".join(lines)
+
+
+def _handover_cause(incident: Incident) -> str:
+    """One clause of cause from the recorded handover, when it established one.
+
+    Never the "not established" placeholder: telling somebody at 3am that the
+    cause looks like "not established" is worse than saying nothing, and the
+    handover in the dashboard says it properly.
+    """
+    handover = (getattr(incident, "metadata", None) or {}).get("handover")
+    if not isinstance(handover, dict):
+        return ""
+    cause = str(handover.get("cause") or "").strip()
+    if not cause or cause.lower().startswith("not established"):
+        return ""
+    first = cause.split(". ")[0].strip().rstrip(".")
+    if not first or len(first) > 140:
+        return ""
+    return first[:1].lower() + first[1:]
 
 
 def render_rolled_back(incident: Incident, *, reason: str, persona: bool = True) -> str:

@@ -512,26 +512,38 @@
     if (!list || !payload.parts) return;
     list.innerHTML = "";
 
-    const row = (label, state, detail) => {
+    const row = (label, state, detail, showDetail) => {
       const li = document.createElement("li");
       const name = document.createElement("span");
       name.textContent = label;
       const value = document.createElement("b");
       value.textContent = state;
       // Anything not plainly good reads as a warning, UNKNOWN included: an
-      // unchecked component must never look healthy.
-      value.className = ["READY", "REGISTERED", "REACHABLE", "ONLINE"].includes(state)
+      // unchecked component must never look healthy. WORKING belongs here
+      // because it is the microphone's only good state, and it is the one
+      // state in this panel that cannot be reached by installing something.
+      value.className = [
+        "READY", "REGISTERED", "REACHABLE", "ONLINE", "WORKING",
+      ].includes(state)
         ? "ok"
         : "warn";
       li.appendChild(name);
       li.appendChild(value);
       if (detail) li.title = detail;
+      if (detail && showDetail) {
+        // Shown rather than hidden behind a tooltip: there is no hover on a
+        // phone, and this is the line that says whether Sir has ever actually
+        // heard anybody.
+        const note = document.createElement("small");
+        note.textContent = detail;
+        li.appendChild(note);
+      }
       list.appendChild(li);
     };
 
     row("Voice", payload.voice, "");
     for (const [key, part] of Object.entries(payload.parts)) {
-      row(key.replace(/_/g, " "), part.state, part.detail);
+      row(key.replace(/_/g, " "), part.state, part.detail, key === "microphone");
     }
   }
 

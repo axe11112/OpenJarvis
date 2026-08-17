@@ -29,18 +29,31 @@ so the Mac needed no decoder. On a real iPhone, inside an installed PWA, iOS
 leaves that graph empty: every utterance produced zero audio, uploaded nothing,
 and answered "I didn't catch that" forever.
 
-So recording now goes through `MediaRecorder`, the one path every browser
-genuinely supports, and the Mac converts whatever container comes back:
+Recording therefore goes through `MediaRecorder`, the one path every browser
+genuinely supports. Uploading its output unchanged, however, only moved the
+failure to the Mac. Safari with a timeslice emits a **fragmented** MP4 — a
+header chunk followed by `moof`/`mdat` fragments — and `afconvert`, the only
+decoder macOS ships and the only one on a Mac without Homebrew, will not read
+it. The upload succeeded, the conversion failed, and every utterance still came
+back "I didn't catch that".
 
-| Browser        | Container            | Decoder on the Mac       |
-| -------------- | -------------------- | ------------------------ |
-| iOS Safari     | `audio/mp4` (AAC)    | `afconvert` (built in)   |
-| Chrome/Android | `audio/webm` (Opus)  | `ffmpeg` (optional)      |
-| Firefox        | `audio/ogg` (Opus)   | `ffmpeg` (optional)      |
+So the phone now decodes its own recording and uploads plain 16 kHz mono WAV:
 
-The container is sniffed from the bytes, never trusted from `Content-Type`.
-Audio exists on disk only inside a temporary directory that is removed on every
-path out, including failure.
+1. `MediaRecorder` captures, with **no timeslice** — one finalised container.
+2. `decodeAudioData` decodes it. This is the same decoder that plays the clip
+   back, so it can always read what the browser just wrote.
+3. `OfflineAudioContext` resamples to 16 kHz mono.
+4. A 44-byte RIFF header is written and the WAV is uploaded.
+
+This is not the ScriptProcessor mistake repeated. That starved a *live* audio
+graph, which iOS does not keep fed inside an installed PWA; these render as fast
+as they can with no realtime clock to miss.
+
+If any step fails the original container is uploaded unchanged and the Mac tries
+`afconvert`/`ffmpeg` as before — a best-effort improvement must never become a
+new way to lose an utterance. The container is sniffed from the bytes, never
+trusted from `Content-Type`, and audio exists on disk only inside a temporary
+directory removed on every path out, including failure.
 
 ## Understanding versus authority
 
@@ -120,11 +133,40 @@ origin, so the call screen would render and then do nothing.
 
 ## Health
 
-`GET /api/voice/health` and the Sir panel report STT, TTS, audio decoding,
-phone registration, call channel and Tailscale separately. **Unknown is never
-healthy** — a component nobody has checked reports `UNKNOWN` and drags the whole
-panel to `DEGRADED`. A green light for something unverified is how an operator
-learns to stop reading the panel.
+`GET /api/voice/health` and the Sir panel report the microphone, STT, TTS,
+audio decoding, phone registration, call channel and Tailscale separately.
+**Unknown is never healthy** — a component nobody has checked reports `UNKNOWN`
+and drags the whole panel to `DEGRADED`. A green light for something unverified
+is how an operator learns to stop reading the panel.
+
+### The microphone is not the speech engine
+
+These are two lights because they fail independently, and conflating them
+shipped a Control Center that read `ONLINE` while every word spoken into the
+real iPhone came back as "I didn't catch that". Every component was healthy. The
+product did not work, because *installed* was being read as *working*.
+
+| Light | Question it answers |
+| --- | --- |
+| **STT engine** — `READY` / `FAILED` | Does whisper load, with a model file? |
+| **Microphone** — `UNKNOWN` / `WORKING` / `FAILED` | Has a real phone ever actually been heard? |
+
+The microphone reaches `WORKING` on exactly one kind of evidence: a real device,
+over the network, sending audio that produced a transcript. A synthesised WAV
+from the test suite proves the library works, which was never the thing in
+doubt, and is ignored.
+
+**Voice does not report `ONLINE` until the microphone is `WORKING`.**
+
+`FAILED` needs audio that had sound in it, three times in a row, or audio that
+could not be decoded at all. Silence and half-second taps stay `UNKNOWN`: the
+owner may simply not have spoken, and calling that a failure is the same
+overclaim in the other direction. One bad utterance never condemns a microphone
+that has worked.
+
+The record is persisted to `~/.openjarvis/voice/microphone.json`, because "has
+this ever actually worked?" must survive the restart that follows every deploy.
+No audio and no transcript text is written — only a word count.
 
 ## Security
 
