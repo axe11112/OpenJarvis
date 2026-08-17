@@ -443,3 +443,151 @@ class TestPostMergeFailureMarker:
         incident.metadata[POST_MERGE_FAILURE_KEY] = {"reason": "red"}
         found = post_merge_failure_for(_Old(incident), "fp_homepage")
         assert found and found["incident_id"] == "INC-00009"
+
+
+# ---------------------------------------------------------------------------
+# Slow versus broken, after the merge
+#
+# These matter more once auto-merge is on than they did before it. These probes
+# run on the operator's laptop; a laptop that is compiling something serves a
+# correct page slowly. Without confirmation, a good merge becomes "production
+# probe(s) failed", HUMAN_REQUIRED and a CRITICAL notification. Three real
+# incidents in one night were exactly that, before anything merged at all.
+#
+# The line held here: only a duration-budget failure is ever retried. A wrong
+# status, a missing element or an unreachable page fails on the first run.
+# ---------------------------------------------------------------------------
+
+
+class _SlowThenFastVerifier:
+    """Fails on the clock alone the first *slow_runs* times, then passes."""
+
+    def __init__(self, probe_id: str, slow_runs: int):
+        self.probe_id = probe_id
+        self.slow_runs = slow_runs
+        self.runs: Dict[str, int] = {}
+
+    def verify(self, spec, *, target_url, incident_id=""):
+        self.runs[spec.id] = self.runs.get(spec.id, 0) + 1
+        if spec.id == self.probe_id and self.runs[spec.id] <= self.slow_runs:
+            return VerificationResult(
+                passed=False,
+                probe_id=spec.id,
+                target_url=target_url,
+                actual="took 41.30s, over the 30.00s budget",
+                failure_kind="slow",
+            )
+        return VerificationResult(
+            passed=True, probe_id=spec.id, target_url=target_url, actual="ok"
+        )
+
+
+def _slow_verifier(inner, *, store=None, notifier=None, fleet=("homepage", "signup")):
+    ticks = iter(range(0, 100000, 10))
+    return PostMergeVerifier(
+        vercel=_FakeVercel([[_deployment()]]),
+        verifier=inner,
+        store=store,
+        fleet_provider=lambda: [_Spec(p) for p in fleet],
+        production_url="https://www.example.com",
+        notifier=notifier,
+        sleep=lambda _s: None,
+        clock=lambda: next(ticks),
+        deployment_timeout_seconds=100.0,
+        poll_interval_seconds=1.0,
+        latency_confirmations=2,
+        latency_confirmation_delay_seconds=0.0,
+    )
+
+
+class TestLatencyConfirmation:
+    def test_a_transient_slow_page_is_confirmed_and_passes(self, store):
+        """One slow run, then a good one. Production is verified."""
+        inner = _SlowThenFastVerifier("signup", slow_runs=1)
+        verifier = _slow_verifier(inner, store=store)
+        incident = _incident(store)
+        result = verifier.verify(incident, merge_record=_record(), spec=_Spec("homepage"))
+
+        assert result.verified, result.reason
+        assert inner.runs["signup"] == 2
+        signup = next(p for p in result.fleet if p.probe_id == "signup")
+        assert signup.passed
+        assert signup.confirmations == 1
+
+    def test_a_page_that_stays_slow_is_not_verified(self, store):
+        """Confirmation bounded: it does not retry until it gets the answer it
+        wants."""
+        inner = _SlowThenFastVerifier("signup", slow_runs=99)
+        verifier = _slow_verifier(inner, store=store)
+        result = verifier.verify(
+            _incident(store), merge_record=_record(), spec=_Spec("homepage")
+        )
+
+        assert not result.verified
+        assert inner.runs["signup"] == 3  # first run plus two confirmations
+        assert result.rule == "fleet_slow_unconfirmed"
+
+    def test_a_persistent_slow_page_says_so_accurately(self, store):
+        """Not "production failed" when every page served correct content."""
+        verifier = _slow_verifier(_SlowThenFastVerifier("signup", 99), store=store)
+        result = verifier.verify(
+            _incident(store), merge_record=_record(), spec=_Spec("homepage")
+        )
+        assert "served correct content" in result.reason
+        assert "monitoring machine being busy" in result.reason
+
+    def test_a_broken_page_is_never_retried(self, store):
+        """The line. A site that is down does not get better by being asked
+        twice, and retrying a real failure would be weakening the gate."""
+        inner = _FakeVerifier(failing=("signup",))
+        verifier = _slow_verifier(inner, store=store)
+        result = verifier.verify(
+            _incident(store), merge_record=_record(), spec=_Spec("homepage")
+        )
+
+        assert not result.verified
+        assert result.rule == "fleet_failed"
+        assert len([r for r in inner.ran if r[0] == "signup"]) == 1
+
+    def test_a_probe_that_worsens_on_retry_is_believed_at_its_worst(self, store):
+        class _SlowThenBroken:
+            def __init__(self):
+                self.runs = 0
+
+            def verify(self, spec, *, target_url, incident_id=""):
+                if spec.id != "signup":
+                    return VerificationResult(passed=True, probe_id=spec.id)
+                self.runs += 1
+                if self.runs == 1:
+                    return VerificationResult(
+                        passed=False, probe_id=spec.id, failure_kind="slow",
+                        actual="over budget",
+                    )
+                return VerificationResult(
+                    passed=False, probe_id=spec.id, failure_kind="assertion",
+                    actual="the signup form is gone",
+                )
+
+        verifier = _slow_verifier(_SlowThenBroken(), store=store)
+        result = verifier.verify(
+            _incident(store), merge_record=_record(), spec=_Spec("homepage")
+        )
+        assert not result.verified
+        assert result.rule == "fleet_failed"
+
+    def test_the_reproduction_gets_the_same_confirmation(self, store):
+        inner = _SlowThenFastVerifier("homepage", slow_runs=1)
+        verifier = _slow_verifier(inner, store=store)
+        result = verifier.verify(
+            _incident(store), merge_record=_record(), spec=_Spec("homepage")
+        )
+        assert result.verified, result.reason
+        assert result.reproduction.confirmations == 1
+
+    def test_a_reproduction_that_stays_slow_names_the_clock(self, store):
+        verifier = _slow_verifier(_SlowThenFastVerifier("homepage", 99), store=store)
+        result = verifier.verify(
+            _incident(store), merge_record=_record(), spec=_Spec("homepage")
+        )
+        assert not result.verified
+        assert result.rule == "reproduction_slow_unconfirmed"

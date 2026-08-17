@@ -236,6 +236,7 @@ def _build_supervised_monitor(config: Any, store: Any) -> tuple:
     from openjarvis.reliability.detector import Detector
     from openjarvis.reliability.flapping import FlappingDetector
     from openjarvis.reliability.monitor import ReliabilityMonitor
+    from openjarvis.reliability.monitor_health import MonitorHealth
     from openjarvis.reliability.probes.spec import load_probes
     from openjarvis.reliability.watch import RepairGate, WatchSupervisor
 
@@ -248,6 +249,9 @@ def _build_supervised_monitor(config: Any, store: Any) -> tuple:
         store,
         environment=rc.site.environment,
         notifier=notifier,
+        # Lets two unrelated pages being simultaneously slow-but-correct be read
+        # as "this machine is struggling" rather than as two outages.
+        monitor_health=MonitorHealth(),
     )
     supervisor = WatchSupervisor(
         monitor=None,  # set below, once the monitor exists

@@ -157,6 +157,18 @@ class ProbeOutcome:
     probe_id: str
     passed: bool
     summary: str = ""
+    #: The probe's failure kind, so a caller can tell a wrong answer from a
+    #: slow one without reading the summary.
+    failure_kind: str = ""
+    #: How many extra runs it took. Non-zero means the first run failed on the
+    #: clock alone and a re-run disagreed — worth recording, because it is the
+    #: signature of a busy monitoring machine rather than a sick site.
+    confirmations: int = 0
+
+    @property
+    def latency_only(self) -> bool:
+        """Failed on the duration budget and nothing else."""
+        return not self.passed and self.failure_kind == "slow"
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize for the audit record."""
@@ -164,6 +176,9 @@ class ProbeOutcome:
             "probe_id": self.probe_id,
             "passed": self.passed,
             "summary": self.summary[:300],
+            "failure_kind": self.failure_kind,
+            "confirmations": self.confirmations,
+            "latency_only": self.latency_only,
         }
 
 
@@ -250,6 +265,24 @@ class PostMergeVerifier:
     #: ship several times while this one builds, and the match is by SHA, so a
     #: short window would simply lose the deployment rather than mismatch it.
     scan_limit: int = 30
+    #: Extra runs allowed for a probe that failed on its *duration budget alone*.
+    #:
+    #: This exists because of a specific way auto-merge could go wrong. These
+    #: probes run on the operator's laptop, and a laptop that is compiling
+    #: something serves a correct page slowly. Without confirmation, a perfectly
+    #: good merge becomes "production probe(s) failed", HUMAN_REQUIRED and a
+    #: CRITICAL notification — three real incidents in one night were exactly
+    #: this, before anything was merging at all.
+    #:
+    #: Deliberately narrow. Only ``failure_kind == "slow"`` is retried: a wrong
+    #: status, a missing element or an unreachable page fails on the first run
+    #: and is never given a second chance, because a site that is down does not
+    #: become healthy by being asked twice.
+    latency_confirmations: int = 2
+    #: Seconds to wait before re-running a latency-only failure. Long enough for
+    #: a compile to finish a chunk, short enough not to stretch the window in
+    #: which unverified code is live.
+    latency_confirmation_delay_seconds: float = 10.0
 
     # -- entry point ------------------------------------------------------
 
@@ -339,12 +372,22 @@ class PostMergeVerifier:
             )
             if not result.reproduction.passed:
                 result.verified = False
-                result.reason = (
-                    f"the probe that opened this incident "
-                    f"({result.reproduction.probe_id}) still fails against "
-                    f"production: {result.reproduction.summary}"
-                )
-                result.rule = "reproduction_failed"
+                if result.reproduction.latency_only:
+                    result.reason = (
+                        f"the probe that opened this incident "
+                        f"({result.reproduction.probe_id}) served correct "
+                        "content against production but over its time budget, "
+                        f"after {self.latency_confirmations} confirmation(s): "
+                        f"{result.reproduction.summary}"
+                    )
+                    result.rule = "reproduction_slow_unconfirmed"
+                else:
+                    result.reason = (
+                        f"the probe that opened this incident "
+                        f"({result.reproduction.probe_id}) still fails against "
+                        f"production: {result.reproduction.summary}"
+                    )
+                    result.rule = "reproduction_failed"
                 self._record(incident, result)
                 return result
 
@@ -359,10 +402,25 @@ class PostMergeVerifier:
         failed = [p for p in result.fleet if not p.passed]
         if failed:
             result.verified = False
-            result.reason = "production probe(s) failed after the merge: " + ", ".join(
-                f"{p.probe_id} ({p.summary[:80]})" for p in failed
-            )
-            result.rule = "fleet_failed"
+            named = ", ".join(f"{p.probe_id} ({p.summary[:80]})" for p in failed)
+            if all(p.latency_only for p in failed):
+                # Still not verified — the rule is that only a pass resolves an
+                # incident — but the account has to be accurate. Saying
+                # production "failed" when every page served correct content is
+                # how an owner is sent to look for an outage that is not there.
+                result.reason = (
+                    "production could not be verified: every failing check "
+                    "served correct content but took longer than its budget, "
+                    f"after {self.latency_confirmations} confirmation(s). This "
+                    "is usually the monitoring machine being busy rather than "
+                    f"the site being unwell. Checks: {named}"
+                )
+                result.rule = "fleet_slow_unconfirmed"
+            else:
+                result.reason = (
+                    "production probe(s) failed after the merge: " + named
+                )
+                result.rule = "fleet_failed"
             self._record(incident, result)
             return result
 
@@ -480,7 +538,46 @@ class PostMergeVerifier:
     def _run_probe(
         self, spec: Any, *, target_url: str, incident_id: str
     ) -> ProbeOutcome:
-        """Run one probe against production, converting a crash into a failure."""
+        """Run one probe against production.
+
+        A crash is a failure — an unverifiable production is not a verified one.
+        A *latency-only* failure is re-run up to
+        :attr:`latency_confirmations` times before being believed; nothing else
+        is retried.
+        """
+        probe_id = str(getattr(spec, "id", "") or "probe")
+        outcome = self._run_probe_once(spec, target_url, incident_id)
+        if outcome.passed or not outcome.latency_only:
+            return outcome
+
+        for attempt in range(1, max(0, self.latency_confirmations) + 1):
+            logger.info(
+                "post-merge: %s served correct content over its time budget; "
+                "confirming (%d/%d)",
+                probe_id,
+                attempt,
+                self.latency_confirmations,
+            )
+            self.sleep(self.latency_confirmation_delay_seconds)
+            retry = self._run_probe_once(spec, target_url, incident_id)
+            retry.confirmations = attempt
+            if retry.passed:
+                retry.summary = (
+                    f"passed on confirmation {attempt}; the first run was over "
+                    f"the time budget only ({outcome.summary[:120]})"
+                )
+                return retry
+            if not retry.latency_only:
+                # It got worse, or it was never only slow. Believe the worse one.
+                return retry
+            outcome = retry
+        outcome.confirmations = max(0, self.latency_confirmations)
+        return outcome
+
+    def _run_probe_once(
+        self, spec: Any, target_url: str, incident_id: str
+    ) -> ProbeOutcome:
+        """One run, with a crash converted into a failure."""
         probe_id = str(getattr(spec, "id", "") or "probe")
         try:
             verdict = self.verifier.verify(
@@ -499,7 +596,12 @@ class PostMergeVerifier:
             or getattr(verdict, "notes", "")
             or ("passed" if passed else "failed")
         )
-        return ProbeOutcome(probe_id=probe_id, passed=passed, summary=str(summary))
+        return ProbeOutcome(
+            probe_id=probe_id,
+            passed=passed,
+            summary=str(summary),
+            failure_kind=str(getattr(verdict, "failure_kind", "") or ""),
+        )
 
     # -- recording --------------------------------------------------------
 

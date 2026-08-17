@@ -150,7 +150,8 @@ class HttpProbeRunner(BaseProbeRunner):
 
         # Cross-cutting assertions
         ceiling = spec.assertions.max_http_status
-        if ceiling and response.status_code > ceiling:
+        status_failed = bool(ceiling and response.status_code > ceiling)
+        if status_failed:
             failures.append(
                 f"HTTP {response.status_code} exceeds the allowed maximum {ceiling}"
             )
@@ -164,6 +165,13 @@ class HttpProbeRunner(BaseProbeRunner):
                     metadata={"status": response.status_code, "url": final_url},
                 )
             )
+        # Tracked separately from the other failures, because "the right answer
+        # arrived slowly" and "the wrong answer arrived" are different events and
+        # the severity rules downstream have to be able to tell them apart. The
+        # browser runner has always reported this as ``slow``; this one reported
+        # it as ``assertion``, which is why INC-00020 — a homepage that returned
+        # 200 with the correct title in 9.65s — was filed CRITICAL.
+        slow_only = False
         if (
             spec.assertions.max_duration_seconds
             and duration > spec.assertions.max_duration_seconds
@@ -172,12 +180,17 @@ class HttpProbeRunner(BaseProbeRunner):
                 f"took {duration:.2f}s, over the "
                 f"{spec.assertions.max_duration_seconds:.2f}s budget"
             )
+            slow_only = True
 
         # Declared expectations
         for expectation in spec.expect:
             problem = self._check(expectation, response, final_url, body)
             if problem:
                 failures.append(problem)
+                # Anything the operator actually declared taking precedence over
+                # the clock: a missing element or a bad status is a fault however
+                # fast it arrived, and must not be softened to "slow".
+                slow_only = False
 
         if final_url != url and not any(e.kind == "url" for e in spec.expect):
             evidence.append(
@@ -192,7 +205,10 @@ class HttpProbeRunner(BaseProbeRunner):
         return ProbeResult(
             probe_id=spec.id,
             success=not failures,
-            failure_kind="assertion" if failures else "",
+            failure_kind=(
+                "" if not failures else ("slow" if slow_only and not status_failed
+                                         else "assertion")
+            ),
             error=redactor.redact("; ".join(failures)),
             duration_seconds=duration,
             final_url=final_url,

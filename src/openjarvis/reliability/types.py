@@ -525,6 +525,11 @@ class VerificationResult:
     expected: str = ""
     actual: str = ""
     notes: str = ""
+    #: The probe's own ``failure_kind``, carried through rather than left inside
+    #: the evidence prose. Callers have to be able to tell "the page served the
+    #: wrong thing" from "the page served the right thing slowly" without
+    #: parsing a sentence, because those two justify very different actions.
+    failure_kind: str = ""
     checked_at: str = field(default_factory=now_iso)
     evidence: List[Evidence] = field(default_factory=list)
 
@@ -537,6 +542,7 @@ class VerificationResult:
             "expected": self.expected,
             "actual": self.actual,
             "notes": self.notes,
+            "failure_kind": self.failure_kind,
             "checked_at": self.checked_at,
             "evidence": [e.to_dict() for e in self.evidence],
         }
@@ -551,6 +557,7 @@ class VerificationResult:
             expected=d.get("expected", ""),
             actual=d.get("actual", ""),
             notes=d.get("notes", ""),
+            failure_kind=d.get("failure_kind", ""),
             checked_at=d.get("checked_at") or now_iso(),
             evidence=[Evidence.from_dict(e) for e in d.get("evidence") or []],
         )

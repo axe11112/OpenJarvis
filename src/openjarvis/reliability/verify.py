@@ -134,6 +134,7 @@ class Verifier:
             target_url=target_url,
             expected=spec.expectation_summary(),
             actual=result.error or f"probe failed ({result.failure_kind})",
+            failure_kind=result.failure_kind,
             notes=(
                 f"Re-ran probe '{spec.id}' against the candidate deployment and "
                 "the original failure still reproduces."

@@ -50,6 +50,30 @@ __all__ = ["Detection", "Detector"]
 #: connection" is worse than no monitoring at all.
 _SELF_FAILURE_KINDS = frozenset({"misconfigured", "runner_error", "blocked"})
 
+#: Failure kinds where the site answered correctly and only took too long.
+#: Public, because :mod:`openjarvis.reliability.monitor_health` imports it — two
+#: definitions of "slow" in one pipeline is a bug waiting for an evening.
+LATENCY_FAILURE_KINDS = frozenset({"slow", "slow_response", "budget_exceeded"})
+
+#: Extra consecutive sightings required before a latency-only failure is
+#: believed, on top of the probe's own ``confirm_runs``.
+#:
+#: Measured rather than guessed. On this machine every active probe runs 6-40x
+#: inside its duration budget, including at load average 27: browser probes
+#: p95 4.6-5.5s against a 30s budget, HTTP probes p95 0.14-0.46s against 5-8s.
+#: Yet nine of the first twenty-five incidents opened on a duration overrun, at
+#: 33-140s and 9.65s respectively — 7-48x the loaded p95. Those are stalls on a
+#: four-core, eight-gigabyte laptop, not a latency distribution a budget should
+#: be widened to accommodate; widening it is how a genuine tenfold regression
+#: stops being visible.
+#:
+#: So the budget stays where the evidence puts it and the *confirmation* is what
+#: changes, and only for the kind of failure that was wrong. A missing element,
+#: a bad status or an unreachable page is still believed at the probe's own
+#: ``confirm_runs``: a site that is down does not become healthy by being asked
+#: again.
+LATENCY_EXTRA_CONFIRMATIONS = 2
+
 
 @dataclass(slots=True)
 class Detection:
@@ -88,9 +112,13 @@ class Detector:
         environment: str = "production",
         notifier: Any = None,
         bus: Any = None,
+        monitor_health: Any = None,
     ) -> None:
         self._store = store
         self._tracker = tracker or ConfirmationTracker()
+        # Optional. Absent means every latency failure is judged on its own,
+        # which is the previous behaviour and is never less safe — only noisier.
+        self._monitor_health = monitor_health
         self._environment = environment
         self._notifier = notifier
         self._bus = bus
@@ -111,18 +139,56 @@ class Detector:
                 reason=f"probe could not run ({result.failure_kind}): {result.error}",
             )
 
+        latency_only = result.failure_kind in LATENCY_FAILURE_KINDS
+        if self._monitor_health is not None:
+            # Recorded before the verdict is asked for, so this probe's own
+            # observation is in the window for *other* probes to corroborate
+            # with. It is excluded from its own verdict below.
+            self._monitor_health.record(spec.id, latency_only=latency_only)
+            if latency_only:
+                monitor = self._monitor_health.verdict(exclude=spec.id)
+                if monitor.degraded:
+                    # Not an incident. Two unrelated pages cannot both slow down
+                    # while still serving correct content because the site is
+                    # unwell; that shape is the observer, and opening a CRITICAL
+                    # for it is how a busy laptop woke the owner three times in
+                    # one night.
+                    logger.warning(
+                        "probe %s exceeded its time budget but %s",
+                        spec.id,
+                        monitor.reason,
+                    )
+                    return Detection(
+                        suppressed=True,
+                        reason=(
+                            "the page was correct but over its time budget, and "
+                            f"{monitor.reason}"
+                        ),
+                    )
+
         count = self._tracker.record(spec.id, failed=True)
         required = max(1, spec.retry.confirm_runs)
+        if latency_only:
+            required += LATENCY_EXTRA_CONFIRMATIONS
         if count < required:
             logger.info(
-                "probe %s failed (%d/%d confirmations); not opening an incident yet",
+                "probe %s failed (%d/%d confirmations%s); not opening an incident yet",
                 spec.id,
                 count,
                 required,
+                ", latency only" if latency_only else "",
             )
             return Detection(
                 suppressed=True,
-                reason=f"awaiting confirmation ({count}/{required})",
+                reason=(
+                    f"awaiting confirmation ({count}/{required})"
+                    + (
+                        "; the page answered correctly and only exceeded its time "
+                        "budget, which needs more than one sighting to be believed"
+                        if latency_only
+                        else ""
+                    )
+                ),
             )
 
         # Severity is decided by deterministic rules over what was observed,

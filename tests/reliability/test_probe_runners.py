@@ -143,6 +143,49 @@ class TestHttpRunner:
         assert not result.success
         assert "expected HTTP 200, got 500" in result.error
 
+    # -- slow versus broken ------------------------------------------------
+    #
+    # These four are INC-00020. A homepage that returned 200 with the correct
+    # title in 9.65s against a 5s budget was filed CRITICAL, escalated 27
+    # seconds later and resolved itself. The severity rule that was supposed to
+    # catch that keys on failure_kind == "slow", which the browser runner has
+    # always set and this runner did not — it reported every failure, including
+    # a pure clock overrun, as "assertion".
+
+    def test_a_duration_only_overrun_is_slow_not_an_assertion(self, runner, site):
+        spec = _http_spec(
+            expect=[{"kind": "status", "matches": "200"}],
+            assertions={"max_duration_seconds": 0.000001},
+        )
+        result = runner.run(spec, base_url=site.base_url)
+        assert not result.success
+        assert result.failure_kind == "slow"
+        assert result.http_status == 200
+        assert "over the" in result.error
+
+    def test_a_broken_page_is_an_assertion_however_fast(self, runner, site):
+        spec = _http_spec(expect=[{"kind": "text", "value": "Nonexistent"}])
+        result = runner.run(spec, base_url=site.base_url)
+        assert result.failure_kind == "assertion"
+
+    def test_slow_and_broken_is_an_assertion_not_merely_slow(self, runner, site):
+        """The control. Softening a real fault to "slow" would hide an outage."""
+        spec = _http_spec(
+            expect=[{"kind": "text", "value": "Nonexistent"}],
+            assertions={"max_duration_seconds": 0.000001},
+        )
+        result = runner.run(spec, base_url=site.base_url)
+        assert not result.success
+        assert result.failure_kind == "assertion"
+
+    def test_a_bad_status_is_an_assertion_even_when_also_slow(self, runner, site):
+        spec = _http_spec(
+            url="/boom",
+            assertions={"max_http_status": 399, "max_duration_seconds": 0.000001},
+        )
+        result = runner.run(spec, base_url=site.base_url)
+        assert result.failure_kind == "assertion"
+
     def test_text_expectation(self, runner, site):
         spec = _http_spec(expect=[{"kind": "text", "value": "Sign in"}])
         assert runner.run(spec, base_url=site.base_url).success
