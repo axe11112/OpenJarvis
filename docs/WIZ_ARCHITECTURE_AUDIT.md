@@ -304,15 +304,32 @@ implementation would, so they deserve explicit tests.
 
 ---
 
-## 9b. Test baseline before Phase 1 — read this first
+## 9b. Test baseline — **now green** [REVISED 2026-08-17]
 
 The brief requires that reliability and security tests run after every phase with no regression.
-So the baseline needs to be known before anything is built. It is **not currently green**:
+So the baseline needed to be known before anything was built. It was **not green**:
 
 ```
-tests/reliability + tests/security
+tests/reliability + tests/security          (2026-08-16, before the fix)
 21 failed · 1391 passed · 14 skipped · 12m11s
 ```
+
+After the one-line harness fix described below, and after merging the parallel session's work:
+
+```
+tests/reliability + tests/security          (2026-08-17, after the fix)
+0 failed · 1782 passed · 14 skipped · 17m55s
+```
+
+The count rose from 1412 to 1796 because the merge brought in the voice, notification-ledger,
+playbook and post-merge suites. Every one of the 21 failures is gone, and none of them was a
+real defect.
+
+> **Note on running the suite yourself.** The virtualenv installs `openjarvis` as an editable
+> package pointing at `/Users/Axel/OpenJarvis/src`, so running pytest from a worktree tests the
+> *main checkout's* source with the *worktree's* tests. Set
+> `PYTHONPATH=<worktree>/src` or the run is silently measuring the wrong tree — which happened
+> once during this work and produced a confounded result.
 
 All 21 failures are in the repair end-to-end paths (`test_repair_e2e.py`, `test_watch_e2e.py`,
 `test_claude_live.py`). They reproduce in isolation, so they are not interference from the
@@ -405,6 +422,7 @@ src/openjarvis/wiz/
   intents.py            Deterministic classifier — regular expressions, no model
   brain.py              Dispatch: the single door every request goes through
   runtime.py            Assembly — the complete inventory of Wiz's abilities
+  approvals.py          Bound, single-use, expiring operator consent
   features/
     model.py            FeatureRequest, FeatureState machine, attempts, priorities
     store.py            SQLite persistence, its own database file
@@ -478,8 +496,8 @@ services to keep it that way.
 
 | Suite | Result |
 |---|---|
-| `tests/wiz` (new) | **254 passed** |
-| `tests/reliability` + `tests/security` | see §9b — the harness fix removes all 21 environmental failures |
+| `tests/wiz` (new) | **272 passed** |
+| `tests/reliability` + `tests/security` | **1782 passed, 14 skipped, 0 failed** — see §9b |
 
 New tests are property-shaped: each names a promise from the brief and fails if it stops
 being true. The adversarial ones matter most — a classifier naming a fictional capability, a
