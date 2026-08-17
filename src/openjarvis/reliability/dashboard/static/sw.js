@@ -17,7 +17,14 @@
  * admits it cannot reach the Mac.
  */
 
-const SHELL = "sir-shell-v1";
+/* Bump this on every asset change.
+ *
+ * A cached call screen is worse than no call screen: the phone keeps running
+ * whichever voice.js it installed first, so a fix on the Mac appears to do
+ * nothing and the bug looks unfixable from the operator's side. `skipWaiting`
+ * plus `clients.claim` below mean a new version takes over on the next load
+ * rather than after every tab is closed. */
+const SHELL = "sir-shell-v3-mediarecorder";
 
 // Only the files needed to render "I cannot reach the Mac" and a call screen.
 const SHELL_FILES = [
@@ -51,6 +58,9 @@ self.addEventListener("activate", (event) => {
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (event.request.method !== "GET" || url.pathname.startsWith("/api/")) return;
+  // The page and its script are always fetched fresh when the Mac is reachable.
+  // Caching them is only a courtesy for a phone that has lost the tailnet.
+  if (url.pathname === "/sw.js") return;
 
   event.respondWith(
     fetch(event.request)

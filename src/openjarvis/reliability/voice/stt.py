@@ -95,9 +95,17 @@ class WhisperTranscriber:
     timeout_seconds: float = 30.0
     threads: int = 4
     runner: Optional[Callable[..., Any]] = None
+    #: Converts whatever the browser recorded into what whisper reads. Set on
+    #: construction so a call never discovers mid-conversation that the phone's
+    #: container is one this Mac cannot decode.
+    normalizer: Any = None
 
     def __post_init__(self) -> None:
         self.binary = self.binary or find_whisper()
+        if self.normalizer is None:
+            from openjarvis.reliability.voice.audio import AudioNormalizer
+
+            self.normalizer = AudioNormalizer()
 
     @property
     def available(self) -> bool:
@@ -127,23 +135,30 @@ class WhisperTranscriber:
         from a tapped button — and they are indistinguishable from the outside.
         Measuring the bytes tells you which one it is in one look.
         """
+        from openjarvis.reliability.voice.audio import sniff_container
+
         info: Dict[str, Any] = {"bytes": len(wav_bytes), "format": "unknown"}
         if len(wav_bytes) < 44:
-            info["problem"] = "too short to be a WAV file"
+            info["problem"] = "too short to contain speech"
             return info
+
+        container, mime = sniff_container(wav_bytes)
+        info["container"] = container or "unknown"
+        info["mime"] = mime
 
         head = wav_bytes[:12]
         if head[:4] != b"RIFF" or head[8:12] != b"WAVE":
-            # The commonest wrong answer: MediaRecorder output. whisper.cpp
-            # reads WAV only, so naming the container is the whole diagnosis.
-            if wav_bytes[:4] == b"\x1aE\xdf\xa3":
-                info["format"] = "WebM/Opus (MediaRecorder) — whisper cannot read this"
-            elif wav_bytes[4:8] == b"ftyp":
-                info["format"] = "MP4/AAC (MediaRecorder) — whisper cannot read this"
-            else:
-                info["format"] = f"not RIFF/WAVE, starts with {wav_bytes[:4]!r}"
-            info["problem"] = "not a WAV container"
-            return info
+            # Not an error any more — this is the normal iPhone case. Convert
+            # it and describe the *result*, because what matters downstream is
+            # whether whisper ends up with something readable.
+            normalized = self.normalizer.normalize(wav_bytes)
+            info["converted_by"] = normalized.converter
+            if not normalized.ok:
+                info["format"] = container or "unrecognised"
+                info["problem"] = normalized.reason
+                return info
+            info["format"] = f"{container} -> WAV via {normalized.converter}"
+            wav_bytes = normalized.wav
 
         try:
             import io
@@ -161,7 +176,11 @@ class WhisperTranscriber:
 
         info.update(
             {
-                "format": "WAV",
+                # Keep the conversion story when there was one: "mp4 -> WAV via
+                # afconvert" says more than "WAV" about how it got here.
+                "format": info.get("format")
+                if info.get("format") not in (None, "unknown")
+                else "WAV",
                 "channels": channels,
                 "sample_width_bytes": width,
                 "sample_rate": rate,
@@ -201,8 +220,12 @@ class WhisperTranscriber:
             info["problem"] = "; ".join(problems)
         return info
 
-    def transcribe(self, wav_bytes: bytes) -> str:
-        """Return the text of *wav_bytes*, or ``""``.
+    def transcribe(self, audio_bytes: bytes) -> str:
+        """Return the text of *audio_bytes*, or ``""``.
+
+        Accepts whatever the browser recorded — iOS sends MP4/AAC, Chrome sends
+        WebM/Opus — and normalises before whisper sees it. Passing raw browser
+        audio straight to whisper is what made every iPhone utterance silent.
 
         The audio is written to a temporary file and deleted immediately after,
         whichever way this goes. Keeping microphone audio on disk is not part of
@@ -211,8 +234,16 @@ class WhisperTranscriber:
         if not self.available:
             logger.warning("voice: cannot transcribe — %s", self.unavailable_reason())
             return ""
-        if not wav_bytes:
+        if not audio_bytes:
             return ""
+
+        normalized = self.normalizer.normalize(audio_bytes)
+        if not normalized.ok:
+            logger.warning(
+                "voice: could not prepare audio for whisper — %s", normalized.reason
+            )
+            return ""
+        wav_bytes = normalized.wav
 
         with tempfile.TemporaryDirectory(prefix="sirvoice-") as tmp:
             wav = Path(tmp) / "utterance.wav"

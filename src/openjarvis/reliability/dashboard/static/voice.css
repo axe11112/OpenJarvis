@@ -231,6 +231,16 @@ body.listening .round--talk span {
 
 .pending li span { flex: 1; min-width: 140px; }
 
+/* Sir's own health. Green is earned, not assumed: anything unverified renders
+   amber, so an unchecked component never reads as working. */
+.pending--health { border-color: var(--line); }
+.pending--health h3 { color: var(--muted); }
+.pending--health li { justify-content: space-between; font-size: 13px; }
+.pending--health b { font-weight: 600; }
+.pending--health .ok { color: var(--answer); }
+.pending--health .warn { color: var(--confirm); }
+.pending--health button { margin-top: 12px; width: 100%; }
+
 .tiny {
   margin: 0 20px 18px;
   color: var(--muted);

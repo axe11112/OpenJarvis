@@ -66,6 +66,10 @@ class VoiceEndpoints:
     #: waiting call when opened; only the ring is lost.
     push: Any = None
     subscriptions: Any = None
+    #: Optional :class:`~openjarvis.reliability.voice.calls.CallOrchestrator`.
+    calls: Any = None
+    #: Optional health reporter, for the Control Center's voice panel.
+    health: Any = None
     _lock: Any = None
 
     def __post_init__(self) -> None:
@@ -99,6 +103,14 @@ class VoiceEndpoints:
                 },
                 "at": now_iso(),
             }
+        if path == "/api/voice/health":
+            return 200, (
+                self.health.snapshot() if self.health else {"voice": "UNKNOWN"}
+            )
+        if path == "/api/voice/calls":
+            return 200, (
+                self.calls.snapshot() if self.calls else {"active": None, "last": None}
+            )
         if path == "/api/voice/push-key":
             # The public half only. It is meant to be public — the browser
             # passes it to the push service to bind the subscription to us.
@@ -123,11 +135,47 @@ class VoiceEndpoints:
             return self._hangup(str((query.get("id") or [""])[0]))
         if path == "/api/voice/confirm":
             return self._confirm(body)
+        if path == "/api/voice/test-call":
+            return self._test_call()
+        if path == "/api/voice/decline":
+            if self.calls is not None:
+                self.calls.declined()
+            with self._lock:
+                self.pending_call = None
+            return 200, {"ok": True}
         if path == "/api/voice/subscribe":
             return self._subscribe(body)
         if path == "/api/voice/unsubscribe":
             return self._unsubscribe(body)
         return 404, {"error": "no such route"}
+
+    def _test_call(self) -> Tuple[int, Dict[str, Any]]:
+        """Ring the phone on purpose, so the operator can prove it works.
+
+        Marked as a test end to end: it opens no incident, resolves nothing,
+        triggers no repair, and is exempt from the cooldowns — pressing it twice
+        must actually ring twice, or it cannot be used to debug a phone. It
+        takes the same transport as a real call, which is the only way it is
+        worth anything.
+        """
+        if self.calls is None:
+            return 404, {"error": "calling is not enabled"}
+        call = self.calls.ring(
+            reason="test",
+            detail="This is a test. Nothing is wrong.",
+            test=True,
+        )
+        if call is None:
+            return 409, {"error": "a call is already in progress"}
+        with self._lock:
+            self.pending_call = {
+                "incident_id": "",
+                "reason": "test",
+                "detail": "This is a test. Nothing is wrong.",
+                "at": now_iso(),
+                "test": True,
+            }
+        return 200, {"ok": True, "call": call.to_dict()}
 
     # -- push registration ------------------------------------------------
 

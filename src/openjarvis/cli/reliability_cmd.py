@@ -1730,7 +1730,7 @@ def _resolve_tls(access: Any, certfile: str, keyfile: str, console: Any) -> Any:
     return "", ""
 
 
-def _build_voice(config: Any, store: Any, console: Any) -> Any:
+def _build_voice(config: Any, store: Any, console: Any, access: Any) -> Any:
     """Assemble the Sir Voice stack, or ``None`` when it cannot speak.
 
     Built once, at startup, so a missing model or binary is a line on the
@@ -1741,6 +1741,7 @@ def _build_voice(config: Any, store: Any, console: Any) -> Any:
 
     from openjarvis.reliability.briefing import redact_secrets
     from openjarvis.reliability.dashboard.supervisor import LaunchdSupervisor
+    from openjarvis.reliability.types import Severity
     from openjarvis.reliability.voice.answers import VoiceFacts
     from openjarvis.reliability.voice.commands import VoiceCommands
     from openjarvis.reliability.voice.confirmations import ConfirmationStore
@@ -1802,14 +1803,46 @@ def _build_voice(config: Any, store: Any, console: Any) -> Any:
     except Exception:  # noqa: BLE001 - a call that cannot ring still answers
         console.print("[bold yellow]Voice: push is unavailable[/bold yellow]")
 
+    from openjarvis.reliability.voice.calls import CallOrchestrator
+    from openjarvis.reliability.voice.health import VoiceHealth
+
+    notifier = _build_notifier(config)
+
+    def _fallback(reason: str, detail: str) -> None:
+        """A call that could not be delivered still has to reach the operator."""
+        if notifier is None:
+            return
+        notifier.notify(
+            f"Sir, I need your help.\n{detail}\nOpen Sir when you can.",
+            severity=Severity.CRITICAL,
+        )
+
+    audit = lambda event, payload: logging.getLogger("openjarvis.voice").info(  # noqa: E731
+        "voice %s %s", event, {k: v for k, v in payload.items() if k != "speech"}
+    )
+    sessions = VoiceSessionManager(factory=_session)
+    calls = CallOrchestrator(
+        push=push,
+        subscriptions=subscriptions,
+        fallback=_fallback,
+        audit=audit,
+    )
     return VoiceEndpoints(
-        sessions=VoiceSessionManager(factory=_session),
+        sessions=sessions,
         confirmations=confirmations,
         push=push,
         subscriptions=subscriptions,
-        audit=lambda event, payload: logging.getLogger("openjarvis.voice").info(
-            "voice %s %s", event, {k: v for k, v in payload.items() if k != "speech"}
+        calls=calls,
+        health=VoiceHealth(
+            transcriber=transcriber,
+            speech=speech,
+            normalizer=transcriber.normalizer,
+            subscriptions=subscriptions,
+            sessions=sessions,
+            calls=calls,
+            access=access,
         ),
+        audit=audit,
     )
 
 
@@ -1939,7 +1972,9 @@ def reliability_dashboard(
         probe_verification=probe_verification,
         auto_recover=auto_recover,
     )
-    voice_endpoints = _build_voice(config, store, console) if enable_voice else None
+    voice_endpoints = (
+        _build_voice(config, store, console, access) if enable_voice else None
+    )
     try:
         server = ControlCenterServer(
             service,

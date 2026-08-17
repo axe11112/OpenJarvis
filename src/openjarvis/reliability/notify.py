@@ -490,11 +490,23 @@ class NotificationRouter:
     persona: bool = True
     redact: bool = True
     clock: Callable[[], float] = time.monotonic
+    #: How long a CRITICAL alert waits for an escalation to supersede it. Zero
+    #: sends immediately, which is what the tests that are not about deferral
+    #: use.
+    critical_grace_seconds: float = 20.0
+    #: Builds the delay. Injected so tests need not wait twenty seconds.
+    scheduler: Optional[Callable[[float, Callable[[], None]], Any]] = None
 
     _sent_times: List[float] = field(default_factory=list, repr=False)
     _recent: Dict[str, float] = field(default_factory=dict, repr=False)
     _suppressed: int = field(default=0, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _deferred: Dict[str, Any] = field(default_factory=dict, repr=False)
+    _alert_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def _scheduler(self) -> Callable[[float, Callable[[], None]], Any]:
+        return self.scheduler or threading.Timer
 
     def notify(self, message: str, *, severity: Severity = Severity.MEDIUM) -> bool:
         """Route *message*, returning ``True`` when it was actually sent."""
@@ -550,6 +562,15 @@ class NotificationRouter:
         have to watch them. Only CRITICAL interrupts — everything JARVIS is
         allowed to handle automatically is handled silently, and the owner hears
         either the fix or the escalation, never the commentary in between.
+
+        Even a CRITICAL is held briefly rather than sent at once. A CRITICAL
+        that JARVIS may not repair escalates to ``HUMAN_REQUIRED`` within the
+        same tick, and the owner would get two messages seconds apart about one
+        event: "something serious happened", then "I need your help". The second
+        is strictly more useful — it says what to do — so the first waits out a
+        short grace period and is cancelled if the escalation arrives. A
+        CRITICAL that nothing supersedes is sent when the grace expires, so a
+        standalone one still gets through.
         """
         if incident.severity is not Severity.CRITICAL:
             logger.info(
@@ -558,9 +579,63 @@ class NotificationRouter:
                 incident.severity.value,
             )
             return False
-        return self.notify(
-            render_alert(incident, persona=self.persona), severity=incident.severity
+
+        message = render_alert(incident, persona=self.persona)
+        if self.critical_grace_seconds <= 0:
+            return self.notify(message, severity=Severity.CRITICAL)
+
+        self._defer_alert(incident.id, message)
+        return False
+
+    # -- deferral ---------------------------------------------------------
+
+    def _defer_alert(self, incident_id: str, message: str) -> None:
+        """Hold a CRITICAL alert, so an escalation can supersede it."""
+        with self._alert_lock:
+            existing = self._deferred.pop(incident_id, None)
+            if existing is not None:
+                existing.cancel()
+            timer = self._scheduler(
+                self.critical_grace_seconds,
+                lambda: self._send_deferred(incident_id, message),
+            )
+            self._deferred[incident_id] = timer
+        timer.daemon = True
+        timer.start()
+        logger.info(
+            "incident %s: holding the CRITICAL alert for %.0fs in case it escalates",
+            incident_id,
+            self.critical_grace_seconds,
         )
+
+    def _send_deferred(self, incident_id: str, message: str) -> None:
+        """Nothing superseded it, so the owner hears about it after all."""
+        with self._alert_lock:
+            self._deferred.pop(incident_id, None)
+        self.notify(message, severity=Severity.CRITICAL)
+
+    def _supersede(self, incident_id: str) -> bool:
+        """Drop a held alert because a better message is going out instead."""
+        with self._alert_lock:
+            timer = self._deferred.pop(incident_id, None)
+        if timer is None:
+            return False
+        timer.cancel()
+        logger.info(
+            "incident %s: the escalation supersedes the CRITICAL alert", incident_id
+        )
+        return True
+
+    def flush(self) -> None:
+        """Send every held alert now. For shutdown, and for tests."""
+        with self._alert_lock:
+            timers = list(self._deferred.items())
+            self._deferred.clear()
+        for _incident_id, timer in timers:
+            timer.cancel()
+            function = getattr(timer, "function", None)
+            if callable(function):
+                function()
 
     def progress(self, incident: Incident, *, attempt: int, max_attempts: int) -> bool:
         """Silent. A repair being under way is not news; its outcome is."""
@@ -613,7 +688,11 @@ class NotificationRouter:
 
         Always sent at CRITICAL regardless of the incident's own severity: an
         escalation the owner never sees is the same as no escalation.
+
+        Supersedes any CRITICAL alert still being held for this incident. Both
+        describe the same event; this one also says what to do about it.
         """
+        self._supersede(incident.id)
         return self.notify(
             render_human_required(
                 incident,
@@ -706,7 +785,11 @@ class NotificationRouter:
         CRITICAL unconditionally. The rate limiter lets CRITICAL through by
         design, and this is the message that exists for that exemption: the
         change is live, unreviewed, and unproven.
+
+        Supersedes a held alert for the same incident, for the same reason the
+        escalation does.
         """
+        self._supersede(incident.id)
         return self.notify(
             render_post_merge_failed(
                 incident, record=record, result=result, persona=self.persona

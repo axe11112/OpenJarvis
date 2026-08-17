@@ -2,28 +2,25 @@
  *
  * Three things here are worth knowing before changing anything.
  *
- * 1. Audio is captured as raw PCM through an AudioWorklet and encoded to a
- *    16 kHz mono WAV in this file. The obvious alternative, MediaRecorder,
- *    produces WebM/Opus, which whisper.cpp cannot read — decoding it would put
- *    ffmpeg on the Mac. Encoding a WAV here is about sixty lines and adds no
- *    dependency to the machine that has to stay up.
+ * 1. Recording goes through MediaRecorder, and the Mac converts whatever
+ *    container comes back. The previous version encoded 16 kHz WAV here from
+ *    raw Web Audio samples, to spare the Mac a decoder; on a real iPhone,
+ *    inside an installed PWA, that graph delivered empty buffers and every
+ *    utterance silently uploaded nothing. One decoder on the Mac is worth more
+ *    than clever DSP that only works in the browsers you tested.
  *
- * 2. A turn is push-to-talk by default, with automatic end-of-speech detection
- *    while the button is held. The operator is often outdoors, in a room with a
- *    television, or on a phone held loosely; a system that decides on its own
+ * 2. A turn is push-to-talk. The operator is often outdoors, in a room with a
+ *    television, or holding the phone loosely; a system that decides for itself
  *    when speech began is a system that transcribes the television.
  *
- * 3. Every failure is recoverable in place. A session that expires while the
- *    phone was asleep answers 409 with `reconnect: true`, and this file picks
- *    the call back up rather than leaving a dead screen.
+ * 3. Nothing fails silently, ever. Every path that ends without an upload says
+ *    so on screen — that was the whole difference between "Sir is broken" and
+ *    "hold the button a little longer".
  */
 (() => {
   "use strict";
 
   const TOKEN = document.body.dataset.controlToken;
-  const SAMPLE_RATE = 16000;
-  const SILENCE_RMS = 0.012;        // below this counts as quiet
-  const SILENCE_MS = 900;           // quiet for this long ends a turn
   const MAX_UTTERANCE_MS = 20000;   // hard stop, so a stuck button cannot run on
 
   const el = (id) => document.getElementById(id);
@@ -33,13 +30,12 @@
   const transcript = el("transcript");
 
   let sessionId = null;
-  let audioCtx = null;
   let stream = null;
-  let capture = null;
+  let recorder = null;
   let chunks = [];
   let recording = false;
-  let silenceSince = 0;
   let startedAt = 0;
+  let maxTimer = null;
 
   /* ---------------------------------------------------------------- api */
 
@@ -71,63 +67,46 @@
     audio.play().catch(() => URL.revokeObjectURL(url));
   }
 
-  /* --------------------------------------------------------- wav encode */
+  /* ------------------------------------------------------------ capture
+   *
+   * MediaRecorder, not Web Audio.
+   *
+   * The first version encoded WAV here from raw ScriptProcessor samples, to
+   * spare the Mac a decoder. On a real iPhone, inside an installed PWA, that
+   * graph delivers empty buffers: every utterance produced zero chunks, the
+   * upload was skipped, and the call looked alive while hearing nothing.
+   *
+   * MediaRecorder is the one recording path every browser genuinely supports.
+   * It hands back its own container — audio/mp4 on iOS, audio/webm on Chrome —
+   * and the Mac normalises it. One decoder there beats per-browser DSP here.
+   */
 
-  function encodeWav(buffers, sampleRate) {
-    let length = 0;
-    for (const b of buffers) length += b.length;
-    const wav = new ArrayBuffer(44 + length * 2);
-    const view = new DataView(wav);
-    const ascii = (offset, text) => {
-      for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
-    };
-    ascii(0, "RIFF");
-    view.setUint32(4, 36 + length * 2, true);
-    ascii(8, "WAVEfmt ");
-    view.setUint32(16, 16, true);          // PCM header size
-    view.setUint16(20, 1, true);           // PCM
-    view.setUint16(22, 1, true);           // mono
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, sampleRate * 2, true);
-    view.setUint16(32, 2, true);
-    view.setUint16(34, 16, true);          // bits per sample
-    ascii(36, "data");
-    view.setUint32(40, length * 2, true);
-
-    let offset = 44;
-    for (const buffer of buffers) {
-      for (let i = 0; i < buffer.length; i++, offset += 2) {
-        const sample = Math.max(-1, Math.min(1, buffer[i]));
-        view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
-      }
+  function pickMimeType() {
+    // Ordered by what decodes most reliably on the Mac. Safari ignores the
+    // option entirely and returns mp4 regardless, which is fine — the server
+    // sniffs the real container from the bytes rather than trusting a label.
+    const candidates = [
+      "audio/mp4",
+      "audio/mp4;codecs=mp4a.40.2",
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+    ];
+    if (typeof MediaRecorder === "undefined") return "";
+    for (const type of candidates) {
+      if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(type)) return type;
     }
-    return new Blob([wav], { type: "audio/wav" });
+    return "";
   }
-
-  function downsample(input, from, to) {
-    if (to >= from) return input;
-    const ratio = from / to;
-    const out = new Float32Array(Math.floor(input.length / ratio));
-    for (let i = 0; i < out.length; i++) {
-      // Average the source window rather than picking one sample: plain
-      // decimation aliases, and aliased speech transcribes badly.
-      const start = Math.floor(i * ratio);
-      const end = Math.min(input.length, Math.floor((i + 1) * ratio));
-      let sum = 0;
-      for (let j = start; j < end; j++) sum += input[j];
-      out[i] = end > start ? sum / (end - start) : 0;
-    }
-    return out;
-  }
-
-  /* ------------------------------------------------------------ capture */
 
   async function ensureMic() {
     if (stream) return true;
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      state.textContent = "this browser will not give me the microphone here";
-      el("footnote").textContent =
-        "A microphone needs a secure page. Open Sir over https on your Tailscale name.";
+      fail("This page cannot use the microphone. Open Sir over https on your Tailscale name.");
+      return false;
+    }
+    if (typeof MediaRecorder === "undefined") {
+      fail("This browser cannot record audio. Use Safari on iOS, or Chrome.");
       return false;
     }
     try {
@@ -135,58 +114,97 @@
         audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 },
       });
     } catch (err) {
-      state.textContent = "I need permission to use the microphone";
+      // Distinguish "said no" from "no microphone here", because the fix is
+      // different and the operator is holding a phone in the dark.
+      fail(
+        err && err.name === "NotAllowedError"
+          ? "I need permission to use the microphone. Allow it in Settings and try again."
+          : "I could not open the microphone: " + ((err && err.name) || "unknown error")
+      );
       return false;
     }
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    const source = audioCtx.createMediaStreamSource(stream);
-    // ScriptProcessor is deprecated but universally available, including on
-    // the iOS Safari versions this has to run on. The AudioWorklet path needs
-    // a separate module file for no behavioural gain at this buffer size.
-    capture = audioCtx.createScriptProcessor(4096, 1, 1);
-    capture.onaudioprocess = (event) => {
-      if (!recording) return;
-      const input = event.inputBuffer.getChannelData(0);
-      chunks.push(downsample(new Float32Array(input), audioCtx.sampleRate, SAMPLE_RATE));
-
-      let sum = 0;
-      for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
-      const rms = Math.sqrt(sum / input.length);
-      const now = performance.now();
-      if (rms > SILENCE_RMS) silenceSince = now;
-      if (now - silenceSince > SILENCE_MS && now - startedAt > 1200) stopTurn();
-      if (now - startedAt > MAX_UTTERANCE_MS) stopTurn();
-    };
-    source.connect(capture);
-    capture.connect(audioCtx.destination);
     return true;
+  }
+
+  function fail(message) {
+    state.textContent = message;
+    say("sir", message, "line--note");
   }
 
   async function startTurn() {
     if (recording || !sessionId) return;
     if (!(await ensureMic())) return;
-    if (audioCtx.state === "suspended") await audioCtx.resume();
+
+    const mimeType = pickMimeType();
+    try {
+      recorder = mimeType
+        ? new MediaRecorder(stream, { mimeType })
+        : new MediaRecorder(stream);
+    } catch (err) {
+      fail("This browser refused to start recording.");
+      return;
+    }
+
     chunks = [];
+    recorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) chunks.push(event.data);
+    };
+    recorder.onerror = () => fail("The recording stopped unexpectedly.");
+    recorder.onstop = uploadTurn;
+
+    // A timeslice means data arrives during the recording rather than only at
+    // the end, so a tab suspended mid-utterance still yields what it captured.
+    recorder.start(250);
     recording = true;
-    startedAt = silenceSince = performance.now();
+    startedAt = performance.now();
     el("talk-label").textContent = "listening…";
     document.body.classList.add("listening");
+
+    clearTimeout(maxTimer);
+    maxTimer = setTimeout(() => { if (recording) stopTurn(); }, MAX_UTTERANCE_MS);
   }
 
-  async function stopTurn() {
+  function stopTurn() {
     if (!recording) return;
     recording = false;
+    clearTimeout(maxTimer);
     document.body.classList.remove("listening");
     el("talk-label").textContent = "Hold to talk";
+    const heldFor = performance.now() - startedAt;
+    try {
+      recorder.stop();
+    } catch (err) {
+      fail("I could not finish the recording.");
+      return;
+    }
+    if (heldFor < 400) {
+      // Almost certainly a tap rather than a hold. Say so: silence here is
+      // what made this feel broken rather than merely fiddly.
+      state.textContent = "hold the button while you speak";
+    }
+  }
+
+  async function uploadTurn() {
     const captured = chunks;
     chunks = [];
-    if (!captured.length) return;
+    const type = (recorder && recorder.mimeType) || "application/octet-stream";
+    if (!captured.length) {
+      // Never silent. This is exactly the case that made every iPhone
+      // utterance vanish without a word.
+      fail("I did not get any audio from the microphone. Try holding the button longer.");
+      return;
+    }
+
+    const blob = new Blob(captured, { type });
+    if (blob.size < 2000) {
+      fail("That was too short for me to hear. Hold the button while you speak.");
+      return;
+    }
 
     state.textContent = "thinking…";
-    const wav = encodeWav(captured, SAMPLE_RATE);
     const { status, payload } = await api(
       `/api/voice/utterance?id=${encodeURIComponent(sessionId)}`,
-      { method: "POST", body: wav, type: "audio/wav" }
+      { method: "POST", body: blob, type }
     );
     await handleTurn(status, payload);
   }
@@ -236,8 +254,15 @@
     }
     sessionId = null;
     recording = false;
+    clearTimeout(maxTimer);
+    // Stopping the tracks is what turns the recording indicator off. Leaving
+    // them live would keep the microphone lit after the call ended, which is
+    // both alarming and true.
+    if (recorder && recorder.state !== "inactive") {
+      try { recorder.stop(); } catch (_) { /* already stopping */ }
+    }
+    recorder = null;
     if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
-    if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
     state.textContent = "call ended";
   }
 
@@ -278,7 +303,13 @@
   /* -------------------------------------------------------------- wire */
 
   el("answer").addEventListener("click", answer);
-  el("decline").addEventListener("click", () => { ringing.hidden = true; endCall(); });
+  el("decline").addEventListener("click", async () => {
+    ringing.hidden = true;
+    // Tell the Mac, so the cooldown is honoured. A decline that only closes a
+    // screen means the next watcher tick rings again in sixty seconds.
+    await api("/api/voice/decline", { method: "POST" });
+    endCall();
+  });
   el("hangup").addEventListener("click", () => endCall());
 
   const talk = el("talk");
@@ -362,6 +393,54 @@
       .catch(() => {});
   }
 
+  /* ----------------------------------------------------------- health */
+
+  async function refreshHealth() {
+    const { payload } = await api("/api/voice/health");
+    const list = el("health-list");
+    if (!list || !payload.parts) return;
+    list.innerHTML = "";
+
+    const row = (label, state, detail) => {
+      const li = document.createElement("li");
+      const name = document.createElement("span");
+      name.textContent = label;
+      const value = document.createElement("b");
+      value.textContent = state;
+      // Anything not plainly good reads as a warning, UNKNOWN included: an
+      // unchecked component must never look healthy.
+      value.className = ["READY", "REGISTERED", "REACHABLE", "ONLINE"].includes(state)
+        ? "ok"
+        : "warn";
+      li.appendChild(name);
+      li.appendChild(value);
+      if (detail) li.title = detail;
+      list.appendChild(li);
+    };
+
+    row("Voice", payload.voice, "");
+    for (const [key, part] of Object.entries(payload.parts)) {
+      row(key.replace(/_/g, " "), part.state, part.detail);
+    }
+  }
+
+  el("test-call").addEventListener("click", async () => {
+    const button = el("test-call");
+    button.disabled = true;
+    button.textContent = "ringing…";
+    const { status, payload } = await api("/api/voice/test-call", { method: "POST" });
+    button.textContent =
+      status === 200
+        ? `rang ${payload.call.push_delivered} phone(s)`
+        : payload.error || "could not ring";
+    setTimeout(() => {
+      button.disabled = false;
+      button.textContent = "Test call";
+    }, 4000);
+  });
+
+  refreshHealth();
+  setInterval(refreshHealth, 30000);
   refreshPending();
   // Opened from a notification: skip the ringing screen only if asked to.
   if (new URLSearchParams(location.search).get("answer") === "1") answer();

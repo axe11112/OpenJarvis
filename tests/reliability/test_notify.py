@@ -331,7 +331,7 @@ class TestIncidentHelpers:
         return NotificationRouter(notifier=notifier, **kwargs), notifier
 
     def test_a_critical_incident_alerts(self):
-        router, notifier = self._router()
+        router, notifier = self._router(critical_grace_seconds=0)
         assert router.alert(_incident(severity=Severity.CRITICAL))
         _assert_owner_readable(notifier.sent[0])
 
@@ -363,9 +363,130 @@ class TestIncidentHelpers:
 
     @pytest.mark.parametrize("persona", [True, False])
     def test_persona_flag_is_honoured(self, persona):
-        router, notifier = self._router(persona=persona)
+        router, notifier = self._router(persona=persona, critical_grace_seconds=0)
         router.alert(_incident(severity=Severity.CRITICAL))
         assert ("Sir," in notifier.sent[0]) is persona
+
+
+# ---------------------------------------------------------------------------
+# One event, one message
+# ---------------------------------------------------------------------------
+
+
+class _ManualTimer:
+    """A threading.Timer stand-in that only fires when a test says so."""
+
+    created: list = []
+
+    def __init__(self, delay, function):
+        self.delay = delay
+        self.function = function
+        self.cancelled = False
+        self.daemon = False
+        _ManualTimer.created.append(self)
+
+    def start(self):
+        return None
+
+    def cancel(self):
+        self.cancelled = True
+
+    def fire(self):
+        if not self.cancelled:
+            self.function()
+
+
+class TestCriticalAndEscalationAreOneEvent:
+    """A CRITICAL that immediately escalates must not be told twice.
+
+    Both messages describe the same thing seconds apart; the escalation is
+    strictly more useful because it says what the owner has to do. So the alert
+    is held briefly and dropped when the escalation arrives — but a CRITICAL
+    that nothing supersedes must still get through, which is the other half of
+    the requirement and the easier half to break.
+    """
+
+    def _router(self, **kwargs):
+        _ManualTimer.created = []
+        notifier = ConsoleNotifier()
+        return (
+            NotificationRouter(
+                notifier=notifier,
+                min_severity=Severity.LOW,
+                dedup_window_seconds=0,
+                clock=_FakeClock(),
+                scheduler=_ManualTimer,
+                **kwargs,
+            ),
+            notifier,
+        )
+
+    def test_an_immediate_escalation_replaces_the_alert(self):
+        router, notifier = self._router()
+        incident = _incident(severity=Severity.CRITICAL)
+
+        router.alert(incident)
+        assert notifier.sent == [], "the alert waits to see what happens next"
+
+        router.human_required(
+            incident, reason="attempts exhausted", attempts=3, max_attempts=3
+        )
+        # The held timer must have been cancelled, not merely ignored.
+        assert all(t.cancelled for t in _ManualTimer.created)
+        for timer in _ManualTimer.created:
+            timer.fire()
+
+        assert len(notifier.sent) == 1, f"expected one message, got {notifier.sent}"
+        assert "I need your help" in notifier.sent[0]
+
+    def test_a_standalone_critical_still_notifies(self):
+        """The half that is easy to break while fixing the duplicate."""
+        router, notifier = self._router()
+        router.alert(_incident(severity=Severity.CRITICAL))
+        assert notifier.sent == []
+
+        for timer in _ManualTimer.created:
+            timer.fire()
+
+        assert len(notifier.sent) == 1
+        assert "something serious happened" in notifier.sent[0]
+
+    def test_a_post_merge_failure_also_supersedes_the_alert(self):
+        router, notifier = self._router()
+        incident = _incident(severity=Severity.CRITICAL)
+        record = type("M", (), {"pr_number": 210, "merge_commit_sha": "e" * 40})()
+        result = _result(verified=False, rule="fleet_failed")
+
+        router.alert(incident)
+        router.post_merge_failed(incident, record=record, result=result)
+        for timer in _ManualTimer.created:
+            timer.fire()
+
+        assert len(notifier.sent) == 1
+        assert "I need your help" in notifier.sent[0]
+
+    def test_escalating_a_different_incident_does_not_swallow_the_alert(self):
+        """Superseding is per incident. Two genuinely separate problems are two
+        messages, and collapsing them would hide one."""
+        router, notifier = self._router()
+        first = _incident(severity=Severity.CRITICAL, id="INC-00001")
+        second = _incident(severity=Severity.CRITICAL, id="INC-00002")
+
+        router.alert(first)
+        router.human_required(
+            second, reason="attempts exhausted", attempts=3, max_attempts=3
+        )
+        for timer in _ManualTimer.created:
+            timer.fire()
+
+        assert len(notifier.sent) == 2
+
+    def test_flush_sends_anything_still_held(self):
+        """A shutdown must not swallow a CRITICAL that was merely waiting."""
+        router, notifier = self._router()
+        router.alert(_incident(severity=Severity.CRITICAL))
+        router.flush()
+        assert len(notifier.sent) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -104,12 +104,23 @@ class VoiceCommands:
 
     def handle(self, match: IntentMatch) -> CommandResult:
         """Act on one interpreted utterance."""
+        if match.ambiguous:
+            # Two readings fitted equally well. Asking costs a second; choosing
+            # is how a voice interface eventually chooses the one that acts.
+            return self._record(
+                CommandResult(
+                    speech="Sorry — did you want the status, or something else?",
+                    intent="",
+                    risk="",
+                )
+            )
+
         if not match.understood:
             return self._record(
                 CommandResult(
                     speech=(
-                        "Sir, I didn't catch that. You can ask me for the status, "
-                        "what happened, or to run a diagnostic."
+                        "Sorry, I didn't catch that. You can ask how things are, "
+                        "what happened, or tell me to run a diagnostic."
                     ),
                     intent="",
                     risk="",
@@ -119,11 +130,30 @@ class VoiceCommands:
         intent = match.intent
         assert intent is not None  # narrowed by `understood`
 
+        if intent.risk is Risk.FORBIDDEN:
+            return self._record(self._forbid(intent, match))
         if intent.risk is Risk.CONFIRM:
             return self._record(self._refuse(intent, match))
         if intent.risk is Risk.SAFE:
             return self._record(self._operate(intent, match))
         return self._record(self._read(intent, match))
+
+    # -- FORBIDDEN ---------------------------------------------------------
+
+    def _forbid(self, intent: Intent, _match: IntentMatch) -> CommandResult:
+        """Refuse, record, and create nothing.
+
+        No pending confirmation, deliberately. These are not requests a human
+        might reasonably approve later; queuing one would put "disable the
+        audit log" in a list somebody clears without reading.
+        """
+        logger.warning("voice: refused a forbidden request: %s", intent.name)
+        return CommandResult(
+            speech=f"No. I won't {intent.description or 'do that'}.",
+            intent=intent.name,
+            risk=intent.risk.value,
+            executed=False,
+        )
 
     # -- READ -------------------------------------------------------------
 

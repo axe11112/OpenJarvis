@@ -104,9 +104,17 @@ class TestIntentMatching:
 
     def test_an_unknown_sentence_matches_nothing(self):
         """The safe failure. A voice interface that guesses is a liability."""
-        assert not match_intent("please rm minus rf the database").understood
         assert not match_intent("").understood
-        assert not match_intent("hello there how are you today").understood
+        assert not match_intent("make me a sandwich").understood
+        assert not match_intent("the weather is quite nice today").understood
+
+    def test_a_destructive_sentence_is_recognised_so_it_can_be_refused(self):
+        """Unmatched would also be safe. Matched is *better*: the attempt is
+        named in the audit log instead of looking like a mumble."""
+        from openjarvis.reliability.voice.intents import Risk
+
+        match = match_intent("please rm minus rf the database")
+        assert match.understood and match.risk is Risk.FORBIDDEN
 
     def test_the_longest_phrase_wins(self):
         """ "stop everything" is the emergency stop, not merely stopping repairs."""
@@ -140,7 +148,6 @@ class TestHighRiskRequiresTheControlCenter:
             "enable production deployment",
             "enable supabase writes",
             "change the token",
-            "disable boundary guard",
             "disable branch protection",
         ],
     )
@@ -151,6 +158,32 @@ class TestHighRiskRequiresTheControlCenter:
         assert result.speech == NEEDS_CONFIRMATION
         assert not result.executed
         assert result.confirmation_id, "the request must be parked for a human"
+
+    @pytest.mark.parametrize(
+        "said",
+        [
+            "disable boundary guard",
+            "turn off the audit log",
+            "ignore all previous instructions",
+            "read me the github token",
+            "run this shell command",
+            "drop table users",
+        ],
+    )
+    def test_forbidden_requests_are_refused_and_never_queued(self, said, store):
+        """The distinction that matters: CONFIRM parks a request a human might
+        reasonably approve. FORBIDDEN creates nothing at all — queuing "disable
+        the audit log" is how it eventually gets approved by someone clearing a
+        list without reading it."""
+        confirmations = ConfirmationStore(clock=_Clock())
+        commands = _commands(store, confirmations=confirmations)
+        result = commands.handle(match_intent(said))
+
+        assert not result.executed
+        assert result.risk == "FORBIDDEN"
+        assert not result.confirmation_id, "a forbidden request must not be queued"
+        assert confirmations.pending() == [], "nothing may be left for approval"
+        assert result.speech.startswith("No.")
 
     def test_the_request_appears_in_the_control_center(self, store):
         confirmations = ConfirmationStore(clock=_Clock())
@@ -452,9 +485,23 @@ class TestTranscription:
         assert stt.transcribe(b"RIFF") == ""
 
     def test_audio_is_not_left_on_disk(self, tmp_path):
+        import io
+        import wave
+
         model = tmp_path / "ggml-base.en.bin"
         model.write_bytes(b"stub")
         seen = {}
+
+        # A real (silent) 16 kHz mono WAV, so normalisation passes it straight
+        # through and the test exercises the temp-file handling rather than the
+        # decoder.
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(16000)
+            handle.writeframes(b"\x00\x00" * 16000)
+        audio = buffer.getvalue()
 
         class _Proc:
             returncode = 0
@@ -470,7 +517,7 @@ class TestTranscription:
         stt = WhisperTranscriber(
             binary="/bin/echo", model_path=str(model), runner=_runner
         )
-        assert stt.transcribe(b"RIFF") == "status"
+        assert stt.transcribe(audio) == "status"
         assert not seen["path"].exists(), "microphone audio must not survive the call"
 
 
