@@ -1827,7 +1827,7 @@ def _build_voice(config: Any, store: Any, console: Any, access: Any) -> Any:
         fallback=_fallback,
         audit=audit,
     )
-    return VoiceEndpoints(
+    endpoints = VoiceEndpoints(
         sessions=sessions,
         confirmations=confirmations,
         push=push,
@@ -1844,6 +1844,19 @@ def _build_voice(config: Any, store: Any, console: Any, access: Any) -> Any:
         ),
         audit=audit,
     )
+
+    # The only thing that decides to ring, and it lives here rather than in the
+    # watcher on purpose: kill voice entirely and JARVIS keeps monitoring,
+    # repairing and messaging exactly as before.
+    from openjarvis.reliability.voice.trigger import CallTrigger
+    from openjarvis.reliability.voice.watchdog import CallWatchdog
+
+    watchdog = CallWatchdog(
+        store=store, trigger=CallTrigger(), calls=calls, endpoints=endpoints
+    )
+    watchdog.start()
+    endpoints.watchdog = watchdog
+    return endpoints
 
 
 def _live_diagnostic(config: Any, store: Any) -> Any:

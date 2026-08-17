@@ -70,6 +70,9 @@ class VoiceEndpoints:
     calls: Any = None
     #: Optional health reporter, for the Control Center's voice panel.
     health: Any = None
+    #: Optional :class:`~openjarvis.reliability.voice.watchdog.CallWatchdog`,
+    #: held only so it can be stopped cleanly on shutdown.
+    watchdog: Any = None
     _lock: Any = None
 
     def __post_init__(self) -> None:

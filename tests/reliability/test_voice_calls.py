@@ -350,3 +350,135 @@ class TestVoiceHealth:
             tailscale_runner=_explode,
         )
         assert health.tailscale()["state"] == "UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# Noticing that a call is warranted
+# ---------------------------------------------------------------------------
+
+
+class _Store:
+    def __init__(self, incidents=()):
+        self.incidents = list(incidents)
+        self.reads = 0
+
+    def list(self, **_kw):
+        self.reads += 1
+        return list(self.incidents)
+
+
+def _incident(**overrides):
+    from openjarvis.reliability.types import Incident, IncidentState, Severity
+
+    fields = dict(
+        fingerprint="fp",
+        severity=Severity.HIGH,
+        component="authentication",
+        title="Login broken",
+        id="INC-1",
+        state=IncidentState.DETECTED,
+    )
+    fields.update(overrides)
+    state = fields.pop("state")
+    incident = Incident(**fields)
+    incident.state = state
+    return incident
+
+
+def _watchdog(incidents, **kwargs):
+    from openjarvis.reliability.voice.trigger import CallTrigger
+    from openjarvis.reliability.voice.watchdog import CallWatchdog
+
+    calls = kwargs.pop("calls", None) or _orchestrator()
+    return CallWatchdog(
+        store=_Store(incidents),
+        trigger=kwargs.pop("trigger", None) or CallTrigger(clock=_Clock()),
+        calls=calls,
+        **kwargs,
+    )
+
+
+class TestCallWatchdog:
+    def test_an_ordinary_incident_never_rings(self):
+        """The overwhelmingly common case, on every tick, forever."""
+        from openjarvis.reliability.types import IncidentState
+
+        watchdog = _watchdog([_incident(state=IncidentState.FIXING)])
+        assert watchdog.tick() is None
+
+    def test_a_resolved_incident_never_rings(self):
+        from openjarvis.reliability.types import IncidentState, Severity
+
+        watchdog = _watchdog(
+            [_incident(state=IncidentState.RESOLVED, severity=Severity.CRITICAL)]
+        )
+        assert watchdog.tick() is None
+
+    def test_a_post_merge_failure_rings(self):
+        from openjarvis.reliability.types import IncidentState
+
+        incident = _incident(state=IncidentState.HUMAN_REQUIRED)
+        incident.metadata["post_merge_failure"] = {"reason": "still red"}
+        watchdog = _watchdog([incident])
+
+        call = watchdog.tick()
+        assert call is not None
+        assert call.incident_id == "INC-1"
+        assert "still fails" in call.detail
+
+    def test_it_does_not_ring_again_on_the_next_tick(self):
+        """The whole reason this is polled rather than pushed."""
+        from openjarvis.reliability.types import IncidentState
+
+        incident = _incident(state=IncidentState.HUMAN_REQUIRED)
+        incident.metadata["post_merge_failure"] = {"reason": "still red"}
+        watchdog = _watchdog([incident])
+
+        assert watchdog.tick() is not None
+        watchdog.calls.answered()  # clear the active call, not the trigger
+        assert watchdog.tick() is None, "one call per incident, not one per tick"
+
+    def test_a_broken_store_does_not_stop_the_loop(self):
+        class _Broken:
+            def list(self, **_kw):
+                raise RuntimeError("database gone")
+
+        watchdog = _watchdog([])
+        watchdog.store = _Broken()
+        assert watchdog.tick() is None
+
+    def test_a_high_severity_escalation_with_nothing_live_does_not_ring(self):
+        """A repair that gave up before touching production is a message, not a
+        call. The operator can read it in the morning."""
+        from openjarvis.reliability.types import IncidentState, Severity
+
+        watchdog = _watchdog(
+            [_incident(state=IncidentState.HUMAN_REQUIRED, severity=Severity.HIGH)]
+        )
+        assert watchdog.tick() is None
+
+    def test_the_detail_is_plain_english(self):
+        from openjarvis.reliability.types import IncidentState, Severity
+
+        incident = _incident(
+            state=IncidentState.HUMAN_REQUIRED, severity=Severity.CRITICAL
+        )
+        watchdog = _watchdog([incident])
+        call = watchdog.tick()
+
+        assert call is not None
+        assert "Login" in call.detail
+        assert "authentication" not in call.detail
+        assert "HUMAN_REQUIRED" not in call.detail
+
+    def test_the_reliability_core_does_not_import_voice(self):
+        """The architectural rule, asserted rather than hoped for: a microphone
+        must never be able to break the repair loop."""
+        import pathlib
+
+        core = pathlib.Path("src/openjarvis/reliability")
+        for name in ("repair.py", "watch.py", "detector.py", "merge.py", "store.py"):
+            source = (core / name).read_text()
+            assert "voice" not in source.replace("invoice", ""), (
+                f"{name} must not depend on the voice subsystem"
+            )
