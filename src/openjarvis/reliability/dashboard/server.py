@@ -417,7 +417,10 @@ def _make_handler(server: ControlCenterServer) -> type:
                     return
                 body = self._read_body(_MAX_VOICE_BODY)
                 status, payload = server.voice.handle_post(
-                    path, body, parse_qs(parsed.query)
+                    path,
+                    body,
+                    parse_qs(parsed.query),
+                    device=self.headers.get("User-Agent", "")[:200],
                 )
                 return self._json(HTTPStatus(status), payload)
 

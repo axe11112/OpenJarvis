@@ -70,6 +70,11 @@ class VoiceEndpoints:
     calls: Any = None
     #: Optional health reporter, for the Control Center's voice panel.
     health: Any = None
+    #: Optional :class:`~openjarvis.reliability.voice.microphone.MicrophoneRecord`.
+    #: Every utterance that arrives here came from a real device over the
+    #: network, which makes this the only place in the system qualified to say
+    #: whether the microphone path actually works.
+    microphone: Any = None
     #: Optional :class:`~openjarvis.reliability.voice.watchdog.CallWatchdog`,
     #: held only so it can be stopped cleanly on shutdown.
     watchdog: Any = None
@@ -124,14 +129,18 @@ class VoiceEndpoints:
         return 404, {"error": "no such route"}
 
     def handle_post(
-        self, path: str, body: bytes, query: Dict[str, Any]
+        self, path: str, body: bytes, query: Dict[str, Any], device: str = ""
     ) -> Tuple[int, Dict[str, Any]]:
         """Answer a state-changing route. The caller has already checked the
-        control token; this never re-decides authorisation, only what to do."""
+        control token; this never re-decides authorisation, only what to do.
+
+        ``device`` is the caller's user agent, used for nothing except naming
+        which phone was heard in the microphone panel.
+        """
         if path == "/api/voice/answer":
             return self._answer()
         if path == "/api/voice/utterance":
-            return self._utterance(str((query.get("id") or [""])[0]), body)
+            return self._utterance(str((query.get("id") or [""])[0]), body, device)
         if path == "/api/voice/text":
             return self._text(str((query.get("id") or [""])[0]), body)
         if path == "/api/voice/hangup":
@@ -228,7 +237,9 @@ class VoiceEndpoints:
             "transcript": session.transcript(),
         }
 
-    def _utterance(self, session_id: str, body: bytes) -> Tuple[int, Dict[str, Any]]:
+    def _utterance(
+        self, session_id: str, body: bytes, device: str = ""
+    ) -> Tuple[int, Dict[str, Any]]:
         """One turn of the conversation, from audio."""
         if len(body) > MAX_UTTERANCE_BYTES:
             return 413, {"error": "that utterance is too long"}
@@ -239,8 +250,31 @@ class VoiceEndpoints:
             # precisely enough that the page can pick up again by itself.
             return 409, {"error": "the call has ended", "reconnect": True}
         turn = session.hear(body)
+        self._record_microphone(session, turn, device)
         self._audit("turn", {"session": session_id, **turn.to_dict()})
         return 200, self._turn_payload(session, turn)
+
+    def _record_microphone(self, session: Any, turn: Any, device: str) -> None:
+        """Note whether the phone was actually heard.
+
+        Wrapped because a bookkeeping failure must never cost the owner their
+        answer: the turn has already happened and the reply is already spoken.
+        """
+        if self.microphone is None:
+            return
+        try:
+            diagnosis = dict(getattr(session, "last_audio", {}) or {})
+            self.microphone.observe(
+                # The *cleaned* transcript deliberately. Whisper emits
+                # "[BLANK_AUDIO]" for silence, and counting that as words heard
+                # would let an empty room certify the microphone.
+                transcript=str(turn.heard or ""),
+                diagnosis=diagnosis,
+                device=device,
+                source="device",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("voice: could not record the microphone result")
 
     def _text(self, session_id: str, body: bytes) -> Tuple[int, Dict[str, Any]]:
         """The same turn, typed. Useful in a room where speaking is impossible,

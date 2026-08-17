@@ -38,6 +38,12 @@ from openjarvis.reliability.events import (
     RELIABILITY_REPAIR_ATTEMPT_START,
     RELIABILITY_VERIFICATION,
 )
+from openjarvis.reliability.playbook import (
+    IncidentHistory,
+    build_handover,
+    classify_cause,
+    next_strategy,
+)
 from openjarvis.reliability.policy import SafetyPolicy
 from openjarvis.reliability.probes.spec import ProbeSpec
 from openjarvis.reliability.scope import (
@@ -244,6 +250,37 @@ class RepairLoop:
             )
 
         gate = self.policy.may_attempt_repair(incident)
+        if not gate and not gate.needs_human:
+            # Refused, but nobody is needed: repair is switched off, the
+            # severity is outside what JARVIS may write code for, or a human
+            # already owns it. The incident stays open and watched — a probe
+            # that starts passing will close it — and no one is woken.
+            #
+            # This branch is the fix for the specific behaviour the owner saw:
+            # a login page that answered correctly in 41 seconds became
+            # HUMAN_REQUIRED one second after it was detected, having never been
+            # looked at, because "JARVIS may not repair this" was being read as
+            # "a person must deal with this".
+            logger.info(
+                "Incident %s: no repair (%s); leaving it open and watched",
+                incident.id,
+                gate.reason,
+            )
+            self._add_note(
+                incident,
+                "No automatic repair",
+                content=(
+                    f"{gate.reason}\n\n"
+                    "The incident stays open and monitored. It will close by "
+                    "itself if the check starts passing again."
+                ),
+            )
+            return RepairOutcome(
+                resolved=False,
+                attempts=incident.attempts_used,
+                final_state=incident.state,
+                reason=gate.reason,
+            )
         if not gate:
             self._escalate(incident, gate.reason)
             return RepairOutcome(
@@ -255,11 +292,37 @@ class RepairLoop:
 
         previous_failure = ""
         last_verification: Optional[VerificationResult] = None
+        history = IncidentHistory(store=self.store)
+        cause = classify_cause(incident)
 
         while incident.attempts_used < self.policy.max_attempts:
             attempt_number = incident.attempts_used + 1
+            # A different hypothesis every time. Three passes at one idea is one
+            # attempt with extra steps, and it was the shape of "Sir gives up
+            # too easily" from the inside: the loop ran out of permitted
+            # attempts without ever running out of ideas.
+            strategy = next_strategy(history.strategies_tried(incident), cause=cause)
+            if strategy is None:
+                reason = (
+                    "every hypothesis I have was tried and none of them held: "
+                    + ", ".join(history.strategies_tried(incident))
+                )
+                self._escalate(incident, reason)
+                return RepairOutcome(
+                    resolved=False,
+                    attempts=incident.attempts_used,
+                    final_state=incident.state,
+                    reason=reason,
+                    verification=last_verification,
+                )
+            logger.info(
+                "Incident %s attempt %d: working from the hypothesis that %s",
+                incident.id,
+                attempt_number,
+                strategy.hypothesis,
+            )
             attempt, verification, stop_reason = self._attempt(
-                incident, spec, attempt_number, previous_failure
+                incident, spec, attempt_number, previous_failure, strategy
             )
             last_verification = verification
 
@@ -303,10 +366,12 @@ class RepairLoop:
         spec: ProbeSpec,
         number: int,
         previous_failure: str,
+        strategy: Any = None,
     ) -> tuple[RepairAttempt, Optional[VerificationResult], str]:
         """Run one attempt. Returns (attempt, verification, stop_reason)."""
         branch = self._branch_name(incident)
         attempt = RepairAttempt(number=number, branch=branch, started_at=now_iso())
+        attempt.strategy = getattr(strategy, "key", "") or ""
         self._publish(RELIABILITY_REPAIR_ATTEMPT_START, incident, attempt=number)
         self._notify_progress(incident, number)
         worktree: Optional[Worktree] = None
@@ -319,6 +384,7 @@ class RepairLoop:
                     attempt=number,
                     max_attempts=self.policy.max_attempts,
                     previous_failure=previous_failure,
+                    strategy=strategy,
                     protected_paths=self.protected_paths,
                     test_command=self.test_command,
                 )
@@ -785,16 +851,51 @@ class RepairLoop:
         )
 
     def _escalate(
-        self, incident: Incident, reason: str, *, notify: bool = True
+        self,
+        incident: Incident,
+        reason: str,
+        *,
+        notify: bool = True,
+        result: Any = None,
     ) -> None:
-        """Stop touching code and hand the incident to a human.
+        """Stop touching code and hand the incident to a human — with a handover.
 
         ``notify=False`` is for callers that send their own, more specific
         message. The post-merge failure path is the only one: it has a CRITICAL
         notification naming the live deployment, and sending the generic
         escalation alongside it would tell the owner the same bad news twice.
+
+        The handover is assembled before anything is sent, and if it cannot be
+        filled in that fact is logged loudly. "3 repair attempts did not produce
+        a verified fix" is a true sentence that helps nobody at 3am; what is
+        owed is what failed, what was believed to be causing it, the evidence,
+        what was tried, why it did not work, and what is actually being asked.
         """
         logger.warning("Incident %s requires a human: %s", incident.id, reason)
+
+        handover = build_handover(
+            incident,
+            reason=reason,
+            max_attempts=self.policy.max_attempts,
+            history=IncidentHistory(store=self.store),
+            result=result,
+        )
+        if not handover.is_complete():
+            # Not fatal — refusing to escalate would be worse than escalating
+            # thinly — but it is a defect in this path and it is recorded as one
+            # rather than quietly shipped.
+            logger.error(
+                "Incident %s: the handover is missing %s; escalating anyway",
+                incident.id,
+                ", ".join(handover.missing()),
+            )
+        try:
+            incident.metadata["handover"] = handover.to_dict()
+            self.store.save(incident)
+        except Exception:  # noqa: BLE001
+            logger.exception("could not record the handover for %s", incident.id)
+        self._add_note(incident, "Handing over", content=handover.render())
+
         if incident.state is not IncidentState.HUMAN_REQUIRED:
             try:
                 self.store.transition(

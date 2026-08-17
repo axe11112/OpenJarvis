@@ -2,12 +2,18 @@
  *
  * Three things here are worth knowing before changing anything.
  *
- * 1. Recording goes through MediaRecorder, and the Mac converts whatever
- *    container comes back. The previous version encoded 16 kHz WAV here from
- *    raw Web Audio samples, to spare the Mac a decoder; on a real iPhone,
- *    inside an installed PWA, that graph delivered empty buffers and every
- *    utterance silently uploaded nothing. One decoder on the Mac is worth more
- *    than clever DSP that only works in the browsers you tested.
+ * 1. Recording goes through MediaRecorder; the resulting container is then
+ *    decoded to 16 kHz mono WAV here, offline, before it is uploaded.
+ *
+ *    Both halves of that were learned the hard way. Encoding WAV from a *live*
+ *    ScriptProcessor graph produced empty buffers on a real iPhone inside an
+ *    installed PWA, so every utterance uploaded nothing. Uploading Safari's own
+ *    container instead moved the failure to the Mac, which without Homebrew has
+ *    only `afconvert` and will not read the fragmented MP4 Safari produces.
+ *
+ *    Recording with MediaRecorder and decoding it offline uses neither weak
+ *    path: capture is the one API every browser genuinely supports, and
+ *    decodeAudioData/OfflineAudioContext have no realtime clock to starve.
  *
  * 2. A turn is push-to-talk. The operator is often outdoors, in a room with a
  *    television, or holding the phone loosely; a system that decides for itself
@@ -152,9 +158,19 @@
     recorder.onerror = () => fail("The recording stopped unexpectedly.");
     recorder.onstop = uploadTurn;
 
-    // A timeslice means data arrives during the recording rather than only at
-    // the end, so a tab suspended mid-utterance still yields what it captured.
-    recorder.start(250);
+    // No timeslice, deliberately.
+    //
+    // With one, Safari emits a *fragmented* MP4: a header chunk followed by
+    // moof/mdat fragments. Concatenating those gives a file that plays in a
+    // browser and that `afconvert` — the only decoder macOS ships, and the only
+    // one on a Mac without Homebrew — will not read. The upload succeeded, the
+    // conversion failed, and every utterance came back "I didn't catch that".
+    //
+    // Without a timeslice the recorder finalises one ordinary MP4 at stop(),
+    // which afconvert reads. The cost is that a tab killed mid-utterance yields
+    // nothing instead of a partial clip; a partial clip that cannot be decoded
+    // was worth less than that.
+    recorder.start();
     recording = true;
     startedAt = performance.now();
     el("talk-label").textContent = "listening…";
@@ -184,10 +200,91 @@
     }
   }
 
+  /* Decode here, upload WAV.
+   *
+   * The container a phone records in is the single most fragile link in this
+   * whole system: iOS gives AAC in MP4, Android gives Opus in WebM, and the Mac
+   * can only decode the first of those without Homebrew. Both browsers,
+   * however, can already decode their own recording — that is the same decoder
+   * that plays it back — and both can resample offline.
+   *
+   * So the phone hands over a plain 16 kHz mono WAV and the Mac needs no
+   * decoder at all. This is not the ScriptProcessor mistake repeated: that used
+   * a *live* audio graph, which iOS starves inside an installed PWA.
+   * `decodeAudioData` and `OfflineAudioContext` render as fast as they can with
+   * no realtime clock to miss, and MediaRecorder still does the capturing.
+   *
+   * If any of it fails, the original blob is uploaded unchanged and the Mac
+   * tries its own converter. A best-effort improvement must never become a new
+   * way to lose an utterance.
+   */
+  const TARGET_RATE = 16000;
+
+  async function toWav(blob) {
+    const Offline = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    const Context = window.AudioContext || window.webkitAudioContext;
+    if (!Offline || !Context) return null;
+
+    const bytes = await blob.arrayBuffer();
+    // Safari's decodeAudioData is callback-only in older versions; wrap both.
+    const context = new Context();
+    let decoded;
+    try {
+      decoded = await new Promise((resolve, reject) => {
+        const promise = context.decodeAudioData(bytes.slice(0), resolve, reject);
+        if (promise && promise.then) promise.then(resolve, reject);
+      });
+    } finally {
+      if (context.close) context.close();
+    }
+    if (!decoded || !decoded.length) return null;
+
+    const frames = Math.max(1, Math.ceil(decoded.duration * TARGET_RATE));
+    const offline = new Offline(1, frames, TARGET_RATE);
+    const source = offline.createBufferSource();
+    source.buffer = decoded;
+    source.connect(offline.destination);
+    source.start(0);
+    const rendered = await new Promise((resolve, reject) => {
+      // Older Safari resolves through oncomplete and returns nothing; newer
+      // Safari returns a promise. Wiring both costs two lines and removes an
+      // entire class of "works on my phone".
+      offline.oncomplete = (event) => resolve(event.renderedBuffer);
+      const promise = offline.startRendering();
+      if (promise && promise.then) promise.then(resolve, reject);
+    });
+    return encodeWav(rendered.getChannelData(0), TARGET_RATE);
+  }
+
+  function encodeWav(samples, rate) {
+    const buffer = new ArrayBuffer(44 + samples.length * 2);
+    const view = new DataView(buffer);
+    const ascii = (offset, text) => {
+      for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
+    };
+    ascii(0, "RIFF");
+    view.setUint32(4, 36 + samples.length * 2, true);
+    ascii(8, "WAVEfmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);            // PCM
+    view.setUint16(22, 1, true);            // mono
+    view.setUint32(24, rate, true);
+    view.setUint32(28, rate * 2, true);     // byte rate
+    view.setUint16(32, 2, true);            // block align
+    view.setUint16(34, 16, true);           // bits per sample
+    ascii(36, "data");
+    view.setUint32(40, samples.length * 2, true);
+    for (let i = 0; i < samples.length; i += 1) {
+      const clamped = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(44 + i * 2, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
+    }
+    return new Blob([buffer], { type: "audio/wav" });
+  }
+
   async function uploadTurn() {
     const captured = chunks;
     chunks = [];
-    const type = (recorder && recorder.mimeType) || "application/octet-stream";
+    const recordedType = (recorder && recorder.mimeType) || "application/octet-stream";
     if (!captured.length) {
       // Never silent. This is exactly the case that made every iPhone
       // utterance vanish without a word.
@@ -195,10 +292,24 @@
       return;
     }
 
-    const blob = new Blob(captured, { type });
-    if (blob.size < 2000) {
+    const recorded = new Blob(captured, { type: recordedType });
+    if (recorded.size < 2000) {
       fail("That was too short for me to hear. Hold the button while you speak.");
       return;
+    }
+
+    let blob = recorded;
+    let type = recordedType;
+    try {
+      const wav = await toWav(recorded);
+      if (wav && wav.size > 44) {
+        blob = wav;
+        type = "audio/wav";
+      }
+    } catch (err) {
+      // Logged, not shown: the upload below still has every chance of working,
+      // and an operator does not need to hear about a fallback that held.
+      console.warn("could not decode locally; sending the original", err);
     }
 
     state.textContent = "thinking…";

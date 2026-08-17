@@ -34,6 +34,15 @@ class Decision:
     allowed: bool
     reason: str = ""
     rule: str = ""
+    #: Whether refusing this actually requires a person.
+    #:
+    #: "JARVIS may not repair this" and "a human must deal with this" are
+    #: different statements, and conflating them is what made Sir escalate a
+    #: slow login page to a phone call within one second. A severity outside the
+    #: auto-repair list means *do not write code for it* — the incident is still
+    #: watched, may still recover on its own, and nobody needs waking. Only
+    #: refusals that leave a real problem nobody is working on set this.
+    needs_human: bool = True
 
     def __bool__(self) -> bool:
         return self.allowed
@@ -77,6 +86,9 @@ class SafetyPolicy:
                 False,
                 "automated repair is disabled ([reliability.repair] enabled = false)",
                 "repair_disabled",
+                # An operator switch, not a fault. Escalating because repair is
+                # off would page somebody for a setting they chose.
+                needs_human=False,
             )
         if incident.attempts_used >= self.max_attempts:
             return Decision(
@@ -92,10 +104,19 @@ class SafetyPolicy:
                 f"severity {incident.severity.value} is not in the auto-repair "
                 f"list ({', '.join(sorted(allowed)) or 'none'})",
                 "severity_not_permitted",
+                # Not a job for a person. It is a decision the operator already
+                # made about which severities JARVIS may write code for, and a
+                # LOW-severity slow page needs neither a repair nor a human.
+                needs_human=False,
             )
         if incident.state.value == "HUMAN_REQUIRED":
             return Decision(
-                False, "the incident is already awaiting a human", "human_required"
+                False,
+                "the incident is already awaiting a human",
+                "human_required",
+                # Already escalated once. Saying so again is the duplicate the
+                # owner complained about.
+                needs_human=False,
             )
         return Decision(True)
 

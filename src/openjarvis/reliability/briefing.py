@@ -29,7 +29,7 @@ import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from openjarvis.reliability.types import Incident
 
@@ -304,6 +304,7 @@ def build_briefing(
     attempt: int = 1,
     max_attempts: int = 3,
     previous_failure: str = "",
+    strategy: Any = None,
     protected_paths: Optional[List[str]] = None,
     test_command: str = "",
 ) -> Briefing:
@@ -362,6 +363,19 @@ def build_briefing(
     if protected_paths:
         listed = "\n".join(f"- `{p}`" for p in protected_paths)
         protected_block = f"\n## Protected paths (do not modify)\n\n{listed}\n"
+
+    strategy_block = ""
+    if strategy is not None:
+        # A direction to look, never an instruction to make a particular change.
+        # The agent still has to find and justify the real cause, and the
+        # verifier still decides whether it worked.
+        strategy_block = (
+            "\n## Where to look this time\n\n"
+            f"Working hypothesis: {getattr(strategy, 'hypothesis', '')}.\n\n"
+            f"{getattr(strategy, 'guidance', '')}\n\n"
+            "This is a direction, not a conclusion. If the evidence points "
+            "somewhere else, follow the evidence and say so.\n"
+        )
 
     previous_block = ""
     if previous_failure:
@@ -430,7 +444,7 @@ def build_briefing(
 ## What changed recently
 
 {chr(10).join(correlation_lines)}
-{previous_block}{injection_block}
+{strategy_block}{previous_block}{injection_block}
 ## Evidence
 
 {evidence_text or "_No evidence captured._"}

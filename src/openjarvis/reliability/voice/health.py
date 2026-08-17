@@ -41,6 +41,10 @@ class VoiceHealth:
     transcriber: Any = None
     speech: Any = None
     normalizer: Any = None
+    #: The record of what real phones have managed to say. Separate from the
+    #: transcriber on purpose: "whisper loads" and "the owner can be heard" are
+    #: different claims, and only the second one is the product.
+    microphone: Any = None
     subscriptions: Any = None
     sessions: Any = None
     calls: Any = None
@@ -59,6 +63,21 @@ class VoiceHealth:
             "state": "FAILED",
             "detail": self.transcriber.unavailable_reason() or "unavailable",
         }
+
+    def mic(self) -> Dict[str, Any]:
+        """Whether a real device has ever produced a transcript.
+
+        The one check here that cannot be satisfied by installing something.
+        Everything else in this panel is a statement about this machine; this is
+        a statement about the phone in the owner's hand, and it is the only one
+        that has ever been wrong in the direction that mattered.
+        """
+        if self.microphone is None:
+            return {
+                "state": UNKNOWN,
+                "detail": "no microphone record is configured",
+            }
+        return self.microphone.snapshot()
 
     def tts(self) -> Dict[str, Any]:
         if self.speech is None:
@@ -151,6 +170,7 @@ class VoiceHealth:
         """Everything, plus one overall verdict derived from it."""
         parts = {
             "stt": self.stt(),
+            "microphone": self.mic(),
             "tts": self.tts(),
             "audio": self.audio(),
             "phone": self.phone(),
@@ -160,10 +180,22 @@ class VoiceHealth:
         states = [part["state"] for part in parts.values()]
 
         # Hearing and speaking are what a call *is*. Without either, voice is
-        # offline however healthy the rest looks.
-        if parts["stt"]["state"] == "FAILED" or parts["tts"]["state"] == "FAILED":
+        # offline however healthy the rest looks — and a microphone known to be
+        # broken is exactly "without hearing", however well the engine loads.
+        if (
+            parts["stt"]["state"] == "FAILED"
+            or parts["tts"]["state"] == "FAILED"
+            or parts["microphone"]["state"] == "FAILED"
+        ):
             overall = OFFLINE
         elif "FAILED" in states or "UNREACHABLE" in states:
+            overall = DEGRADED
+        elif parts["microphone"]["state"] != "WORKING":
+            # The rule that had to be written down after a green light shipped
+            # over a microphone that had never once worked: ONLINE requires a
+            # real device to have been heard. Not whisper installed, not a model
+            # file present, not a test with a synthesised WAV — a phone, over
+            # the network, producing words.
             overall = DEGRADED
         elif UNKNOWN in states or "NOT_REGISTERED" in states:
             # Deliberately not ONLINE. Something here has not been established,

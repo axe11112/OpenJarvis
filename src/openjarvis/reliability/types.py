@@ -593,6 +593,11 @@ class RepairAttempt:
     scope: Dict[str, Any] = field(default_factory=dict)
     #: Insertions plus deletions against the base commit, for the scope guard.
     lines_changed_total: int = 0
+    #: Which hypothesis this attempt was working from — a key from
+    #: :data:`openjarvis.reliability.playbook.STRATEGIES`. Recorded so the next
+    #: attempt can try a *different* idea rather than the same one louder, and
+    #: so a handover can say which ideas have already been eliminated.
+    strategy: str = ""
     #: Test files the agent added or modified — the regression-test question.
     regression_tests: List[str] = field(default_factory=list)
 

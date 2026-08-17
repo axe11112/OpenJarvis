@@ -58,6 +58,24 @@ _UNREACHABLE_KINDS = frozenset(
 #: Failure kinds that are cosmetic until proven otherwise.
 _COSMETIC_KINDS = frozenset({"visual", "layout", "screenshot_diff"})
 
+#: Failures where the site answered correctly and only took too long. These are
+#: emphatically not outages, and treating them as such is what produced two
+#: CRITICAL incidents overnight for a homepage that returned 200 with the right
+#: title in 9.65s against a 5s budget, and a login page that rendered the right
+#: form in 41s against a 30s budget. Nothing was broken; the machine running
+#: the probes was busy.
+_LATENCY_KINDS = frozenset({"slow", "slow_response", "budget_exceeded"})
+
+#: Rules whose verdict is *not* raised to the probe's declared severity.
+#:
+#: The floor exists because an operator knows things about their product that a
+#: generic rule does not — when they declare a probe CRITICAL they mean "if this
+#: workflow is broken, that is critical". A latency overrun is a different
+#: observation entirely: the workflow ran and produced the right answer. Letting
+#: the floor apply to it turns "the login page was slow" into "authentication is
+#: down", which is how an owner gets woken for a page that was working.
+_FLOOR_EXEMPT_RULES = frozenset({"responded_but_slow"})
+
 
 @dataclass(slots=True)
 class Classification:
@@ -92,6 +110,19 @@ def _component_matches(component: str, needles: Sequence[str]) -> bool:
 #: ``(name, predicate, severity, reason)``, most severe first.
 #: The predicate takes ``(component, result)``.
 _RULES: List[Tuple[str, Callable[[str, ProbeResult], bool], Severity, str]] = [
+    (
+        # First, because it is the cheapest way to be wrong about an outage.
+        # A response that arrived, with the right content, over the budget is a
+        # performance observation — never an availability one.
+        "responded_but_slow",
+        lambda _component, result: (
+            result.failure_kind in _LATENCY_KINDS
+            and bool(result.steps_completed)
+            and (result.http_status or 200) < 400
+        ),
+        Severity.LOW,
+        "the site answered correctly but took longer than its budget",
+    ),
     (
         "auth_unavailable",
         lambda component, result: (
@@ -188,6 +219,16 @@ def classify(
             continue
         if not matched:
             continue
+        if name in _FLOOR_EXEMPT_RULES:
+            # The declaration answers "how bad is it when this workflow breaks".
+            # This rule fired because the workflow did *not* break, so the
+            # declaration is not an answer to the question being asked.
+            return Classification(
+                severity=severity,
+                rule=name,
+                reason=reason,
+                declared=floor,
+            )
         if severity.rank >= floor.rank:
             return Classification(
                 severity=severity, rule=name, reason=reason, declared=floor

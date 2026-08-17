@@ -328,7 +328,13 @@ class TestRepairLoop:
         assert len(agent.calls) == 2
         assert "2 repair attempts" in outcome.reason
 
-    def test_repair_disabled_is_refused_immediately(self, store, incident):
+    def test_repair_disabled_is_refused_without_waking_anybody(self, store, incident):
+        """Repair being switched off is a setting, not an emergency.
+
+        This used to escalate to HUMAN_REQUIRED, which paged the owner for a
+        decision they had already made. The incident stays open and watched
+        instead, and closes by itself if the check recovers.
+        """
         agent = FakeCodeAgent()
         loop = _loop(
             store,
@@ -340,7 +346,8 @@ class TestRepairLoop:
 
         assert not outcome.resolved
         assert agent.calls == []
-        assert incident.state is IncidentState.HUMAN_REQUIRED
+        assert incident.state is not IncidentState.HUMAN_REQUIRED
+        assert "disabled" in outcome.reason
 
     def test_severity_outside_the_allowlist_is_refused(self, store):
         critical = store.create(

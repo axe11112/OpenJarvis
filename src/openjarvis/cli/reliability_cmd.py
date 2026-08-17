@@ -170,6 +170,7 @@ def _build_notifier(config: Any) -> Any:
         NotificationRouter,
         TelegramNotifier,
     )
+    from openjarvis.reliability.notify_ledger import NotificationLedger, ledger_path
     from openjarvis.reliability.types import Severity
 
     rc = config.reliability
@@ -188,6 +189,8 @@ def _build_notifier(config: Any) -> Any:
         min_severity=Severity.parse(rc.notify.min_severity),
         max_per_hour=rc.notify.max_messages_per_hour,
         persona=rc.notify.persona,
+        # On disk, so a restart is not a reason to say it all again.
+        ledger=NotificationLedger(path=ledger_path(config)),
     )
 
 
@@ -1827,16 +1830,26 @@ def _build_voice(config: Any, store: Any, console: Any, access: Any) -> Any:
         fallback=_fallback,
         audit=audit,
     )
+    from openjarvis.reliability.voice.microphone import (
+        MicrophoneRecord,
+        microphone_path,
+    )
+
+    # Persisted, so "has a real phone ever been heard?" survives the restart
+    # that follows every deploy.
+    microphone = MicrophoneRecord(path=microphone_path(config))
     endpoints = VoiceEndpoints(
         sessions=sessions,
         confirmations=confirmations,
         push=push,
         subscriptions=subscriptions,
         calls=calls,
+        microphone=microphone,
         health=VoiceHealth(
             transcriber=transcriber,
             speech=speech,
             normalizer=transcriber.normalizer,
+            microphone=microphone,
             subscriptions=subscriptions,
             sessions=sessions,
             calls=calls,

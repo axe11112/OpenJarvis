@@ -496,6 +496,9 @@ class NotificationRouter:
     critical_grace_seconds: float = 20.0
     #: Builds the delay. Injected so tests need not wait twenty seconds.
     scheduler: Optional[Callable[[float, Callable[[], None]], Any]] = None
+    #: Remembers what the owner has already been told, across restarts. Without
+    #: it, every watcher restart re-announces every open problem.
+    ledger: Any = None
 
     _sent_times: List[float] = field(default_factory=list, repr=False)
     _recent: Dict[str, float] = field(default_factory=dict, repr=False)
@@ -580,16 +583,45 @@ class NotificationRouter:
             )
             return False
 
+        if not self._is_news(incident):
+            return False
+
         message = render_alert(incident, persona=self.persona)
         if self.critical_grace_seconds <= 0:
+            self._remember(incident)
             return self.notify(message, severity=Severity.CRITICAL)
 
-        self._defer_alert(incident.id, message)
+        # Not recorded yet: a held alert has not been said. Recording here would
+        # make an escalation that supersedes it look like a repeat and silence
+        # the only message the owner actually needs.
+        self._defer_alert(incident.id, message, incident)
         return False
+
+    # -- what the owner already knows -------------------------------------
+
+    def _is_news(self, incident: Incident) -> bool:
+        """Whether telling the owner would tell them anything."""
+        if self.ledger is None:
+            return True
+        try:
+            return bool(self.ledger.should_notify(incident))
+        except Exception:  # noqa: BLE001 - a broken ledger must not silence us
+            logger.exception("could not consult the notification ledger")
+            return True
+
+    def _remember(self, incident: Incident) -> None:
+        if self.ledger is None:
+            return
+        try:
+            self.ledger.record(incident)
+        except Exception:  # noqa: BLE001
+            logger.exception("could not record the notification")
 
     # -- deferral ---------------------------------------------------------
 
-    def _defer_alert(self, incident_id: str, message: str) -> None:
+    def _defer_alert(
+        self, incident_id: str, message: str, incident: Optional[Incident] = None
+    ) -> None:
         """Hold a CRITICAL alert, so an escalation can supersede it."""
         with self._alert_lock:
             existing = self._deferred.pop(incident_id, None)
@@ -597,7 +629,7 @@ class NotificationRouter:
                 existing.cancel()
             timer = self._scheduler(
                 self.critical_grace_seconds,
-                lambda: self._send_deferred(incident_id, message),
+                lambda: self._send_deferred(incident_id, message, incident),
             )
             self._deferred[incident_id] = timer
         timer.daemon = True
@@ -608,10 +640,17 @@ class NotificationRouter:
             self.critical_grace_seconds,
         )
 
-    def _send_deferred(self, incident_id: str, message: str) -> None:
+    def _send_deferred(
+        self, incident_id: str, message: str, incident: Optional[Incident] = None
+    ) -> None:
         """Nothing superseded it, so the owner hears about it after all."""
         with self._alert_lock:
             self._deferred.pop(incident_id, None)
+        if incident is not None:
+            # Recorded only now, at the moment it is actually said. A held alert
+            # that was cancelled must leave no trace, or it would silence the
+            # escalation that replaced it.
+            self._remember(incident)
         self.notify(message, severity=Severity.CRITICAL)
 
     def _supersede(self, incident_id: str) -> bool:
@@ -660,6 +699,15 @@ class NotificationRouter:
         owner stayed quiet for, and the severity that got them here was about
         the fault, not about the news that it is over.
         """
+        self._supersede(incident.id)
+        if self.ledger is not None:
+            try:
+                # A fix closes the account. If this ever breaks again, that is
+                # news, so the problem record goes rather than lingering and
+                # silencing the next genuine failure.
+                self.ledger.forget(incident)
+            except Exception:  # noqa: BLE001
+                logger.exception("could not clear the notification ledger")
         return self.notify(
             render_resolved(
                 incident,
@@ -691,8 +739,14 @@ class NotificationRouter:
 
         Supersedes any CRITICAL alert still being held for this incident. Both
         describe the same event; this one also says what to do about it.
+
+        Also consults the ledger, so an incident that sits in ``HUMAN_REQUIRED``
+        across a dozen watcher cycles and two restarts is announced once.
         """
         self._supersede(incident.id)
+        if not self._is_news(incident):
+            return False
+        self._remember(incident)
         return self.notify(
             render_human_required(
                 incident,
@@ -790,6 +844,9 @@ class NotificationRouter:
         escalation does.
         """
         self._supersede(incident.id)
+        if not self._is_news(incident):
+            return False
+        self._remember(incident)
         return self.notify(
             render_post_merge_failed(
                 incident, record=record, result=result, persona=self.persona
