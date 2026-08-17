@@ -16,8 +16,20 @@ fixture exists to prove it holds rather than to assert it.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 from typing import List
+
+#: The interpreter the fixture repository is exercised with.
+#:
+#: Deliberately ``sys.executable`` rather than a bare ``python3``. A bare name
+#: resolves through ``PATH`` inside the subprocess, which on a machine with
+#: several Pythons installed is not the interpreter running these tests and
+#: does not have ``pytest`` importable. The failure that produces is
+#: particularly misleading: the fixture project's own checks fail, so no repair
+#: is ever committed, and every assertion downstream of "a repair was verified"
+#: fails for a reason that has nothing to do with the code under test.
+PYTHON = sys.executable
 
 #: The bug: a percentage discount is subtracted as if it were an amount.
 #: ``apply_discount(200, 10)`` returns 190 where it should return 180.
@@ -112,7 +124,7 @@ def build_broken_repo(path: Path) -> Path:
 def reproduction_passes(workspace: str) -> bool:
     """Whether the original failure has stopped reproducing in *workspace*."""
     proc = subprocess.run(
-        ["python3", "-c", REPRODUCTION],
+        [PYTHON, "-c", REPRODUCTION],
         cwd=workspace,
         capture_output=True,
         text=True,

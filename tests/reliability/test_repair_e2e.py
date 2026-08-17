@@ -225,7 +225,7 @@ def harness(broken_repo, store, tmp_path):
                 protected_paths=[".github/workflows/"],
             ),
             checks=CheckSuite.from_config(
-                test_command="python3 -m pytest tests -q", timeout=120
+                test_command=f"{fixture_repo.PYTHON} -m pytest tests -q", timeout=120
             ),
             preview_lookup=preview_lookup,
             protected_paths=[".github/workflows/"],
