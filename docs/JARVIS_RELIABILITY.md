@@ -305,6 +305,26 @@ cancelled one must leave no trace, or it would silence the escalation that
 replaced it. And a ledger that cannot be read costs a duplicate, never a missed
 outage: when in doubt, speak.
 
+### A failed build is not an alert forever
+
+`_poll_source` called `source.poll()` with no `since` for as long as it existed,
+so every cycle re-reported every failed deployment still in the API's newest
+page. Four production deployments cancelled within fifteen seconds of each other
+on 15 August — superseded seventeen seconds later by a READY one, and followed by
+nine more successful production deployments — were still being re-reported two
+days later, 328 occurrences each, holding four HIGH incidents open against a
+completely healthy site.
+
+Two bounds now, because one is not enough:
+
+* a **watermark** per source, which is what `since` was always for, stops a
+  failure being reported twice within a process;
+* an **age cutoff** in the source (six hours by default, configurable, zero to
+  disable) is what survives a restart, where a watermark cannot help.
+
+A deployment with an unreadable timestamp is still reported: unknown age must not
+become a silent drop.
+
 ### Escalation
 
 A `CRITICAL` incident still open after `critical_escalation_minutes` is raised

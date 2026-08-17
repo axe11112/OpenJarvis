@@ -390,7 +390,62 @@ A handover that cannot be filled in is logged as a defect and the count is shown
 on the Control Center, next to the autonomy rate. It is not silently tidied
 away.
 
-### 10.3 Autonomy, measured
+### 10.3 Slow, or slow to watch?
+
+A probe measures one number — how long a page took *as seen from here* — and that
+number contains both the site's latency and the observer's. On a four-core,
+eight-gigabyte laptop also running a browser, a watcher and a dashboard, the
+observer's share is not small.
+
+Measured on that machine, fifteen idle and eight loaded samples per probe,
+in-process exactly as the watcher runs them:
+
+| Probe kind | Budget | p95 idle | p95 at load average 27 |
+| --- | --- | --- | --- |
+| HTTP (5 probes) | 5-8s | 0.21-0.35s | 0.14-0.46s |
+| Browser (5 probes) | 30s | 3.56-4.87s | 4.71-5.45s |
+
+Every probe runs 6-40x inside its budget even under heavy load. Nine of the first
+twenty-five incidents nonetheless opened on a duration overrun — 33-140s on
+browser probes, 9.65s on an HTTP one, which is 7-48x the loaded p95. Nothing in
+the normal distribution reaches that; they were stalls.
+
+**So no budget was widened.** Widening one to swallow a 140s stall is how a
+genuine tenfold regression stops being visible. Four guards were added instead,
+and each one only touches the case that was wrong:
+
+1. **The HTTP runner can say "slow".** It reported every failure as `assertion`,
+   including a pure clock overrun, so the LOW-severity rule written for exactly
+   this never fired for an HTTP probe. A duration overrun arriving alongside a bad
+   status or a failed expectation is still an `assertion`.
+2. **Kind-aware confirmation.** A correct-but-late page needs two more consecutive
+   sightings than a wrong one. A 500, a missing form or an unreachable host is
+   believed on the same schedule as before.
+3. **Corroboration between probes.** A fault in the homepage does not also slow
+   the sitemap and the API while leaving every assertion passing. Two unrelated
+   slow-but-correct witnesses mean the observer, so the detection is suppressed
+   and says why. No other failure kind is affected by it.
+4. **Post-merge latency confirmation.** These probes decide whether a merged
+   repair is good, so a compile finishing at the wrong moment could turn a sound
+   merge into HUMAN_REQUIRED and a CRITICAL call. A latency-only failure is re-run
+   twice; nothing else is retried; a page that stays slow is still not verified,
+   it just says so accurately instead of claiming production failed.
+
+### 10.4 Evidence before escalation
+
+The last thing the loop does before handing an incident to a person is re-run the
+originating probe against production. If it passes, the incident closes with a
+note and nobody is woken — every one of the first nine escalations in this
+system's history was for a fault that had already cleared.
+
+Conditional on the state machine already permitting RESOLVED, and that condition
+is load-bearing. Reaching RESOLVED only through VERIFYING is what makes "never
+trust the coding agent's claim that it fixed something" a property of the state
+machine rather than of one code path. Where closing is not legal this escalates
+exactly as before, and it fails closed on a missing URL, a missing spec, an
+unreadable verdict or a crash.
+
+### 10.5 Autonomy, measured
 
 The Control Center shows how many closed incidents were handled without a
 person, split into repaired-by-JARVIS and cleared-on-their-own.
@@ -630,6 +685,28 @@ could not be seen. Grant the permission instead.
 Third-party CI counts: Vercel publishes a combined-status context named `Vercel`
 that goes `failure` when a preview build breaks, so a repository with no GitHub
 Actions workflows can still have a meaningful `status_checks` gate.
+
+#### Current state on this deployment (2026-08-17)
+
+Automatic merge is **configured, tested end to end, and switched off**, and the
+reason is this section rather than a change of heart. `GITHUB_READONLY_TOKEN`
+403s on **both** endpoints:
+
+    GET /repos/axe11112/Wize-Performance/commits/{sha}/status      403
+    GET /repos/axe11112/Wize-Performance/commits/{sha}/check-runs  403
+
+The same token reads repository metadata, pull requests, contents and Actions, so
+this is two missing permissions and not a broken token. With `status_checks`
+permanently `unreadable` the gate refuses every merge — correct, and the reason
+the switch went back off: safe but inert is not a capability worth presenting as
+one.
+
+`jarvis reliability live-diagnostic` reports it and opens a HIGH `github`
+incident naming the missing permissions. To finish: grant **Commit statuses:
+Read**, confirm the diagnostic goes green, set `[reliability.merge] enabled =
+true`. All twenty-five gates are already wired, and
+`tests/reliability/test_merge.py::TestPreActivationAudit` asserts that none of
+them has gone missing.
 
 ### Time-of-check / time-of-use
 
