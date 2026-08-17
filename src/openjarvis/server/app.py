@@ -433,6 +433,16 @@ def create_app(
     app.include_router(upload_router)
     app.include_router(research_router)
     app.include_router(analytics_router)
+
+    # JARVIS reliability dashboard (read-only). Mounted unconditionally: the
+    # routes report "disabled" rather than erroring when reliability is off.
+    from openjarvis.server.reliability_dashboard import (
+        router as reliability_dashboard_router,
+    )
+    from openjarvis.server.reliability_routes import router as reliability_router
+
+    app.include_router(reliability_router)
+    app.include_router(reliability_dashboard_router)
     include_all_routes(app)
 
     # Restore SendBlue channel bindings from database on startup

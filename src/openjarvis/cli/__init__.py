@@ -32,6 +32,7 @@ from openjarvis.cli.optimize_cmd import optimize_group
 from openjarvis.cli.pearl_cmd import pearl
 from openjarvis.cli.quickstart_cmd import quickstart
 from openjarvis.cli.registry_cmd import registry
+from openjarvis.cli.reliability_cmd import reliability
 from openjarvis.cli.scan_cmd import scan
 from openjarvis.cli.scheduler_cmd import scheduler
 from openjarvis.cli.self_update_cmd import self_update
@@ -124,6 +125,7 @@ cli.add_command(compose, "compose")
 cli.add_command(gateway, "gateway")
 cli.add_command(tool, "tool")
 cli.add_command(registry, "registry")
+cli.add_command(reliability, "reliability")
 cli.add_command(config, "config")
 cli.add_command(scan, "scan")
 cli.add_command(connect, "connect")

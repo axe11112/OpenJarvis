@@ -10,6 +10,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+**JARVIS Control Center (`jarvis reliability dashboard`)** — a local, read-only
+web view of the running reliability system at `http://127.0.0.1:8765`. Shows
+overall status, one card per monitored surface (website, GitHub, Vercel,
+Supabase, probes, Telegram, code agent), incidents with evidence, transitions,
+repair attempts and audit chain, every probe with its verdict, and every safety
+interlock read from the live configuration. Wiz, the wizard mascot, narrates
+the state — deterministically, from the same values on the screen, with no model
+involved.
+
+It is a visualization layer, not a second monitoring engine: incidents come from
+`IncidentStore`, surfaces from `LiveDiagnostic` run with `open_incidents=False`,
+probes from the specs on disk. It never writes to the incident database, so it
+is safe to run beside `jarvis reliability watch`. Built on `http.server`, so it
+adds no dependency. Loopback-only three ways over (bind address, peer address,
+`Host` header), strict CSP, `GET`-only apart from two named lifecycle `POST`s
+guarded by a per-process token, and all rendered text passes `BoundaryGuard`.
+
+**launchd watchdog (`jarvis reliability service`)** — supervises
+`jarvis reliability watch` on macOS so it survives a reboot, a crash and a closed
+terminal. `install` writes a LaunchAgent that starts the watcher at login and
+respawns it on an unexpected exit, with a `ThrottleInterval` backoff. Credentials
+go in a `0600` environment file, never in the plist. Logs land in
+`~/.openjarvis/logs/` and are truncated in place once past 5 MB. An emergency
+stop is honoured by the supervisor, by the HTTP endpoint and by the wrapper
+itself, which exits `0` so `KeepAlive` cannot undo a deliberate stop. The
+dashboard can ask launchd to start or restart that one service — through a
+four-verb allowlist on a hard-coded label, with a restart budget — and reports
+`ONLINE` / `STARTING` / `OFFLINE` / `ERROR` / `STOPPED_BY_OPERATOR`.
+
+See `docs/JARVIS_CONTROL_CENTER.md`.
+
 **Vision input for `jarvis ask`** — attach images to a query with
 `-i`/`--image` (repeatable) or capture the current screen with
 `-S`/`--screen`, for vision-capable models such as `gemma3:4b`. Images flow

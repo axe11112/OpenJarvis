@@ -1,0 +1,83 @@
+[Unit]
+Description=JARVIS — autonomous website reliability watcher
+Documentation=https://github.com/open-jarvis/OpenJarvis/blob/main/docs/JARVIS_RELIABILITY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openjarvis
+WorkingDirectory=/opt/openjarvis
+Environment=HOME=/opt/openjarvis
+
+# Credentials live here, mode 0600, owned by root. Never inline Environment=
+# lines: those leak into `systemctl show` and the journal.
+#
+# For monitoring only:
+#   GITHUB_READONLY_TOKEN=...      (Contents/Pull requests/Actions: Read)
+#   VERCEL_READONLY_TOKEN=...
+#   SUPABASE_READONLY_TOKEN=...    (Management API, read — NEVER service_role)
+#   TELEGRAM_BOT_TOKEN=...
+#
+# Additionally, only once [reliability.repair] enabled = true:
+#   a GitHub token with Contents: Write and Pull requests: Write.
+#   Administration, secrets and branch-protection scopes are NOT required and
+#   should not be granted.
+EnvironmentFile=/etc/openjarvis/env
+
+# Refuse to start on a configuration that could reach production. `doctor`
+# exits non-zero when a required credential is missing, and the watcher itself
+# exits 2 when automatic repair is combined with default-branch push, a
+# permissive deploy_mode, or Supabase writes. Validating here means a bad
+# configuration fails at boot rather than at 3am.
+ExecStartPre=/opt/openjarvis/.venv/bin/jarvis reliability doctor
+
+ExecStart=/opt/openjarvis/.venv/bin/jarvis reliability watch
+
+# Restart after a crash, but deliberately NOT after a clean exit.
+#
+# `jarvis reliability watch` exits non-zero for reasons that restarting cannot
+# fix and would only obscure:
+#   2 = unsafe configuration
+#   3 = emergency stop engaged
+# Restart=on-failure would fight the operator in both cases, so the emergency
+# stop is also a persistent file: even Restart=always could not bring JARVIS
+# back on after `jarvis reliability stop`.
+Restart=on-abnormal
+RestartSec=15
+
+# An interrupted repair is never resumed. On restart the watcher finds any
+# incident left in FIXING/TESTING/VERIFYING, moves it to RECOVERY_REQUIRED and
+# notifies the owner. A process that died mid-repair may have left a worktree,
+# a branch, or a half-applied change; starting a second coding agent on top of
+# that is how one outage becomes two.
+
+# Give a repair time to finish rather than killing it mid-commit.
+TimeoutStopSec=120
+KillSignal=SIGINT
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=jarvis-reliability
+
+# --- Sandboxing ---
+# ProtectSystem=strict makes the filesystem read-only except ReadWritePaths.
+# JARVIS needs to write the incident database, evidence artifacts and repair
+# worktrees under $HOME, and to read the target checkout it cuts worktrees
+# from. Add that checkout to ReadWritePaths only if it is outside /opt/openjarvis
+# — git's worktree bookkeeping writes into the source repository's .git.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/openjarvis
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

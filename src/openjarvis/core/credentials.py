@@ -55,6 +55,16 @@ TOOL_CREDENTIALS: dict[str, list[str]] = {
     "xmpp": ["XMPP_JID", "XMPP_PASSWORD"],
     "feishu": ["FEISHU_APP_ID", "FEISHU_APP_SECRET"],
     "nostr": ["NOSTR_PRIVATE_KEY"],
+    # JARVIS reliability engineering. Every entry is read-only by default; see
+    # docs/JARVIS_SECURITY.md §3.1. Listing them here lets `jarvis doctor`
+    # report what is missing without ever printing a value.
+    "reliability_vercel": ["VERCEL_READONLY_TOKEN"],
+    "reliability_supabase": ["SUPABASE_READONLY_TOKEN"],
+    "reliability_github": ["GITHUB_READONLY_TOKEN"],
+    "reliability_test_account": [
+        "JARVIS_TEST_USER_EMAIL",
+        "JARVIS_TEST_USER_PASSWORD",
+    ],
 }
 
 

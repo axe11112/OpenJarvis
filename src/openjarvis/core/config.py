@@ -1416,6 +1416,328 @@ class WorkflowConfig:
     default_node_timeout: int = 300
 
 
+# ---------------------------------------------------------------------------
+# Reliability (JARVIS) — see docs/JARVIS_ARCHITECTURE.md
+#
+# Every field that names a credential holds the *name of an environment
+# variable*, never the value: no token ever enters config.toml.  Every
+# dangerous capability defaults to off.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class ReliabilitySiteConfig:
+    """The web application under observation."""
+
+    base_url: str = ""
+    environment: str = "production"
+
+
+@dataclass(slots=True)
+class ReliabilityProbesConfig:
+    """Where probe specs live and how often they run."""
+
+    directory: str = ""  # defaults to <config-dir>/reliability/probes
+    default_interval_seconds: int = 300
+    confirm_runs: int = 2  # N-of-M confirmation before an incident opens
+    evidence_dir: str = ""  # defaults to <config-dir>/reliability/evidence
+    evidence_retention_days: int = 30
+    trace_on_failure: bool = True
+    browser_executable_path: str = ""  # override the bundled Chromium
+    # Probing a loopback/private address requires opting out of the SSRF guard.
+    # Legitimate for a self-hosted target; never enable it to reach a public URL.
+    allow_private_targets: bool = False
+
+
+@dataclass(slots=True)
+class ReliabilityVercelConfig:
+    """Vercel monitoring — read-only."""
+
+    enabled: bool = False
+    team_id: str = ""
+    project_id: str = ""
+    token_env: str = "VERCEL_READONLY_TOKEN"
+    poll_interval_seconds: int = 120
+
+
+@dataclass(slots=True)
+class ReliabilitySupabaseConfig:
+    """Supabase monitoring — read-only unless explicitly unlocked."""
+
+    enabled: bool = False
+    project_ref: str = ""
+    token_env: str = "SUPABASE_READONLY_TOKEN"
+    poll_interval_seconds: int = 300
+    allow_production_writes: bool = False  # hard gate; see JARVIS_SECURITY.md §5
+
+
+@dataclass(slots=True)
+class ReliabilityGitHubConfig:
+    """GitHub integration for correlation and, later, repair branches."""
+
+    enabled: bool = False
+    repo: str = ""  # "owner/name"
+    token_env: str = "GITHUB_READONLY_TOKEN"
+    #: Optional separate token for Actions. Some organisations issue workflow
+    #: read access on a different token than repository contents; naming it
+    #: separately means the operator does not have to widen the main one.
+    #: Empty means "use token_env".
+    actions_token_env: str = ""
+    #: Whether GitHub Actions is part of this target's health picture.
+    #:
+    #: Defaults to true because for most repositories a red CI is a real
+    #: signal.  Set false when the target deliberately does not use Actions —
+    #: no minutes on the plan, CI hosted elsewhere, or workflows switched off.
+    #: On such a repository the Actions API answers truthfully that there is
+    #: nothing there or that the last runs failed months ago, and JARVIS would
+    #: report a healthy target as degraded forever.
+    #:
+    #: This is a statement about the *target's architecture*, not about
+    #: permissions: when false, JARVIS makes no Actions API call at all, and
+    #: records the absence as a deliberate configuration rather than as a blind
+    #: spot.  Everything else GitHub-related — reachability, commits, branches,
+    #: pull requests — is unaffected.
+    monitor_actions: bool = True
+    base_branch: str = "main"
+    branch_prefix: str = "jarvis/incident-"
+    poll_interval_seconds: int = 300
+
+
+@dataclass(slots=True)
+class ReliabilityRepairConfig:
+    """The Claude Code repair loop.
+
+    Every field that widens what JARVIS may do defaults to the narrow value.
+    ``enabled`` is the master switch and is off; see ``docs/JARVIS_REPAIR_LOOP.md``
+    for the manual enablement procedure.
+    """
+
+    enabled: bool = False
+
+    #: Identity repair commits are authored with, set inside the isolated
+    #: worktree before anything commits. Empty means "leave it to git".
+    #:
+    #: Not cosmetic. Hosting providers decide whether to build a pushed branch
+    #: by mapping the commit author to an authorized account, so a synthetic
+    #: author gets the preview deployment silently refused — which looks like a
+    #: failed repair rather than a refused build. Set these to an identity the
+    #: target's host will accept.
+    git_author_name: str = ""
+    git_author_email: str = ""
+    max_attempts: int = 3
+    #: Repository the isolated worktrees are cut from. Read-only: JARVIS creates
+    #: worktrees from it and never commits to it.
+    workspace: str = ""
+    #: Where per-incident worktrees are created. Defaults to
+    #: ``<config-dir>/reliability/worktrees``.
+    worktree_root: str = ""
+    #: Keep a failed repair's worktree so a human can see what the agent did.
+    keep_failed_worktrees: bool = True
+    #: Local gates, run inside the worktree. Empty means "not configured",
+    #: which is reported as not-run rather than as passing.
+    test_command: str = ""
+    lint_command: str = ""
+    typecheck_command: str = ""
+    build_command: str = ""
+    test_timeout_seconds: int = 1800
+    #: A repair may not reach a pull request without a preview deployment to
+    #: verify against. Turning this off means trusting local checks alone.
+    require_preview_verification: bool = True
+    #: How long to wait for a preview deployment to become READY.
+    preview_wait_seconds: int = 600
+    #: Ask the coding agent to add a regression test reproducing the failure.
+    request_regression_test: bool = True
+    #: The coding agent to drive. "claude_cli" runs the `claude` CLI headlessly.
+    agent: str = "claude_cli"
+    agent_executable: str = "claude"
+    agent_timeout_seconds: int = 1800
+
+    # -- change-scope control (see reliability/scope.py) -------------------
+    #: A diff larger than this fetches a human instead of opening a PR.
+    max_changed_files: int = 20
+    max_changed_lines: int = 800
+
+    # -- what the agent may do --------------------------------------------
+    #: Tools the coding agent is permitted. Constrained by JARVIS, not by the
+    #: agent. Bash is included because a repair must be able to run the
+    #: project's tests; the worktree is the blast radius.
+    agent_allowed_tools: List[str] = field(
+        default_factory=lambda: ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]
+    )
+    #: Refused outright. Network fetch tools are refused so evidence text cannot
+    #: talk the agent into contacting an attacker-controlled URL.
+    agent_disallowed_tools: List[str] = field(
+        default_factory=lambda: ["WebFetch", "WebSearch"]
+    )
+
+
+@dataclass(slots=True)
+class ReliabilityPolicyConfig:
+    """What JARVIS is permitted to do without a human."""
+
+    deploy_mode: str = "pr_only"  # "pr_only" | "auto_deploy_allowlisted" | "never"
+    allow_push_to_default_branch: bool = False
+    auto_repair_severities: List[str] = field(
+        default_factory=lambda: ["HIGH", "MEDIUM"]
+    )
+    auto_deploy_fix_classes: List[str] = field(default_factory=list)
+    protected_paths: List[str] = field(
+        default_factory=lambda: [
+            ".github/workflows/",
+            "middleware.*",
+            "**/auth/**",
+            "**/*rls*",
+        ]
+    )
+
+
+@dataclass(slots=True)
+class ReliabilityMergeConfig:
+    """Automatic merge of a JARVIS pull request.
+
+    The narrowest authority in the system and the last one before production:
+    merging is how JARVIS's work reaches the default branch, and the default
+    branch is what the host deploys. Every field defaults to the closed
+    position, and ``enabled`` is off.
+
+    Merging deploys nothing by itself — JARVIS has no deploy call — but a repo
+    with deploy-on-merge wired up means a merge *becomes* a deployment. Treat
+    this switch as production authority, not as a convenience.
+    """
+
+    enabled: bool = False
+    #: ``squash`` keeps one reviewable commit per incident on the default
+    #: branch. ``merge`` and ``rebase`` are accepted for repositories whose
+    #: settings forbid squashing.
+    method: str = "squash"
+    #: Require the head commit to have a green combined status / check-run
+    #: conclusion on GitHub before merging. Turning this off is only defensible
+    #: where the repository genuinely runs no CI — with it off, the local
+    #: check suite and the preview verification are the only gates, and the
+    #: refusal reason says so rather than implying CI agreed.
+    require_status_checks: bool = True
+    #: Status contexts that must each be present and ``success`` on the verified
+    #: commit. Naming them turns "some CI was green" into a contract: this
+    #: deployment, on this commit, reported success.
+    #:
+    #: It also makes the gate usable by a credential that cannot read the Checks
+    #: API at all. GitHub's fine-grained tokens have no Checks permission, so
+    #: ``/commits/{sha}/check-runs`` answers 403 for them however the token is
+    #: scoped; with no named contexts that denial has to be treated as a blind
+    #: spot, because the missing half is exactly where the evidence might be.
+    #: Name the contexts and the question changes from "is anything red
+    #: anywhere" to "did *these* report success", which the Commit Statuses API
+    #: answers on its own. The Checks denial is then reported as unavailable for
+    #: this credential rather than silently read as consent.
+    #:
+    #: Empty is the conservative default: both APIs must be readable and
+    #: everything they report must be green.
+    required_status_contexts: List[str] = field(default_factory=list)
+    #: How long to wait for the production deployment carrying the merge commit
+    #: to reach READY. Bounded on purpose: an unbounded wait is indistinguishable
+    #: from a hang, and "still building" is not "verified". On timeout the
+    #: incident escalates rather than resolving.
+    production_timeout_seconds: float = 900.0
+    #: How often to ask Vercel which production deployments exist.
+    production_poll_seconds: float = 15.0
+    #: Delete the incident branch after a successful merge. Off by default: a
+    #: merged branch is the cheapest way for a human to inspect what landed.
+    delete_branch_on_merge: bool = False
+
+
+@dataclass(slots=True)
+class ReliabilityWatchConfig:
+    """The 24/7 supervisor.
+
+    ``enabled`` gates unattended operation; the watcher can still be started
+    explicitly with ``jarvis reliability watch`` for a supervised session.
+    """
+
+    enabled: bool = False
+    interval_seconds: int = 60
+    #: One repair at a time. Two coding agents in two worktrees producing two
+    #: pull requests for the same root cause is worse than a slower queue.
+    max_concurrent_repairs: int = 1
+    #: Wait this long before retrying a repair for an incident that just failed.
+    cooldown_seconds: int = 300
+    #: Park interrupted repairs on startup instead of resuming them.
+    recover_on_start: bool = True
+
+
+@dataclass(slots=True)
+class ReliabilityFlappingConfig:
+    """Detection of checks that alternate between pass and fail."""
+
+    enabled: bool = True
+    #: How many recent results to remember per probe.
+    window: int = 10
+    #: Pass->fail transitions inside the window that make it flapping. Counting
+    #: transitions rather than failures is deliberate: a long run of failures is
+    #: an outage and belongs on the repair path.
+    failure_threshold: int = 3
+    #: Never call something flapping before there is enough history to say so.
+    min_samples: int = 4
+
+
+@dataclass(slots=True)
+class ReliabilityNotificationConfig:
+    """Owner notification escalation."""
+
+    enabled: bool = False
+    #: Severity floor for routine notifications.
+    min_severity: str = "MEDIUM"
+    #: How long a CRITICAL incident may stay unresolved before JARVIS repeats
+    #: itself. 0 disables the reminder.
+    critical_escalation_minutes: int = 5
+    #: Providers to deliver through, in order. Only "telegram" and "console" are
+    #: implemented; SMS and voice need an external paid provider and are
+    #: deliberately absent (see docs/JARVIS_RELIABILITY.md).
+    providers: List[str] = field(default_factory=lambda: ["telegram"])
+
+
+@dataclass(slots=True)
+class ReliabilityNotifyConfig:
+    """Owner notifications."""
+
+    enabled: bool = False
+    channel: str = "telegram"
+    persona: bool = True  # JARVIS voice on user-facing messages
+    min_severity: str = "MEDIUM"
+    max_messages_per_hour: int = 20
+
+
+@dataclass
+class ReliabilityConfig:
+    """JARVIS autonomous reliability engineering settings.
+
+    Disabled by default.  Enabling it only starts *monitoring*; repair,
+    notifications and every integration are separately opt-in.
+    """
+
+    enabled: bool = False
+    db_path: str = field(
+        default_factory=lambda: str(get_config_dir() / "reliability" / "incidents.db")
+    )
+    site: ReliabilitySiteConfig = field(default_factory=ReliabilitySiteConfig)
+    probes: ReliabilityProbesConfig = field(default_factory=ReliabilityProbesConfig)
+    vercel: ReliabilityVercelConfig = field(default_factory=ReliabilityVercelConfig)
+    supabase: ReliabilitySupabaseConfig = field(
+        default_factory=ReliabilitySupabaseConfig
+    )
+    github: ReliabilityGitHubConfig = field(default_factory=ReliabilityGitHubConfig)
+    repair: ReliabilityRepairConfig = field(default_factory=ReliabilityRepairConfig)
+    policy: ReliabilityPolicyConfig = field(default_factory=ReliabilityPolicyConfig)
+    merge: ReliabilityMergeConfig = field(default_factory=ReliabilityMergeConfig)
+    notify: ReliabilityNotifyConfig = field(default_factory=ReliabilityNotifyConfig)
+    watch: ReliabilityWatchConfig = field(default_factory=ReliabilityWatchConfig)
+    flapping: ReliabilityFlappingConfig = field(
+        default_factory=ReliabilityFlappingConfig
+    )
+    notification: ReliabilityNotificationConfig = field(
+        default_factory=ReliabilityNotificationConfig
+    )
+
+
 @dataclass(slots=True)
 class SessionConfig:
     """Cross-channel session settings."""
@@ -1608,6 +1930,7 @@ class JarvisConfig:
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     workflow: WorkflowConfig = field(default_factory=WorkflowConfig)
+    reliability: ReliabilityConfig = field(default_factory=ReliabilityConfig)
     sessions: SessionConfig = field(default_factory=SessionConfig)
     a2a: A2AConfig = field(default_factory=A2AConfig)
     operators: OperatorsConfig = field(default_factory=OperatorsConfig)
@@ -1897,6 +2220,7 @@ def load_config(path: Optional[Path] = None) -> JarvisConfig:
             "sandbox",
             "scheduler",
             "workflow",
+            "reliability",
             "sessions",
             "a2a",
             "operators",

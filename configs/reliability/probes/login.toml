@@ -1,0 +1,68 @@
+# Login → dashboard.
+#
+# The canonical "does the site actually work" probe: a real browser, a real
+# form submission, and an assertion that the user lands somewhere useful.
+#
+# Credentials name ENVIRONMENT VARIABLES, never values. Use a dedicated,
+# non-privileged test account — see docs/JARVIS_SECURITY.md §6.
+#
+# Selectors below are placeholders: point them at your own markup before
+# enabling this probe.
+
+[probe]
+id = "auth-login"
+name = "Login reaches the dashboard"
+component = "authentication"
+severity = "critical"
+runner = "browser"
+enabled = false           # enable once the selectors match your app
+timeout_ms = 30000
+trace_on_failure = true
+
+[probe.schedule]
+type = "interval"
+value = "600"
+
+[probe.retry]
+attempts = 2
+confirm_runs = 2
+backoff_seconds = 30
+
+[probe.credentials]
+email = "JARVIS_TEST_USER_EMAIL"
+password = "JARVIS_TEST_USER_PASSWORD"
+
+[probe.assertions]
+no_console_errors = true
+no_failed_requests = true
+max_http_status = 399
+
+[[probe.steps]]
+action = "goto"
+url = "/login"
+
+[[probe.steps]]
+action = "fill"
+selector = "input[name=email]"
+value_from = "email"
+
+[[probe.steps]]
+action = "fill"
+selector = "input[name=password]"
+value_from = "password"
+
+[[probe.steps]]
+action = "click"
+selector = "button[type=submit]"
+
+[[probe.steps]]
+action = "wait_for_url"
+url = "/dashboard"
+
+[[probe.expect]]
+kind = "url"
+matches = "/dashboard"
+
+[[probe.expect]]
+kind = "visible"
+selector = "[data-testid=dashboard-root]"
