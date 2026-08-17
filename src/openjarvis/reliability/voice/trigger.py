@@ -37,7 +37,9 @@ REASONS = {
     "post_merge_failure": "a fix went live and production did not come good",
     "production_deployment_failed": "a production deployment failed",
     "human_required_production": "a production problem needs a human",
-    "critical_unhandled": "a critical fault JARVIS cannot safely handle",
+    # No product name here: this text is read out to the operator, and §0 of the
+    # assistant brief keeps "JARVIS" to logs, audit records and debug views.
+    "critical_unhandled": "a critical fault I cannot safely handle",
     "attempts_exhausted": "repair attempts ran out on a production outage",
     "security_event": "a security control refused something",
 }

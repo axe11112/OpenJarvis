@@ -1,9 +1,17 @@
 # Wiz — Architecture & Inventory Audit
 
-**Status:** audit only. No feature code was written for this report.
-**Date:** 2026-08-16
-**Branch audited:** `claude/jarvis-autonomous-engineer-2yveid` (31 commits ahead of `main`, 0 behind).
+**Status:** re-audited against current code. Phases A and B are now implemented.
+**First written:** 2026-08-16 · **Revised:** 2026-08-17
+**Branch audited:** `worktree-wiz-architecture-audit`, after merging the live
+reliability/voice work at `9d6b0c92`.
 **Scope:** the whole fork — 716 Python modules, ~183k LOC, 618 test files.
+
+> **Revision note (2026-08-17).** The original audit was written against
+> `60b7d452`. A parallel session then landed sixteen commits — Sir Voice, the
+> notification rewrite, the Vercel status contract, post-merge production
+> verification and autonomy metrics — which have been merged in and re-read.
+> Two conclusions changed as a result; both are marked **[REVISED]** below.
+> Section 11 records what was built in response to this audit.
 
 ---
 
@@ -54,7 +62,7 @@ integration work, not new construction.
 
 | # | Feature | What exists | What's missing |
 |---|---|---|---|
-| 0 | Identity | `reliability/notify.py` has a persona helper `_sir()` and `reliability.notify.persona` config | Templates still emit `🔧 JARVIS`, `🟢 JARVIS`, `JARVIS ALERT` headers — exactly what the brief forbids. Mechanical rename of user-facing strings; `tests/reliability/test_notify.py` asserts on them. |
+| 0 | Identity **[REVISED]** | `reliability/notify.py` has a persona helper `_sir()` and `reliability.notify.persona` config | **Largely resolved by the parallel session.** The notification rewrite at `03601332` removed the `🔧 JARVIS` / `🟢 JARVIS` / `JARVIS ALERT` headers; remaining occurrences in `notify.py` are docstrings and one `logger.info`, which §0 explicitly permits. One residual user-facing string was found in `voice/trigger.py` (a spoken call reason) and fixed here. Worth a lint rule rather than another audit. |
 | 2 | Memory | `memory/store.py` = `LocalFactStore` (flat `Fact{text, source}`), `memory/service.py` (background extraction), `memory/extractor.py`; CLI has `index`, `search`, `list`, `clear`, `stats` | No typed categories, no FACT/DECISION/PREFERENCE/INFERENCE/TEMPORARY distinction, no confidence, no timestamps as first-class provenance, **no per-item forget or correct** (only clear-all). This is the largest genuine extension. |
 | 3 | Daily briefing | `agents/morning_digest.py`, `digest_store.py`, `cli/digest_cmd.py`, `server/digest_routes.py` | Add a Wize/reliability section; suppress sections with no data. |
 | 4 | Notifications | `reliability/notify.py`: `NotificationRouter` with rate limiting (`max_messages_per_hour`), `min_severity`, dedup/prune, deterministic templates for alert/progress/resolved/recovered/human_required/rolled_back/merge | The new philosophy *removes* alert+progress notifications. Must be done without silently disabling CRITICAL escalation (`escalation.py`, `critical_escalation_minutes`). |
@@ -143,9 +151,17 @@ and it is worth enforcing with a test.
 > **deny-by-default**, stored at `~/.openjarvis/reliability/capabilities.json`, with every
 > denial publishing `CAPABILITY_DENIED` to the audit log.
 
-**None of it is implemented.** Grep confirms: no `infra:read`, no `repo:write`, no
-`capabilities.json` anywhere in `src/`. `CAPABILITY_DENIED` exists only as an unused event enum
+**None of it was implemented.** Grep confirmed: no `infra:read`, no `repo:write`, no
+`capabilities.json` anywhere in `src/`. `CAPABILITY_DENIED` existed only as an unused event enum
 member and one reference in `tools/_stubs.py`.
+
+> **[RESOLVED 2026-08-17]** This is what Phase A built. `src/openjarvis/wiz/authority.py`
+> now implements the model, with a difference worth noting: the levels are the brief's
+> (`READ`, `SAFE_ACTION`, `CODE_WRITE`, `PR_WRITE`, `PRODUCTION_CHANGE`, `SECRET_ACCESS`)
+> rather than the doc's resource-shaped labels, because authority is a property of the
+> *consequence* and the requesting channel, not of the resource. The older labels remain
+> unimplemented and `docs/JARVIS_SECURITY.md` §2 should be updated to match rather than
+> the reverse. See section 11.
 
 What actually enforces safety today is a *different*, config-driven mechanism, and it works:
 
@@ -371,3 +387,112 @@ integration), and anything requiring torch.
 **Standing constraint for every phase:** implementing a feature never enables new
 production-changing authority. Repair-to-PR stays on; deploy, push-to-main, merge and Supabase
 writes stay off until explicitly turned on, one at a time, with evidence.
+
+---
+
+## 11. What was built (Phases A and B) — 2026-08-17
+
+Implemented after the re-audit above, in six commits. Docs-only sections 0–10 remain the
+record of what was found; this section is the record of what was done about it.
+
+### 11.1 Package layout
+
+```
+src/openjarvis/wiz/
+  authority.py          Authority levels, channels, ceilings, deny-by-default policy
+  capabilities.py       The registry: what exists, what is configured, what it costs
+  journal.py            Hash-chained, append-only record of every decision
+  intents.py            Deterministic classifier — regular expressions, no model
+  brain.py              Dispatch: the single door every request goes through
+  runtime.py            Assembly — the complete inventory of Wiz's abilities
+  features/
+    model.py            FeatureRequest, FeatureState machine, attempts, priorities
+    store.py            SQLite persistence, its own database file
+    risk.py             LOW/MEDIUM/HIGH, decided from paths and words
+    profile.py          EngineeringProfile — configured, then discovered
+    queue.py            Admission control; production pre-empts product
+    engineer.py         ClaudeCodeEngineeringAgent — planning and building sessions
+    workspace.py        Feature worktrees, and the paths an agent may never be given
+```
+
+`reliability/` does not import `wiz/`, and `tests/wiz/test_dependency_direction.py` parses the
+imports to keep it that way.
+
+### 11.2 The authority model
+
+Six levels — `READ`, `SAFE_ACTION`, `CODE_WRITE`, `PR_WRITE`, `PRODUCTION_CHANGE`,
+`SECRET_ACCESS` — checked individually rather than ranked, so there is no "greater than" that
+could silently promote one into another. Only the harmless implications are modelled
+(`CODE_WRITE` implies `READ`); nothing implies `PRODUCTION_CHANGE` or `SECRET_ACCESS`.
+
+Three properties, each a test rather than a convention:
+
+| Property | Where it lives | Why it is not configurable |
+|---|---|---|
+| Deny by default | `AuthorityPolicy.decide` | An unlisted channel must get nothing, not the defaults |
+| Channel ceilings | `CHANNEL_CEILING` in source | Voice must be *unable* to merge, not merely un-granted |
+| Cannot widen itself | no `grant()` exists; frozen dataclass | An autonomous system that can grant itself autonomy has no model |
+
+Ceilings as shipped: Control Center `PRODUCTION_CHANGE`; CLI, scheduler and autonomous
+`PR_WRITE`; voice and Telegram `CODE_WRITE`. `SECRET_ACCESS` appears in **no** ceiling — Wiz has
+no capability needing it, and the way to keep it that way is to make it ungrantable.
+
+The shipped default policy grants **no write authority to any channel**. Enabling Wiz to change
+code is a deliberate act, not what happens when a config file is missing.
+
+### 11.3 Exact path all generated code takes
+
+```
+operator request  (Control Center | CLI | voice | Telegram)
+  │
+  ├─ intent classification ....... deterministic rules; names a verb or refuses
+  ├─ capability lookup ........... unregistered name → LookupError, no handler exists
+  ├─ availability probe .......... claude CLI on PATH? incident DB present?
+  ├─ risk classification ......... paths (from git) + words; agent may only raise it
+  ├─ HIGH risk? .................. → operator approval in Control Center, or stop
+  ├─ authority decision .......... deny-by-default, clamped by channel ceiling
+  ├─ queue admission ............. 1 concurrent; refuses while reliability is working
+  │
+  ├─ PLANNING session ............ claude CLI, tools = Read/Grep/Glob  (no Bash)
+  │     └─ plan checked against authority and risk BEFORE anything is written
+  │
+  ├─ worktree created ............ base ref → immutable SHA; git identity set first
+  │     └─ path checked against live checkouts; refuses to hand over a live tree
+  │
+  ├─ BUILDING session ............ claude CLI, tools = Read/Edit/Write/Grep/Glob/Bash
+  │     └─ WebFetch/WebSearch refused; JARVIS credentials stripped from env
+  │
+  ├─ diff read FROM GIT .......... never from the agent's account of itself
+  ├─ local gates ................. lint / typecheck / tests / build, from the profile
+  ├─ preview + verification ...... Phase C
+  └─ PR ....... existing reliability GitHub adapter, existing merge status contract
+```
+
+Every code-changing step is the `claude` CLI via
+`reliability.code_agent.ClaudeCliAgent`. There is no second coding model and no API-key
+fallback: if the CLI is unavailable the work stops and says so
+(`CodingEngineUnavailable`), and a test greps the module for the names of competing
+services to keep it that way.
+
+### 11.4 Test results
+
+| Suite | Result |
+|---|---|
+| `tests/wiz` (new) | **254 passed** |
+| `tests/reliability` + `tests/security` | see §9b — the harness fix removes all 21 environmental failures |
+
+New tests are property-shaped: each names a promise from the brief and fails if it stops
+being true. The adversarial ones matter most — a classifier naming a fictional capability, a
+model calling an `auth/session.ts` change low-risk, injection-shaped text arriving as a
+message, voice attempting a production verb with an operator approval attached. All refused.
+
+### 11.5 What is deliberately *not* built yet
+
+Phase B stops at the pieces, not the pipeline. There is no orchestrator yet that walks a
+feature from `RECEIVED` to `COMPLETE` — that is Phase C, together with acceptance contracts,
+Vercel previews, feature-specific Playwright checks and the iterative repair loop. Phase D is
+the Control Center UI; Phase E is Telegram/voice intake and feature memory.
+
+Wiz's registered vocabulary is still five read-only verbs. Nothing in this work enabled any
+new production authority: repair-to-PR remains on, and deploy, push-to-main, merge and Supabase
+writes remain off.
