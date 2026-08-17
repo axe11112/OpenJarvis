@@ -27,13 +27,29 @@ def _source(**kwargs) -> VercelSource:
     return VercelSource(**kwargs)
 
 
+def _now_ms() -> int:
+    """Milliseconds since the epoch, now.
+
+    The fixture used to hard-code a timestamp, which stopped working the moment
+    the source learned to ignore failures older than a few hours. A test about
+    severity should not also be a test about the calendar.
+    """
+    import time
+
+    return int(time.time() * 1000)
+
+
+def _hours_ago_ms(hours: float) -> int:
+    return _now_ms() - int(hours * 3600 * 1000)
+
+
 def _deployment(**overrides):
     base = {
         "uid": "dpl_1",
         "readyState": "READY",
         "target": "production",
         "url": "site-abc.vercel.app",
-        "createdAt": 1786000000000,
+        "createdAt": _now_ms(),
         "meta": {
             "githubCommitSha": "aaa111",
             "githubCommitRef": "main",
@@ -56,7 +72,7 @@ class TestListDeployments:
         assert deployments[0]["branch"] == "main"
         assert deployments[0]["url"].startswith("https://")
         assert deployments[0]["commit_message"] == "fix: auth"
-        assert deployments[0]["created_at"].startswith("2026-")
+        assert deployments[0]["created_at"].startswith("20")
 
     def test_handles_missing_meta(self, respx_mock):
         respx_mock.get(f"{API}/v6/deployments").mock(
@@ -288,3 +304,46 @@ class TestPollAndHealth:
         health = VercelSource(project_id=PROJECT).health()
         assert not health.reachable
         assert "VERCEL_READONLY_TOKEN" in health.detail
+
+
+# ---------------------------------------------------------------------------
+# Age bounding
+#
+# Written from a real failure. Four production deployments were cancelled within
+# fifteen seconds of each other on 15 August — superseded seventeen seconds
+# later by a READY one, and followed by nine more successful production
+# deployments. Two days later the poll was still reporting all four on every
+# cycle: 328 occurrences each, holding four HIGH incidents open against a site
+# that was entirely healthy.
+# ---------------------------------------------------------------------------
+
+
+class TestSignalAgeBound:
+    def _listing(self, respx_mock, **overrides):
+        respx_mock.get(f"{API}/v6/deployments").mock(
+            return_value=httpx.Response(
+                200, json={"deployments": [_deployment(**overrides)]}
+            )
+        )
+
+    def test_a_recent_failure_is_news(self, respx_mock):
+        self._listing(respx_mock, readyState="ERROR", createdAt=_hours_ago_ms(1))
+        assert len(_source().poll()) == 1
+
+    def test_a_two_day_old_failure_is_history(self, respx_mock):
+        self._listing(respx_mock, readyState="ERROR", createdAt=_hours_ago_ms(48))
+        assert _source().poll() == []
+
+    def test_the_window_is_configurable(self, respx_mock):
+        self._listing(respx_mock, readyState="ERROR", createdAt=_hours_ago_ms(48))
+        assert len(_source(max_signal_age_hours=72).poll()) == 1
+
+    def test_zero_disables_the_bound(self, respx_mock):
+        """An operator who wants everything can still have everything."""
+        self._listing(respx_mock, readyState="ERROR", createdAt=_hours_ago_ms(500))
+        assert len(_source(max_signal_age_hours=0).poll()) == 1
+
+    def test_a_deployment_with_no_timestamp_is_still_reported(self, respx_mock):
+        """Unknown age must not become a silent drop."""
+        self._listing(respx_mock, readyState="ERROR", createdAt="not-a-number")
+        assert len(_source().poll()) == 1

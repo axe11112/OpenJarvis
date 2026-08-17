@@ -335,3 +335,86 @@ class TestLifecycle:
         monitor.start(poll_interval=0.01)
         monitor.start(poll_interval=0.01)
         monitor.stop(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Source watermarks
+#
+# ``poll()`` was called with no ``since`` for as long as ``_poll_source``
+# existed, so every cycle re-reported every failure still in the API's newest
+# page. Four cancelled production deployments from 15 August were still being
+# re-reported two days later — 328 occurrences each — holding four HIGH
+# incidents open against a healthy site.
+# ---------------------------------------------------------------------------
+
+
+class _CountingSource:
+    """Records what ``since`` it was asked for, and returns one fixed signal."""
+
+    source_id = "counting"
+
+    def __init__(self, occurred_at="2026-08-17T12:00:00+00:00"):
+        self.occurred_at = occurred_at
+        self.since_values = []
+
+    def poll(self, *, since=None):
+        self.since_values.append(since)
+        from openjarvis.reliability.types import Severity, Signal, TrustLevel
+
+        return [
+            Signal(
+                source=self.source_id,
+                kind="deployment_failed",
+                title="preview deployment error",
+                detail="https://example.vercel.app",
+                severity=Severity.MEDIUM,
+                component="deployment",
+                external_id="dpl_1",
+                occurred_at=self.occurred_at,
+                trust=TrustLevel.EXTERNAL,
+            )
+        ]
+
+
+class _LegacySource:
+    """A source written before ``since`` existed."""
+
+    source_id = "legacy"
+
+    def __init__(self):
+        self.calls = 0
+
+    def poll(self):
+        self.calls += 1
+        return []
+
+
+class TestSourceWatermarks:
+    def test_the_second_poll_asks_only_for_news(self, store):
+        monitor = _monitor(store, _Executor(), _Clock())
+        source = _CountingSource()
+        monitor.add_source(source)
+
+        monitor._poll_source(source)
+        monitor._poll_source(source)
+
+        assert source.since_values[0] is None
+        assert source.since_values[1] == "2026-08-17T12:00:00+00:00"
+
+    def test_a_source_that_predates_since_still_gets_polled(self, store):
+        monitor = _monitor(store, _Executor(), _Clock())
+        source = _LegacySource()
+        monitor.add_source(source)
+        monitor._poll_source(source)
+        monitor._poll_source(source)
+        assert source.calls == 2
+
+    def test_the_watermark_never_goes_backwards(self, store):
+        monitor = _monitor(store, _Executor(), _Clock())
+        source = _CountingSource(occurred_at="2026-08-17T12:00:00+00:00")
+        monitor.add_source(source)
+        monitor._poll_source(source)
+        source.occurred_at = "2026-08-01T00:00:00+00:00"  # an older signal arrives
+        monitor._poll_source(source)
+        monitor._poll_source(source)
+        assert source.since_values[-1] == "2026-08-17T12:00:00+00:00"

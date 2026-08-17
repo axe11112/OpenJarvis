@@ -41,6 +41,20 @@ _API_ROOT = "https://api.vercel.com"
 #: Vercel deployment states that mean "this did not ship".
 FAILED_STATES = frozenset({"ERROR", "CANCELED"})
 
+#: How old a failed deployment may be and still count as news, in hours.
+#:
+#: Without this the poll re-reported every failed build in the newest twenty on
+#: every cycle, forever. Four production deployments cancelled within fifteen
+#: seconds of each other on 15 August — superseded seventeen seconds later by a
+#: READY one, and followed by nine more successful production deployments — were
+#: still being re-reported 328 times two days later, holding four HIGH incidents
+#: open against a site that was entirely healthy.
+#:
+#: A build that failed yesterday is history, not an alert. Six hours is long
+#: enough that an overnight failure is still waiting in the morning, short
+#: enough that nothing accumulates.
+DEFAULT_MAX_SIGNAL_AGE_HOURS = 6.0
+
 #: Cap on retained build-log text.
 _MAX_LOG_CHARS = 8000
 
@@ -67,9 +81,11 @@ class VercelSource(BaseSignalSource):
         team_id: str = "",
         token_env: str = "VERCEL_READONLY_TOKEN",
         client: Optional[ResilientClient] = None,
+        max_signal_age_hours: float = DEFAULT_MAX_SIGNAL_AGE_HOURS,
     ) -> None:
         self.project_id = project_id
         self.team_id = team_id
+        self.max_signal_age_hours = max_signal_age_hours
         self._token_env = token_env
         self._client = client
 
@@ -198,18 +214,35 @@ class VercelSource(BaseSignalSource):
     # -- signal source contract -------------------------------------------
 
     def poll(self, *, since: Optional[str] = None) -> List[Signal]:
-        """Report failed deployments as signals."""
+        """Report *recent* failed deployments as signals.
+
+        Two bounds, and both are needed. ``since`` is the caller's watermark and
+        stops the same failure being reported twice in one process. The age
+        cutoff is what survives a restart, which is where the watermark cannot
+        help: a fresh process has no memory and would otherwise re-report every
+        historical failure it can still see.
+        """
         try:
             deployments = self.list_deployments(limit=20)
         except (httpx.HTTPError, CircuitOpenError, MissingTokenError) as exc:
             logger.warning("vercel: poll failed (%s)", exc)
             return []
 
+        cutoff = self._age_cutoff()
         signals: List[Signal] = []
         for deployment in deployments:
             if deployment["state"] not in FAILED_STATES:
                 continue
-            if since and deployment["created_at"] and deployment["created_at"] <= since:
+            created = deployment["created_at"] or ""
+            if cutoff and created and created < cutoff:
+                logger.debug(
+                    "vercel: %s failed at %s, older than the %sh window; not news",
+                    deployment["id"],
+                    created,
+                    self.max_signal_age_hours,
+                )
+                continue
+            if since and created and created <= since:
                 continue
             production = deployment["target"] == "production"
             signals.append(
@@ -238,6 +271,17 @@ class VercelSource(BaseSignalSource):
                 )
             )
         return signals
+
+    def _age_cutoff(self) -> str:
+        """The oldest ``created_at`` still worth reporting, as an ISO string."""
+        if not self.max_signal_age_hours or self.max_signal_age_hours <= 0:
+            return ""
+        from datetime import datetime, timedelta, timezone
+
+        return (
+            datetime.now(timezone.utc)
+            - timedelta(hours=float(self.max_signal_age_hours))
+        ).isoformat()
 
     def health(self) -> SourceHealth:
         """Check that the project is reachable with the configured token."""

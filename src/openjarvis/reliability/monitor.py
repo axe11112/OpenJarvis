@@ -123,6 +123,12 @@ class ReliabilityMonitor:
         jitter: Callable[[], float] = random.random,
     ) -> None:
         self._detector = detector
+        #: Newest signal timestamp seen per source, so a poll asks for news
+        #: rather than for history. In memory on purpose: the durable guard
+        #: against re-reporting after a restart is the source's own age cutoff,
+        #: and a persisted watermark could silently swallow a real signal that
+        #: arrived while the process was down.
+        self._watermarks: Dict[str, str] = {}
         self._executor = executor
         self._repair_loop = repair_loop
         self._notifier = notifier
@@ -279,9 +285,32 @@ class ReliabilityMonitor:
             self._maybe_repair(incident, spec)
 
     def _poll_source(self, source: Any) -> None:
-        signals = source.poll()
+        """Poll one signal source, asking only for what is new.
+
+        The watermark is the whole point. ``poll()`` was called with no ``since``
+        for as long as this method existed, so every cycle re-reported every
+        failed deployment still in the API's newest page. Four production
+        deployments cancelled on 15 August — superseded seventeen seconds later,
+        and followed by nine successful production deployments — were still being
+        re-reported 328 times two days later, holding four HIGH incidents open
+        against a site that was completely healthy.
+        """
+        source_id = str(getattr(source, "source_id", "") or id(source))
+        since = self._watermarks.get(source_id)
+        try:
+            signals = source.poll(since=since) if since else source.poll()
+        except TypeError:
+            # A source that predates the argument. Never a reason to stop
+            # polling it.
+            signals = source.poll()
         for detection in self._detector.from_signals(signals):
             self._account(detection)
+        newest = max(
+            (str(getattr(s, "occurred_at", "") or "") for s in signals),
+            default="",
+        )
+        if newest and newest > (since or ""):
+            self._watermarks[source_id] = newest
 
     def _account(self, detection: Detection) -> None:
         if detection.opened:
