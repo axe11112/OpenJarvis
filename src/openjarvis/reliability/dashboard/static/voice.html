@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d10">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Sir">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="stylesheet" href="/static/voice.css">
+<title>Sir</title>
+</head>
+<body data-control-token="__CONTROL_TOKEN__" data-voice="__VOICE_ENABLED__">
+
+<!-- The incoming-call screen. Shown first; it is what a notification opens. -->
+<main id="ringing" class="screen">
+  <div class="caller">
+    <img src="/static/wiz.svg" alt="" class="avatar avatar--ringing">
+    <h1>Sir</h1>
+    <p class="subtitle" id="ring-reason">is calling</p>
+    <p class="detail" id="ring-detail"></p>
+  </div>
+  <div class="actions">
+    <button id="decline" class="round round--decline" aria-label="Decline">
+      <span aria-hidden="true">✕</span>
+      <em>Decline</em>
+    </button>
+    <button id="answer" class="round round--answer" aria-label="Answer">
+      <span aria-hidden="true">✆</span>
+      <em>Answer</em>
+    </button>
+  </div>
+</main>
+
+<!-- The call itself. -->
+<main id="call" class="screen" hidden>
+  <header class="call-head">
+    <img src="/static/wiz.svg" alt="" class="avatar avatar--small">
+    <div>
+      <h2>Sir</h2>
+      <p class="status" id="state">connecting…</p>
+    </div>
+  </header>
+
+  <section class="transcript" id="transcript" aria-live="polite" aria-label="Conversation"></section>
+
+  <div class="composer">
+    <input id="typed" type="text" inputmode="text" autocomplete="off"
+           placeholder="…or type instead" aria-label="Type to Sir">
+    <button id="send" class="pill">Send</button>
+  </div>
+
+  <div class="actions actions--call">
+    <button id="talk" class="round round--talk" aria-label="Hold to talk">
+      <span aria-hidden="true">🎙</span>
+      <em id="talk-label">Hold to talk</em>
+    </button>
+    <button id="hangup" class="round round--decline" aria-label="Hang up">
+      <span aria-hidden="true">✕</span>
+      <em>End</em>
+    </button>
+  </div>
+</main>
+
+<!-- Waiting for a human: things a voice asked for and may not have. -->
+<section id="pending" class="pending" hidden>
+  <h3>Needs your confirmation</h3>
+  <ul id="pending-list"></ul>
+</section>
+
+<!-- Sir's own health, and the one button that proves the phone rings. -->
+<section class="pending pending--health">
+  <h3>Sir</h3>
+  <ul id="health-list"></ul>
+  <button id="test-call" class="pill">Test call</button>
+</section>
+
+<p class="tiny" id="footnote"></p>
+
+<script src="/static/voice.js"></script>
+</body>
+</html>

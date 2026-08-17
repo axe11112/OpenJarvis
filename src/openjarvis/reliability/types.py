@@ -109,6 +109,19 @@ class IncidentState(str, Enum):
     FIXING = "FIXING"
     TESTING = "TESTING"
     VERIFYING = "VERIFYING"
+    #: The fix is on the default branch and production has not yet proved it.
+    #:
+    #: This window exists whether or not it is named, and it is the most
+    #: dangerous one in the whole lifecycle: the change is live-bound, and the
+    #: only evidence so far came from a preview deployment of a different
+    #: commit. Naming it means an operator can see an incident sitting here, a
+    #: crash cannot leave one silently counted as fixed, and the transition
+    #: graph can enforce that nothing reaches ``RESOLVED`` by merging alone.
+    #:
+    #: Only reached when automatic merge is enabled *and* the merge succeeded.
+    #: The pull-request-only flow goes ``VERIFYING -> RESOLVED`` as it always
+    #: has.
+    MERGED = "MERGED"
     RESOLVED = "RESOLVED"
     FAILED = "FAILED"
     HUMAN_REQUIRED = "HUMAN_REQUIRED"
@@ -195,10 +208,23 @@ LEGAL_TRANSITIONS: Dict[IncidentState, FrozenSet[IncidentState]] = {
     ),
     IncidentState.VERIFYING: frozenset(
         {
-            IncidentState.RESOLVED,  # the ONLY automatic path to RESOLVED
+            IncidentState.RESOLVED,  # preview verified, pull request delivered
+            IncidentState.MERGED,  # ...or the merge gates let it onto main
             IncidentState.FIXING,  # verification failed — next repair attempt
             IncidentState.HUMAN_REQUIRED,
             IncidentState.RECOVERY_REQUIRED,
+            IncidentState.FAILED,
+        }
+    ),
+    #: Deliberately NOT back to FIXING. Once the change is on the default
+    #: branch, "try again" is no longer a repair — it is a second unreviewed
+    #: change stacked on a live one that is already suspect. Production either
+    #: proves the merge or a human takes it.
+    IncidentState.MERGED: frozenset(
+        {
+            IncidentState.RESOLVED,  # production verified the merged fix
+            IncidentState.HUMAN_REQUIRED,
+            IncidentState.RECOVERY_REQUIRED,  # interrupted mid-verification
             IncidentState.FAILED,
         }
     ),
@@ -567,6 +593,11 @@ class RepairAttempt:
     scope: Dict[str, Any] = field(default_factory=dict)
     #: Insertions plus deletions against the base commit, for the scope guard.
     lines_changed_total: int = 0
+    #: Which hypothesis this attempt was working from — a key from
+    #: :data:`openjarvis.reliability.playbook.STRATEGIES`. Recorded so the next
+    #: attempt can try a *different* idea rather than the same one louder, and
+    #: so a handover can say which ideas have already been eliminated.
+    strategy: str = ""
     #: Test files the agent added or modified — the regression-test question.
     regression_tests: List[str] = field(default_factory=list)
 
@@ -604,6 +635,7 @@ class RepairAttempt:
             "checks": dict(self.checks),
             "scope": dict(self.scope),
             "lines_changed_total": self.lines_changed_total,
+            "strategy": self.strategy,
             "regression_tests": list(self.regression_tests),
         }
 
@@ -635,6 +667,7 @@ class RepairAttempt:
             checks=dict(d.get("checks") or {}),
             scope=dict(d.get("scope") or {}),
             lines_changed_total=int(d.get("lines_changed_total", 0) or 0),
+            strategy=d.get("strategy", ""),
             regression_tests=list(d.get("regression_tests") or []),
         )
 

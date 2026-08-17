@@ -139,6 +139,28 @@ class TestStateMachine:
         incident.transition_to(IncidentState.ROLLED_BACK, reason="regression")
         assert incident.state is IncidentState.ROLLED_BACK
 
+    def test_verifying_may_go_to_merged(self):
+        incident = _incident(state=IncidentState.VERIFYING)
+        incident.transition_to(IncidentState.MERGED, reason="merged, production next")
+        assert incident.state is IncidentState.MERGED
+
+    def test_merged_may_resolve_or_escalate(self):
+        for target in (IncidentState.RESOLVED, IncidentState.HUMAN_REQUIRED):
+            incident = _incident(state=IncidentState.MERGED)
+            incident.transition_to(target, reason="production had its say")
+            assert incident.state is target
+
+    def test_merged_can_never_go_back_to_fixing(self):
+        """Once the change is on the default branch, "try again" would stack a
+        second unreviewed change on a live one already under suspicion."""
+        incident = _incident(state=IncidentState.MERGED)
+        with pytest.raises(InvalidTransitionError):
+            incident.transition_to(IncidentState.FIXING)
+
+    def test_merged_is_not_terminal(self):
+        """It is a state something must still happen to, not a resting place."""
+        assert IncidentState.MERGED not in TERMINAL_STATES
+
     def test_terminal_states(self):
         assert IncidentState.HUMAN_REQUIRED in TERMINAL_STATES
         assert IncidentState.DETECTED not in TERMINAL_STATES

@@ -189,9 +189,15 @@ class Detector:
                 IncidentState.FIXING,
                 IncidentState.TESTING,
                 IncidentState.VERIFYING,
+                IncidentState.MERGED,
             ):
                 # A repair is mid-flight; let the repair loop finish rather than
                 # racing it to a conclusion.
+                #
+                # ``MERGED`` especially: one probe going green is a far weaker
+                # claim than the post-merge verification currently running, and
+                # letting it close the incident would discard the fleet result
+                # that is about to arrive.
                 continue
             if not incident.can_transition_to(IncidentState.RESOLVED):
                 continue

@@ -100,6 +100,10 @@
   <!-- ================= incidents ================= -->
   <section class="section">
     <h2>Incidents <span class="count" id="incidentCount"></span></h2>
+    <!-- How much JARVIS actually handled. Not a score to be maximised:
+         escalating a real outage is correct, and a system tuned to keep this
+         number up would be a system that hides problems. -->
+    <div class="autonomy" id="autonomy" hidden></div>
     <div class="incidents" id="incidents"></div>
   </section>
 

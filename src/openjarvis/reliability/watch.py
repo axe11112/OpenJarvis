@@ -70,10 +70,17 @@ __all__ = [
 ]
 
 #: States that mean a repair was in flight when the process stopped.
+#:
+#: ``MERGED`` is the most important entry: a process that died there left a
+#: change on the default branch whose production verification never finished.
+#: Parking it demands a human look, which is the only safe reading — the
+#: alternative is an incident that is neither being verified nor known to be
+#: bad, sitting quietly while the code is live.
 IN_FLIGHT_STATES = (
     IncidentState.FIXING,
     IncidentState.TESTING,
     IncidentState.VERIFYING,
+    IncidentState.MERGED,
 )
 
 
@@ -491,13 +498,54 @@ class WatchSupervisor:
         return self.flapping.record(probe_id, failed=failed)
 
     def escalate_flapping(self, incident: Incident, verdict: FlappingVerdict) -> bool:
-        """Mark *incident* flapping and hand it to a human.
+        """Record that a check is flapping, and stop repairing it.
 
         Returns ``True`` when the incident was escalated by this call.
+
+        Flapping means the *check* is unreliable — it has changed its mind
+        several times in a few minutes. That is a statement about the monitor,
+        not about production, and it is exactly the wrong moment to write code:
+        a repair verified against a check that alternates proves nothing.
+
+        Whether it also deserves a person depends on what is flapping. A
+        genuinely severe fault that keeps recurring does. A check whose only
+        complaint is that the site answered slowly does not — it is noise from a
+        busy machine, and escalating it woke the owner twice in one night for a
+        homepage that was returning 200 the whole time.
         """
         if incident.state is IncidentState.HUMAN_REQUIRED:
             return False
         incident.metadata["flapping"] = verdict.to_dict()
+        if incident.severity.rank < Severity.HIGH.rank:
+            # Recorded, repair suppressed, nobody woken. The incident stays open
+            # and closes itself when the check settles.
+            try:
+                self.store.add_evidence(
+                    incident,
+                    Evidence(
+                        kind=EvidenceKind.NOTE,
+                        summary="Flapping check, left to settle",
+                        content=(
+                            f"{verdict.reason}\n\n"
+                            "Severity is below HIGH, so this is treated as an "
+                            "unreliable check rather than a production fault. "
+                            "No repair is attempted and no one is notified."
+                        ),
+                        source="watch",
+                        trust=TrustLevel.TRUSTED,
+                    ),
+                )
+                self.store.save(incident)
+            except Exception:
+                logger.exception("could not record flapping for %s", incident.id)
+            self.flapping.reset(verdict.probe_id)
+            logger.info(
+                "Incident %s: %s is flapping at %s severity; left to settle",
+                incident.id,
+                verdict.probe_id,
+                incident.severity.value,
+            )
+            return False
         try:
             self.store.add_evidence(
                 incident,

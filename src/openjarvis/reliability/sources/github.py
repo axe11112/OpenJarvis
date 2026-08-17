@@ -23,7 +23,7 @@ from __future__ import annotations
 import fnmatch
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import httpx
 
@@ -546,7 +546,12 @@ class GitHubSource(BaseSignalSource):
             "url": raw.get("html_url", ""),
         }
 
-    def combined_status(self, sha: str) -> Dict[str, Any]:
+    def combined_status(
+        self,
+        sha: str,
+        *,
+        required_contexts: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
         """Report CI's verdict on *sha* from both status APIs.
 
         GitHub has two, and a repository can use either: the legacy combined
@@ -554,52 +559,194 @@ class GitHubSource(BaseSignalSource):
         Actions uses. Reading only one reports "no CI" for half the world, so
         both are read and the pessimistic answer wins.
 
-        ``state`` is ``"success"``, ``"failure"``, ``"pending"`` or ``"none"``.
-        ``"none"`` means nothing reported at all — deliberately its own value,
-        because "no CI ran" and "CI passed" are different facts and only one of
-        them is evidence.
+        ``state`` is ``"success"``, ``"failure"``, ``"pending"``, ``"none"`` or
+        ``"unreadable"``. The last two are distinct from each other and from
+        ``"success"``, and keeping them apart is the whole point:
+
+        ``"none"``
+            Nothing was reported. "No CI ran" is not "CI passed".
+        ``"unreadable"``
+            The credential is not permitted to look. A fine-grained token
+            without *Commit statuses: Read* and *Checks: Read* gets 403 on both
+            endpoints below.
+
+        Collapsing ``unreadable`` into ``none`` — or letting the 403 escape as
+        an exception the caller reports as "could not read the pull request" —
+        turns a blind spot into an observation and sends whoever is debugging it
+        looking for absent CI instead of an absent permission. Found against a
+        real repository whose Vercel status was green the entire time and simply
+        could not be seen. ``missing_permissions`` names what to grant.
+
+        Naming *required_contexts* changes the question being asked. Without
+        them the verdict is "is anything, anywhere, not green", which no
+        credential can answer while half the evidence is behind a 403. With
+        them it is "did *these named* contexts report success on this commit" —
+        a question the Commit Statuses API answers by itself, so a Checks API
+        that refuses to open is reported as unavailable rather than treated as
+        a blind spot that poisons the verdict. It is never treated as consent:
+        the named contexts must be found and green on their own evidence, and a
+        Commit Statuses API that cannot be read is still ``"unreadable"``,
+        because that is the API the answer now rests on.
+
+        This is what makes the gate usable by a GitHub fine-grained token, which
+        has no Checks permission to grant at all.
+
+        Extra keys when *required_contexts* is given: ``required`` maps each
+        named context to what was observed (its state, ``"missing"`` or
+        ``"unreadable"``), ``missing_required`` lists those not found. ``sha``
+        always echoes the commit the verdict describes, so a caller can prove
+        the answer is about the commit it asked about.
         """
+        required = [str(c) for c in (required_contexts or []) if str(c).strip()]
         states: List[str] = []
         contexts: List[str] = []
+        denied: List[str] = []
+        #: context name -> worst state seen for it, so a context reported twice
+        #: cannot be rescued by its better half.
+        observed: Dict[str, str] = {}
+        readable = {"statuses": True, "checks": True}
 
-        combined = (
-            self.client.get_json(f"/repos/{self.repo}/commits/{sha}/status", default={})
-            or {}
-        )
-        for item in combined.get("statuses") or []:
-            states.append(str(item.get("state", "")).lower())
-            contexts.append(str(item.get("context", "")))
-
-        runs = (
-            self.client.get_json(
-                f"/repos/{self.repo}/commits/{sha}/check-runs",
-                params={"per_page": 100},
-                default={},
+        def _worst(current: str, incoming: str) -> str:
+            rank = {"success": 0, "pending": 1, "error": 2, "failure": 2}
+            return (
+                incoming if rank.get(incoming, 2) >= rank.get(current, 2) else current
             )
-            or {}
+
+        def _observe(context: str, state: str) -> None:
+            contexts.append(context)
+            states.append(state)
+            observed[context] = (
+                _worst(observed[context], state) if context in observed else state
+            )
+
+        def _read(
+            path: str, permission: str, which: str, **params: Any
+        ) -> Dict[str, Any]:
+            """Read *path*, recording a permission denial rather than raising."""
+            try:
+                return (
+                    self.client.get_json(path, params=params or None, default={}) or {}
+                )
+            except (httpx.HTTPStatusError, CircuitOpenError) as exc:
+                status = getattr(getattr(exc, "response", None), "status_code", 0)
+                # 404 is included on purpose: GitHub returns it instead of 403
+                # for resources a token may not even know exist.
+                if status in (401, 403, 404):
+                    denied.append(permission)
+                    readable[which] = False
+                    logger.warning(
+                        "github: cannot read %s (HTTP %s) — the token is missing "
+                        "the '%s' permission",
+                        path,
+                        status,
+                        permission,
+                    )
+                    return {}
+                raise
+
+        combined = _read(
+            f"/repos/{self.repo}/commits/{sha}/status",
+            "Commit statuses: Read",
+            "statuses",
+        )
+        # GitHub echoes the commit it answered about. If that is not the commit
+        # asked about, the answer is evidence about someone else's code — treat
+        # it as no answer at all rather than as a verdict.
+        echoed = str(combined.get("sha") or "")
+        if echoed and echoed != sha:
+            readable["statuses"] = False
+            denied.append(f"commit status answered for {echoed[:12]}, not {sha[:12]}")
+            combined = {}
+        for item in combined.get("statuses") or []:
+            _observe(str(item.get("context", "")), str(item.get("state", "")).lower())
+
+        runs = _read(
+            f"/repos/{self.repo}/commits/{sha}/check-runs",
+            "Checks: Read",
+            "checks",
+            per_page=100,
         )
         for run in runs.get("check_runs") or []:
-            contexts.append(str(run.get("name", "")))
             if str(run.get("status", "")).lower() != "completed":
-                states.append("pending")
+                _observe(str(run.get("name", "")), "pending")
                 continue
             conclusion = str(run.get("conclusion", "")).lower()
             if conclusion in ("success", "neutral", "skipped"):
-                states.append("success")
+                _observe(str(run.get("name", "")), "success")
             elif conclusion in ("cancelled", "timed_out", "action_required"):
-                states.append("pending")
+                _observe(str(run.get("name", "")), "pending")
             else:
-                states.append("failure")
+                _observe(str(run.get("name", "")), "failure")
 
-        if not states:
-            state = "none"
-        elif any(s == "failure" or s == "error" for s in states):
+        red = any(s in ("failure", "error") for s in states)
+        result: Dict[str, Any] = {
+            "state": "",
+            "contexts": contexts,
+            "count": len(states),
+            "missing_permissions": sorted(set(denied)),
+            "sha": sha,
+            "required_configured": bool(required),
+            "statuses_api": "readable" if readable["statuses"] else "unavailable",
+            "checks_api": "readable" if readable["checks"] else "unavailable",
+        }
+
+        if not required:
+            if red:
+                # A denial does not soften an observed failure: something red was
+                # seen, and that is enough to refuse whatever else was invisible.
+                state = "failure"
+            elif denied:
+                # Checked before "none" on purpose. With one endpoint forbidden
+                # and the other empty, "nothing reported" would be a guess
+                # dressed as an observation — the forbidden half is exactly
+                # where the evidence would have been.
+                state = "unreadable"
+            elif not states:
+                state = "none"
+            elif any(s == "pending" for s in states):
+                state = "pending"
+            else:
+                state = "success"
+            result["state"] = state
+            return result
+
+        # -- the named-contexts contract --------------------------------------
+        per_context: Dict[str, str] = {}
+        for name in required:
+            if name in observed:
+                per_context[name] = observed[name]
+            elif not readable["statuses"] or not readable["checks"]:
+                # Absent from what could be read, with something unread. Absence
+                # is only evidence when everything was legible; here the context
+                # may be sitting in the half that refused to open.
+                per_context[name] = "unreadable"
+            else:
+                per_context[name] = "missing"
+
+        values = list(per_context.values())
+        if red:
+            # Still pessimistic about anything observed red, required or not.
+            # A named contract narrows what must be green; it does not license
+            # ignoring a failure that was seen.
             state = "failure"
-        elif any(s == "pending" for s in states):
+        elif any(v == "unreadable" for v in values):
+            state = "unreadable"
+        elif any(v == "missing" for v in values):
+            state = "none"
+        elif any(v == "pending" for v in values):
             state = "pending"
-        else:
+        elif all(v == "success" for v in values):
             state = "success"
-        return {"state": state, "contexts": contexts, "count": len(states)}
+        else:
+            # An unrecognised state word is not a green light.
+            state = "failure"
+
+        result["state"] = state
+        result["required"] = per_context
+        result["missing_required"] = sorted(
+            name for name, v in per_context.items() if v in ("missing", "unreadable")
+        )
+        return result
 
     def merge_pull_request(
         self,

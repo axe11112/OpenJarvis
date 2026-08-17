@@ -7,6 +7,8 @@ repair loop and notifications arrive in later phases (see
 
 from __future__ import annotations
 
+import logging
+import shutil
 from typing import Any, Optional
 
 import click
@@ -168,6 +170,7 @@ def _build_notifier(config: Any) -> Any:
         NotificationRouter,
         TelegramNotifier,
     )
+    from openjarvis.reliability.notify_ledger import NotificationLedger, ledger_path
     from openjarvis.reliability.types import Severity
 
     rc = config.reliability
@@ -186,6 +189,8 @@ def _build_notifier(config: Any) -> Any:
         min_severity=Severity.parse(rc.notify.min_severity),
         max_per_hour=rc.notify.max_messages_per_hour,
         persona=rc.notify.persona,
+        # On disk, so a restart is not a reason to say it all again.
+        ledger=NotificationLedger(path=ledger_path(config)),
     )
 
 
@@ -361,6 +366,42 @@ def _build_repair_loop(config: Any, store: Any, sources: list) -> Any:
         protected_paths=list(rc.policy.protected_paths),
         notifier=_build_notifier(config),
         auto_merger=_build_auto_merger(config, store, github),
+        post_merge_verifier=_build_post_merge_verifier(config, store, vercel),
+    )
+
+
+def _build_post_merge_verifier(config: Any, store: Any, vercel: Any) -> Any:
+    """Build the post-merge production verifier, or ``None``.
+
+    ``None`` when merging is off (nothing can reach the stage) or when Vercel is
+    unavailable (no way to identify the deployment a merge produced). The second
+    case does not silently degrade: with merging enabled and no verifier, a
+    merged incident escalates rather than resolving, so a missing verifier costs
+    an operator a phone call and never a false "resolved".
+    """
+    rc = config.reliability
+    if not rc.merge.enabled or vercel is None:
+        return None
+
+    from openjarvis.reliability.postmerge import PostMergeVerifier
+    from openjarvis.reliability.probes.spec import load_probes
+    from openjarvis.reliability.verify import Verifier
+
+    def _fleet() -> Any:
+        # Loaded at verification time rather than at construction: the probe
+        # that opened the incident may have been edited while the repair ran,
+        # and the fleet that proves production should be the current one.
+        return load_probes(_probe_dir(config))
+
+    return PostMergeVerifier(
+        vercel=vercel,
+        verifier=Verifier(evidence_dir=_evidence_dir(config)),
+        store=store,
+        fleet_provider=_fleet,
+        production_url=rc.site.base_url,
+        notifier=_build_notifier(config),
+        deployment_timeout_seconds=rc.merge.production_timeout_seconds,
+        poll_interval_seconds=rc.merge.production_poll_seconds,
     )
 
 
@@ -387,6 +428,7 @@ def _build_auto_merger(config: Any, store: Any, github: Any) -> Any:
         base_branch=rc.github.base_branch,
         branch_prefix=rc.github.branch_prefix,
         require_status_checks=rc.merge.require_status_checks,
+        required_status_contexts=list(rc.merge.required_status_contexts),
         delete_branch_on_merge=rc.merge.delete_branch_on_merge,
         notifier=_build_notifier(config),
     )
@@ -1641,6 +1683,202 @@ def reliability_analyze(incident_id: str, out: str, invoke: bool) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_tls(access: Any, certfile: str, keyfile: str, console: Any) -> Any:
+    """Find or fetch the TLS certificate for this machine's Tailscale name.
+
+    Serving the phone over plain HTTP is not a smaller version of this feature —
+    a browser refuses the microphone and Web Push on an insecure origin, so the
+    call screen would render and then do nothing. Better to say why.
+    """
+    import subprocess
+    from pathlib import Path
+
+    if certfile and keyfile:
+        return certfile, keyfile
+
+    name = access.tailscale_host
+    if not name:
+        return "", ""
+    directory = Path.home() / ".openjarvis" / "voice" / "certs"
+    directory.mkdir(parents=True, exist_ok=True)
+    cert, key = directory / f"{name}.crt", directory / f"{name}.key"
+    if cert.exists() and key.exists():
+        return str(cert), str(key)
+
+    binary = shutil.which("tailscale") or (
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+    )
+    console.print(f"[dim]Requesting a TLS certificate for {escape(name)}…[/dim]")
+    proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [binary, "cert", "--cert-file", str(cert), "--key-file", str(key), name],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    if proc.returncode == 0 and cert.exists():
+        return str(cert), str(key)
+
+    detail = (proc.stderr or proc.stdout or "").strip()
+    console.print(
+        "[bold yellow]No HTTPS certificate — the phone will not grant the "
+        "microphone.[/bold yellow]"
+    )
+    console.print(f"[dim]{escape(detail[:200])}[/dim]")
+    if "does not support" in detail or "not support" in detail:
+        console.print(
+            "[dim]Enable HTTPS for your tailnet: Tailscale admin console → DNS "
+            "→ HTTPS Certificates → Enable. Then run this again.[/dim]"
+        )
+    return "", ""
+
+
+def _build_voice(config: Any, store: Any, console: Any, access: Any) -> Any:
+    """Assemble the Sir Voice stack, or ``None`` when it cannot speak.
+
+    Built once, at startup, so a missing model or binary is a line on the
+    console rather than a surprise mid-call. Returning ``None`` makes the voice
+    routes 404 — absent rather than broken.
+    """
+    from pathlib import Path
+
+    from openjarvis.reliability.briefing import redact_secrets
+    from openjarvis.reliability.dashboard.supervisor import LaunchdSupervisor
+    from openjarvis.reliability.types import Severity
+    from openjarvis.reliability.voice.answers import VoiceFacts
+    from openjarvis.reliability.voice.commands import VoiceCommands
+    from openjarvis.reliability.voice.confirmations import ConfirmationStore
+    from openjarvis.reliability.voice.push import (
+        PushSender,
+        SubscriptionStore,
+        VapidKey,
+    )
+    from openjarvis.reliability.voice.session import VoiceSession, VoiceSessionManager
+    from openjarvis.reliability.voice.stt import DEFAULT_MODEL, WhisperTranscriber
+    from openjarvis.reliability.voice.tts import MacSpeech
+    from openjarvis.reliability.voice.web import VoiceEndpoints
+
+    rc = config.reliability
+    home = Path.home() / ".openjarvis" / "voice"
+    model = home / "models" / f"ggml-{DEFAULT_MODEL}.bin"
+
+    transcriber = WhisperTranscriber(model_path=str(model))
+    speech = MacSpeech()
+    if not transcriber.available:
+        console.print(
+            f"[bold yellow]Voice: {escape(transcriber.unavailable_reason())}"
+            "[/bold yellow]"
+        )
+    if not speech.available:
+        console.print("[bold yellow]Voice: no speech synthesis available[/bold yellow]")
+
+    supervisor = LaunchdSupervisor(config)
+    confirmations = ConfirmationStore(path=home / "confirmations.json")
+
+    def _session(session_id: str) -> VoiceSession:
+        return VoiceSession(
+            id=session_id,
+            commands=VoiceCommands(
+                facts=VoiceFacts(
+                    store=store,
+                    watcher_status=supervisor.status,
+                    site_url=rc.site.base_url,
+                    merge_enabled=rc.merge.enabled,
+                    repair_enabled=rc.repair.enabled,
+                ),
+                confirmations=confirmations,
+                supervisor=supervisor,
+                diagnostic_factory=lambda: _live_diagnostic(config, store),
+                store=store,
+                session_id=session_id,
+            ),
+            transcriber=transcriber,
+            speech=speech,
+            redact=redact_secrets,
+        )
+
+    push = None
+    subscriptions = None
+    try:
+        key = VapidKey.load_or_create(home / "vapid.json")
+        push = PushSender(key=key)
+        subscriptions = SubscriptionStore(path=home / "subscriptions.json")
+    except Exception:  # noqa: BLE001 - a call that cannot ring still answers
+        console.print("[bold yellow]Voice: push is unavailable[/bold yellow]")
+
+    from openjarvis.reliability.voice.calls import CallOrchestrator
+    from openjarvis.reliability.voice.health import VoiceHealth
+
+    notifier = _build_notifier(config)
+
+    def _fallback(reason: str, detail: str) -> None:
+        """A call that could not be delivered still has to reach the operator."""
+        if notifier is None:
+            return
+        notifier.notify(
+            f"Sir, I need your help.\n{detail}\nOpen Sir when you can.",
+            severity=Severity.CRITICAL,
+        )
+
+    audit = lambda event, payload: logging.getLogger("openjarvis.voice").info(  # noqa: E731
+        "voice %s %s", event, {k: v for k, v in payload.items() if k != "speech"}
+    )
+    sessions = VoiceSessionManager(factory=_session)
+    calls = CallOrchestrator(
+        push=push,
+        subscriptions=subscriptions,
+        fallback=_fallback,
+        audit=audit,
+    )
+    from openjarvis.reliability.voice.microphone import (
+        MicrophoneRecord,
+        microphone_path,
+    )
+
+    # Persisted, so "has a real phone ever been heard?" survives the restart
+    # that follows every deploy.
+    microphone = MicrophoneRecord(path=microphone_path(config))
+    endpoints = VoiceEndpoints(
+        sessions=sessions,
+        confirmations=confirmations,
+        push=push,
+        subscriptions=subscriptions,
+        calls=calls,
+        microphone=microphone,
+        health=VoiceHealth(
+            transcriber=transcriber,
+            speech=speech,
+            normalizer=transcriber.normalizer,
+            microphone=microphone,
+            subscriptions=subscriptions,
+            sessions=sessions,
+            calls=calls,
+            access=access,
+        ),
+        audit=audit,
+    )
+
+    # The only thing that decides to ring, and it lives here rather than in the
+    # watcher on purpose: kill voice entirely and JARVIS keeps monitoring,
+    # repairing and messaging exactly as before.
+    from openjarvis.reliability.voice.trigger import CallTrigger
+    from openjarvis.reliability.voice.watchdog import CallWatchdog
+
+    watchdog = CallWatchdog(
+        store=store, trigger=CallTrigger(), calls=calls, endpoints=endpoints
+    )
+    watchdog.start()
+    endpoints.watchdog = watchdog
+    return endpoints
+
+
+def _live_diagnostic(config: Any, store: Any) -> Any:
+    """A diagnostic with no store attached: a spoken question opens no incident."""
+    from openjarvis.reliability.diagnostic import LiveDiagnostic
+
+    return LiveDiagnostic(config)
+
+
 @reliability.command("dashboard")
 @click.option("--host", default="127.0.0.1", show_default=True, help="Bind address.")
 @click.option("--port", default=8765, show_default=True, help="Port to listen on.")
@@ -1678,6 +1916,34 @@ def reliability_analyze(incident_id: str, out: str, invoke: bool) -> None:
         "unexpectedly offline. Never overrides an emergency stop."
     ),
 )
+@click.option(
+    "--tailscale/--no-tailscale",
+    "use_tailscale",
+    default=False,
+    show_default=True,
+    help=(
+        "Also listen on this machine's Tailscale address, so a phone on the "
+        "same tailnet can reach it. Never binds a public or LAN interface."
+    ),
+)
+@click.option(
+    "--voice/--no-voice",
+    "enable_voice",
+    default=False,
+    show_default=True,
+    help="Mount the Sir Voice call routes and the installable phone app.",
+)
+@click.option(
+    "--cert",
+    "certfile",
+    default="",
+    help=(
+        "TLS certificate. With --tailscale this defaults to the certificate "
+        "`tailscale cert` writes for this machine; HTTPS is required before a "
+        "phone will grant the microphone."
+    ),
+)
+@click.option("--key", "keyfile", default="", help="TLS private key.")
 def reliability_dashboard(
     host: str,
     port: int,
@@ -1685,6 +1951,10 @@ def reliability_dashboard(
     probe_verification: str,
     watcher_control: bool,
     auto_recover: bool,
+    use_tailscale: bool,
+    enable_voice: bool,
+    certfile: str,
+    keyfile: str,
 ) -> None:
     """Serve the JARVIS Control Center on localhost.
 
@@ -1697,6 +1967,10 @@ def reliability_dashboard(
     actions it offers are asking launchd to start or restart the watcher
     service, and both are refused while an emergency stop is engaged.
     """
+    from openjarvis.reliability.dashboard.access import (
+        detect_tailscale,
+        loopback_policy,
+    )
     from openjarvis.reliability.dashboard.server import ControlCenterServer
     from openjarvis.reliability.dashboard.service import DashboardService
 
@@ -1704,11 +1978,28 @@ def reliability_dashboard(
     config = _load_config()
     store = _get_store(config)
 
+    access = detect_tailscale() if use_tailscale else loopback_policy()
+    if use_tailscale:
+        if not access.tailscale_enabled:
+            console.print(
+                "[bold red]Tailscale is not running, or this machine is not "
+                "signed in.[/bold red]"
+            )
+            raise SystemExit(2)
+        # Bind the Tailscale address specifically. Not 0.0.0.0 — that would
+        # also answer on whatever café network the laptop is joined to.
+        if host in ("127.0.0.1", "localhost"):
+            host = access.tailscale_ip
+        certfile, keyfile = _resolve_tls(access, certfile, keyfile, console)
+
     service = DashboardService(
         config,
         store=store,
         probe_verification=probe_verification,
         auto_recover=auto_recover,
+    )
+    voice_endpoints = (
+        _build_voice(config, store, console, access) if enable_voice else None
     )
     try:
         server = ControlCenterServer(
@@ -1716,6 +2007,10 @@ def reliability_dashboard(
             host=host,
             port=port,
             allow_watcher_control=watcher_control,
+            access=access,
+            certfile=certfile,
+            keyfile=keyfile,
+            voice=voice_endpoints,
         )
     except ValueError as exc:
         service.close()
@@ -1730,7 +2025,11 @@ def reliability_dashboard(
     console.print(
         f"[dim]Target        {escape(rc.site.base_url or 'not configured')}[/dim]"
     )
-    console.print("[dim]Mode          read-only · loopback only[/dim]")
+    console.print(f"[dim]Access        {escape(access.describe())}[/dim]")
+    console.print(
+        f"[dim]Transport     {'HTTPS' if server.tls else 'HTTP (no TLS)'} · "
+        f"voice {'ON' if voice_endpoints is not None else 'OFF'}[/dim]"
+    )
     console.print(
         f"[dim]Refresh       every {service.cycle_seconds:.0f}s · probe "
         f"verification {probe_verification}[/dim]"

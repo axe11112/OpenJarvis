@@ -251,10 +251,22 @@ def _degraded_report():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.20", "example.com", "::"])
+@pytest.mark.parametrize("host", ["192.168.1.20", "example.com"])
 def test_refuses_to_bind_anything_but_loopback(service, host):
     """A non-loopback bind is refused at construction, not at request time."""
     with pytest.raises(ValueError, match="local-only"):
+        ControlCenterServer(service, host=host, port=0)
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::"])
+def test_a_wildcard_bind_is_refused_by_name(service, host):
+    """The dangerous one gets its own message.
+
+    ``0.0.0.0`` is what someone types when a phone will not connect, and on a
+    laptop it means "answer on every café network I ever join". The refusal says
+    so rather than repeating the generic line.
+    """
+    with pytest.raises(ValueError, match="every network this machine joins"):
         ControlCenterServer(service, host=host, port=0)
 
 
@@ -1369,3 +1381,42 @@ def test_os_import_is_used_only_for_presence():
         assert environ_has("JARVIS_DASHBOARD_ABSENT_TEST") is False
     finally:
         del os.environ["JARVIS_DASHBOARD_PRESENCE_TEST"]
+
+
+# ---------------------------------------------------------------------------
+# Handover and autonomy — what the owner reads when Sir has stopped
+# ---------------------------------------------------------------------------
+
+
+def test_an_escalated_incident_carries_its_handover_to_the_page(tmp_path):
+    """The page must show what was tried, not just that something was."""
+    from openjarvis.reliability.dashboard.model import incident_detail
+    from openjarvis.reliability.playbook import build_handover
+    from openjarvis.reliability.types import Incident, RepairAttempt, Severity
+
+    incident = Incident(
+        fingerprint="fp",
+        severity=Severity.HIGH,
+        component="authentication",
+        title="Login redirects back to /login",
+        id="INC-00042",
+    )
+    incident.attempts.append(RepairAttempt(number=1, strategy="recent_change"))
+    incident.metadata["handover"] = build_handover(
+        incident, reason="attempts exhausted", max_attempts=3
+    ).to_dict()
+
+    payload = incident_detail(incident, [])
+    assert payload["handover"]["what_failed"]
+    assert payload["handover"]["what_is_needed"]
+    assert any("recent change" in line for line in payload["handover"]["tried"])
+
+
+def test_an_incident_with_no_handover_gets_no_empty_panel():
+    from openjarvis.reliability.dashboard.model import incident_detail
+    from openjarvis.reliability.types import Incident, Severity
+
+    incident = Incident(
+        fingerprint="fp", severity=Severity.LOW, component="site", title="slow"
+    )
+    assert "handover" not in incident_detail(incident, [])

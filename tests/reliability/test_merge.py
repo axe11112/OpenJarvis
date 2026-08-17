@@ -26,6 +26,7 @@ import pytest
 from openjarvis.reliability.merge import (
     REQUIRED_CHECKS,
     AutoMerger,
+    MergeRecord,
     evaluate_merge,
     pull_request_number,
 )
@@ -177,6 +178,7 @@ class _FakeGitHub:
         self._base_sha = base_sha
         self._fail = fail
         self.merge_calls = []
+        self.status_calls = []
         self.client = self
 
     # -- read side (also serves as the fake ResilientClient) --------------
@@ -185,7 +187,12 @@ class _FakeGitHub:
             raise RuntimeError("GitHub is unavailable")
         return dict(self._pr, number=number)
 
-    def combined_status(self, sha):
+    def combined_status(self, sha, *, required_contexts=None):
+        # Recorded, not just answered: asserting on the question proves the gate
+        # asked about the verified commit and named the configured contexts.
+        self.status_calls.append(
+            (sha, list(required_contexts) if required_contexts is not None else None)
+        )
         return dict(self._status)
 
     def get_json(self, path, default=None, **_kw):
@@ -566,6 +573,68 @@ class TestRepositoryStateGates:
         decision = _decide(status={"state": "none", "count": 0, "contexts": []})
         assert _refused(decision, "status_checks")
 
+    def test_unreadable_ci_is_no_merge_and_blames_the_credential(self):
+        """A 403 is a fact about the token, not about CI.
+
+        Measured against the real Wize-Performance repository: the Vercel status
+        was green on every commit the whole time, and JARVIS's fine-grained
+        token could not read it. Reporting that as "no CI" would send somebody
+        looking for absent CI instead of an absent permission.
+        """
+        decision = _decide(
+            status={
+                "state": "unreadable",
+                "count": 0,
+                "contexts": [],
+                "missing_permissions": ["Checks: Read", "Commit statuses: Read"],
+            }
+        )
+        assert _refused(decision, "status_checks")
+        gate = next(g for g in decision.gates if g.name == "status_checks")
+        assert "Commit statuses: Read" in gate.detail
+        assert "credential problem" in gate.detail
+
+    def test_unreadable_ci_never_suggests_disabling_the_gate(self):
+        """The 'none' branch offers the opt-out. This one must not.
+
+        Advising require_status_checks = false in response to a permission error
+        would turn one misread into a permanently disabled control.
+        """
+        decision = _decide(
+            status={
+                "state": "unreadable",
+                "count": 0,
+                "contexts": [],
+                "missing_permissions": ["Checks: Read"],
+            }
+        )
+        gate = next(g for g in decision.gates if g.name == "status_checks")
+        assert "require_status_checks = false" in gate.detail
+        assert "do not set" in gate.detail.lower()
+
+    def test_an_observed_failure_outranks_an_unreadable_endpoint(self):
+        """Something red was seen. That is enough, whatever else was hidden."""
+        decision = _decide(
+            status={
+                "state": "failure",
+                "count": 1,
+                "contexts": ["Vercel"],
+                "missing_permissions": ["Checks: Read"],
+            }
+        )
+        assert _refused(decision, "status_checks")
+        gate = next(g for g in decision.gates if g.name == "status_checks")
+        assert "Vercel" in gate.detail
+
+    def test_a_green_gate_names_the_contexts_it_trusted(self):
+        """The record should say *which* checks were green, not just how many."""
+        decision = _decide(
+            status={"state": "success", "count": 1, "contexts": ["Vercel"]}
+        )
+        assert decision.allowed
+        gate = next(g for g in decision.gates if g.name == "status_checks")
+        assert "Vercel" in gate.detail
+
     def test_absent_ci_can_be_opted_out_of_explicitly(self):
         """For repositories that genuinely run no CI — and it says so."""
         decision = _decide(
@@ -737,14 +806,17 @@ class TestAutoMergerNotifies:
         ).merge_for(incident)
         assert record.merged is True
 
-    def test_the_outcome_message_names_the_gates_that_refused(self):
-        from openjarvis.reliability.notify import render_merge_outcome
-
+    def test_a_refusal_is_recorded_even_though_it_is_not_announced(self):
+        """The gates refusing is not news for the owner — it is the system
+        working — but it must still be written down, in full, with the gate that
+        refused named. The audit log is where a refusal lives now."""
         incident = _incident()
         github = _FakeGitHub()
+        audited = []
 
         class _Store:
-            def record_audit(self, *a, **k):
+            def record_audit(self, _incident, *, actor, reason):
+                audited.append(reason)
                 return None
 
             def add_evidence(self, *a, **k):
@@ -753,19 +825,10 @@ class TestAutoMergerNotifies:
         record = AutoMerger(github=github, store=_Store(), enabled=False).merge_for(
             incident
         )
-        message = render_merge_outcome(incident, record=record)
-        assert "merge refused" in message
-        assert "merge_enabled" in message
-        assert "nothing was deployed" in message.lower()
-
-    def test_the_attempt_message_says_it_is_not_a_deployment(self):
-        from openjarvis.reliability.notify import render_merge_attempt
-
-        message = render_merge_attempt(
-            _incident(), pr_number=42, head_sha=VERIFIED_SHA, method="squash"
-        )
-        assert "#42" in message
-        assert "does not deploy" in message
+        assert not record.merged
+        assert "merge_enabled" in record.decision.reason
+        assert audited and "refused" in audited[0]
+        assert not github.merge_calls
 
 
 # ---------------------------------------------------------------------------
@@ -838,3 +901,270 @@ class TestTheVerifiedAttemptIsTheOneThatCounts:
         )
         assert record.verified_head_sha == VERIFIED_SHA
         assert github.merge_calls[0]["expected_head_sha"] == VERIFIED_SHA
+
+
+# ---------------------------------------------------------------------------
+# The named deployment status as the required evidence
+# ---------------------------------------------------------------------------
+
+
+def _vercel(state="success", *, sha=VERIFIED_SHA, checks="unavailable", **extra):
+    """A verdict in the shape ``combined_status`` returns for named contexts.
+
+    ``checks="unavailable"`` is the default because that is the real shape for a
+    GitHub fine-grained token: it has no Checks permission to grant, so
+    check-runs answers 403 no matter how the token is scoped.
+    """
+    per_context = {"Vercel": state if state != "none" else "missing"}
+    verdict = {
+        "state": state,
+        "contexts": ["Vercel"],
+        "count": 1,
+        "missing_permissions": ["Checks: Read"] if checks == "unavailable" else [],
+        "sha": sha,
+        "required_configured": True,
+        "required": per_context,
+        "missing_required": [
+            n for n, v in per_context.items() if v in ("missing", "unreadable")
+        ],
+        "statuses_api": "readable",
+        "checks_api": checks,
+    }
+    verdict.update(extra)
+    return verdict
+
+
+class TestRequiredStatusContextsGate:
+    """``required_status_contexts = ["Vercel"]`` against the merge gate.
+
+    The reason this configuration exists: the Checks API is closed to the
+    credential, so the whole-picture rule can never go green. Naming the context
+    the deployment actually posts makes the gate answerable — without making it
+    weaker, which is what every refusal below is here to prove.
+    """
+
+    def test_vercel_success_passes(self):
+        decision = _decide(
+            required_status_contexts=["Vercel"], status=_vercel("success")
+        )
+        assert decision.allowed
+        detail = next(g.detail for g in decision.gates if g.name == "status_checks")
+        assert "Vercel = success" in detail
+        # Reported, never silently swallowed.
+        assert "Checks API is unavailable" in detail
+
+    @pytest.mark.parametrize("state", ["failure", "pending", "error", "none"])
+    def test_anything_other_than_success_refuses(self, state):
+        decision = _decide(required_status_contexts=["Vercel"], status=_vercel(state))
+        assert _refused(decision, "status_checks")
+
+    def test_vercel_missing_refuses(self):
+        """No context by that name reported at all. Absence is not consent."""
+        verdict = _vercel("none")
+        verdict["required"] = {"Vercel": "missing"}
+        decision = _decide(required_status_contexts=["Vercel"], status=verdict)
+        assert _refused(decision, "status_checks")
+
+    def test_commit_statuses_unreadable_refuses(self):
+        """The API the verdict now rests on is forbidden: refuse, and say why."""
+        verdict = _vercel("unreadable", checks="unavailable")
+        verdict["statuses_api"] = "unavailable"
+        verdict["required"] = {"Vercel": "unreadable"}
+        verdict["missing_permissions"] = ["Commit statuses: Read"]
+        decision = _decide(required_status_contexts=["Vercel"], status=verdict)
+        assert _refused(decision, "status_checks")
+        detail = next(g.detail for g in decision.gates if g.name == "status_checks")
+        assert "credential problem" in detail
+        # It must never propose removing the gate as the fix.
+        assert "do not remove the required context" in detail
+
+    def test_status_belonging_to_another_commit_refuses(self):
+        """Green Vercel status — for a commit nobody verified."""
+        decision = _decide(
+            required_status_contexts=["Vercel"],
+            status=_vercel("success", sha=OTHER_SHA),
+        )
+        assert _refused(decision, "status_checks")
+
+    def test_verdict_without_a_commit_refuses(self):
+        decision = _decide(
+            required_status_contexts=["Vercel"], status=_vercel("success", sha="")
+        )
+        assert _refused(decision, "status_checks")
+
+    def test_a_verdict_that_does_not_answer_the_question_refuses(self):
+        """Contexts were required; the verdict evaluated something else.
+
+        Passing on the summary alone would drop the contract silently — the one
+        failure mode a narrowed gate must not have.
+        """
+        decision = _decide(
+            required_status_contexts=["Vercel"],
+            status={"state": "success", "count": 2, "contexts": ["ci"]},
+        )
+        assert _refused(decision, "status_checks")
+
+    def test_a_verdict_for_the_wrong_contexts_refuses(self):
+        verdict = _vercel("success")
+        verdict["required"] = {"build": "success"}
+        decision = _decide(required_status_contexts=["Vercel"], status=verdict)
+        assert _refused(decision, "status_checks")
+
+    def test_checks_api_403_does_not_block_a_green_required_context(self):
+        """The whole point: the fine-grained PAT's permanent 403 stops poisoning
+        a verdict the Commit Statuses API can answer on its own."""
+        decision = _decide(
+            required_status_contexts=["Vercel"],
+            status=_vercel("success", checks="unavailable"),
+        )
+        assert decision.allowed
+
+    def test_without_required_contexts_the_old_conservative_rule_stands(self):
+        """Requirement 8: unconfigured behaviour is untouched. The same verdict
+        that passes with a named context refuses without one."""
+        unnamed = {
+            "state": "unreadable",
+            "contexts": ["Vercel"],
+            "count": 1,
+            "missing_permissions": ["Checks: Read"],
+        }
+        assert _refused(_decide(status=unnamed), "status_checks")
+        green = {"state": "success", "count": 1, "contexts": ["Vercel"]}
+        assert _decide(status=green).allowed
+
+    def test_old_style_verdict_naming_the_wrong_commit_still_refuses(self):
+        """Even unconfigured, a verdict that names a commit must name the right
+        one. Verdicts that name none at all are unaffected."""
+        stale = {
+            "state": "success",
+            "count": 1,
+            "contexts": ["Vercel"],
+            "sha": OTHER_SHA,
+        }
+        assert _refused(_decide(status=stale), "status_checks")
+
+
+class TestRequiredContextsReachGitHub:
+    """The gate is only as good as the question the source was asked."""
+
+    def test_the_verified_sha_and_the_named_contexts_are_what_is_queried(self, store):
+        incident = store.create(_incident())
+        github = _FakeGitHub(status=_vercel("success"))
+        AutoMerger(
+            github=github,
+            store=store,
+            enabled=True,
+            required_status_contexts=["Vercel"],
+        ).merge_for(incident)
+        assert github.status_calls == [(VERIFIED_SHA, ["Vercel"])]
+
+    def test_unconfigured_asks_exactly_as_before(self, store):
+        """No named contexts: the source is called without the argument, so a
+        source that predates it keeps working."""
+        incident = store.create(_incident())
+        github = _FakeGitHub()
+        AutoMerger(github=github, store=store, enabled=True).merge_for(incident)
+        assert github.status_calls == [(VERIFIED_SHA, None)]
+
+    def test_a_source_that_cannot_answer_refuses_rather_than_crashing(self, store):
+        """An older source raising on the new argument must produce a refusal,
+        not an exception that unwinds into the watcher."""
+
+        class _OldSource(_FakeGitHub):
+            def combined_status(self, sha, **kwargs):
+                if kwargs:
+                    raise TypeError("unexpected keyword argument")
+                return dict(self._status)
+
+        incident = store.create(_incident())
+        github = _OldSource()
+        record = AutoMerger(
+            github=github,
+            store=store,
+            enabled=True,
+            required_status_contexts=["Vercel"],
+        ).merge_for(incident)
+        assert not record.decision.allowed
+        assert not github.merge_calls
+
+
+# ---------------------------------------------------------------------------
+# The post-merge retry-storm guard, at the merge gate
+# ---------------------------------------------------------------------------
+
+
+class TestPriorPostMergeFailureGate:
+    """One bad merge is a bad day. Two is a pattern the gates should prevent."""
+
+    def test_a_prior_failure_refuses_the_merge(self):
+        decision = _decide(
+            prior_post_merge_failure={
+                "incident_id": "INC-00001",
+                "merge_commit_sha": "e" * 40,
+                "reason": "production stayed red",
+            }
+        )
+        assert _refused(decision, "no_prior_post_merge_failure")
+
+    def test_no_prior_failure_passes(self):
+        assert _decide(prior_post_merge_failure=None).allowed
+
+    def test_an_already_merged_incident_is_not_merged_again(self):
+        """MERGED means production has not had its say yet. Merging again would
+        stack a change on one whose effect nobody has measured."""
+        decision = _decide(incident=_incident(state=IncidentState.MERGED))
+        assert _refused(decision, "incident_state")
+
+    def test_the_gate_outranks_a_clean_new_attempt(self):
+        """Every other gate passes — that is exactly the dangerous case. The
+        recurrence looks pristine because it *is* pristine; what is broken is
+        the production the last merge left behind."""
+        decision = _decide(
+            prior_post_merge_failure={"incident_id": "INC-00001", "reason": "red"}
+        )
+        failed = [g.name for g in decision.gates if not g.passed]
+        assert failed == ["no_prior_post_merge_failure"]
+
+    def test_a_successful_merge_records_what_post_merge_needs(self, store):
+        """Requirement: incident, PR, verified SHA, merge SHA, merge timestamp."""
+        incident = store.create(_incident())
+        record = AutoMerger(github=_FakeGitHub(), store=store, enabled=True).merge_for(
+            incident
+        )
+        assert record.merged
+        assert record.incident_id == incident.id
+        assert record.pr_number == 42
+        assert record.verified_head_sha == VERIFIED_SHA
+        assert record.merge_commit_sha == MERGE_SHA
+        assert record.merged_at, "the moment it landed must be recorded"
+        assert record.to_dict()["merged_at"] == record.merged_at
+
+    def test_a_refused_merge_records_no_merge_time(self):
+        """`at` is when it was decided; `merged_at` is when it landed. A refusal
+        has the first and must not have the second."""
+        record = MergeRecord()
+        assert record.at and not record.merged_at
+
+    def test_the_merger_consults_the_store(self, store):
+        """The guard has to survive a restart, so it is read from the store
+        rather than carried in memory."""
+        from openjarvis.reliability.postmerge import POST_MERGE_FAILURE_KEY
+
+        # The escalated incident: HUMAN_REQUIRED, carrying the marker. Not
+        # RESOLVED — a resolved one means a human dealt with it and the guard is
+        # meant to lift.
+        first = store.create(_incident(id="INC-00001", state=IncidentState.DETECTED))
+        store.transition(first, IncidentState.HUMAN_REQUIRED, reason="post-merge")
+        first.metadata[POST_MERGE_FAILURE_KEY] = {
+            "incident_id": first.id,
+            "reason": "production stayed red",
+        }
+        store.save(first)
+
+        recurrence = store.create(_incident(id="INC-00002"))
+        github = _FakeGitHub()
+        record = AutoMerger(github=github, store=store, enabled=True).merge_for(
+            recurrence
+        )
+        assert not record.decision.allowed
+        assert not github.merge_calls

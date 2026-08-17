@@ -45,7 +45,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from openjarvis.reliability.types import (
     Evidence,
@@ -86,6 +86,10 @@ _REFUSING_STATES = frozenset(
         IncidentState.RECOVERY_REQUIRED,
         IncidentState.FAILED,
         IncidentState.ROLLED_BACK,
+        # Already on the default branch and awaiting production's verdict.
+        # A second merge here would be merging on top of a change whose effect
+        # nobody has measured yet.
+        IncidentState.MERGED,
     }
 )
 
@@ -173,7 +177,13 @@ class MergeRecord:
     merge_commit_sha: str = ""
     method: str = ""
     actor: str = "jarvis"
+    #: When the decision was made. Stamped at construction, so it is also the
+    #: timestamp of a refusal — the entry a refused merge leaves behind.
     at: str = field(default_factory=now_iso)
+    #: When the merge actually landed, empty if it never did. Kept apart from
+    #: ``at`` because the interval between them is the window a post-merge
+    #: verification has to explain, and one field cannot mean both.
+    merged_at: str = ""
     decision: MergeDecision = field(default_factory=lambda: MergeDecision(False))
     merged: bool = False
     error: str = ""
@@ -192,6 +202,7 @@ class MergeRecord:
             "method": self.method,
             "actor": self.actor,
             "at": self.at,
+            "merged_at": self.merged_at,
             "merged": self.merged,
             "error": self.error,
             "decision": self.decision.to_dict(),
@@ -224,6 +235,8 @@ def evaluate_merge(
     expected_pr_number: int,
     status: Optional[Dict[str, Any]] = None,
     require_status_checks: bool = True,
+    required_status_contexts: Sequence[str] = (),
+    prior_post_merge_failure: Optional[Dict[str, Any]] = None,
     base_sha_at_verification: str = "",
     observed_base_sha: str = "",
 ) -> MergeDecision:
@@ -244,6 +257,11 @@ def evaluate_merge(
     status:
         CI's verdict on the head commit, from
         :meth:`GitHubSource.combined_status`.
+    required_status_contexts:
+        Status contexts that must each be present and green on the verified
+        commit. When set, *status* must carry the per-context answer for exactly
+        those names — a verdict that does not answer the question asked is
+        refused rather than accepted on its summary.
     base_sha_at_verification / observed_base_sha:
         Where the base branch was when the repair was verified against it, and
         where it is now. Different values mean the fix was verified against code
@@ -261,6 +279,28 @@ def evaluate_merge(
         "[reliability.merge] enabled = true"
         if enabled
         else "[reliability.merge] enabled = false",
+    )
+
+    # -- 1b. production has not already been broken by a merge like this --
+    #
+    # Ranked with the switch rather than among the evidence gates, because it
+    # is not a judgement about *this* repair: a fingerprint whose last merge
+    # left production unverified does not get a second automatic attempt, no
+    # matter how clean the new attempt looks. The failure that motivates this
+    # is the tidy one — production stays broken, the probe keeps failing, a
+    # fresh incident opens with a clean slate, and every evidence gate passes.
+    gate(
+        "no_prior_post_merge_failure",
+        not prior_post_merge_failure,
+        (
+            "a previous merge for this fingerprint left production unverified "
+            f"({(prior_post_merge_failure or {}).get('incident_id', 'unknown')}, "
+            f"merge "
+            f"{str((prior_post_merge_failure or {}).get('merge_commit_sha', ''))[:12]}"
+            "); a human must clear it before another automatic merge"
+        )
+        if prior_post_merge_failure
+        else "no prior post-merge failure for this fingerprint",
     )
 
     # -- 2. the incident is in a state that permits acting ----------------
@@ -462,24 +502,105 @@ def evaluate_merge(
         )
 
     # -- 11. CI agrees, where CI exists -----------------------------------
-    if require_status_checks:
+    if require_status_checks and [c for c in required_status_contexts if c]:
+        required = [c for c in required_status_contexts if c]
         reported = dict(status or {})
         ci_state = str(reported.get("state") or "none")
-        gate(
-            "status_checks",
-            ci_state == "success",
-            (
-                f"{reported.get('count', 0)} check(s) green"
-                if ci_state == "success"
-                else (
-                    "no status or check-run reported on the head commit; "
-                    "set [reliability.merge] require_status_checks = false only "
-                    "if this repository genuinely runs no CI"
-                    if ci_state == "none"
-                    else f"checks are '{ci_state}'"
-                )
-            ),
+        per_context = dict(reported.get("required") or {})
+        verified_sha = attempt.commit_sha if attempt is not None else ""
+        status_sha = str(reported.get("sha") or "")
+        named = ", ".join(f"{c} = {per_context.get(c, 'unknown')}" for c in required)
+        checks_note = (
+            ""
+            if reported.get("checks_api") != "unavailable"
+            else (
+                "; the Checks API is unavailable to this credential (fine-grained "
+                "tokens have no Checks permission) — not read as consent, the "
+                "named Commit Status context above is the authority"
+            )
         )
+
+        if not status_sha or (verified_sha and status_sha != verified_sha):
+            # The verdict has to be about the commit that was verified. A status
+            # read for any other commit is evidence about code nobody checked,
+            # however green it is.
+            gate(
+                "status_checks",
+                False,
+                f"the CI verdict describes {status_sha[:12] or 'no commit'}, not the "
+                f"verified commit {verified_sha[:12] or 'unknown'}",
+            )
+        elif not reported.get("required_configured") or set(per_context) != set(
+            required
+        ):
+            # Configured to require named contexts, handed a verdict that did not
+            # evaluate them. Passing on the summary alone would silently drop the
+            # contract; refusing keeps the gate honest about what it checked.
+            gate(
+                "status_checks",
+                False,
+                "required status context(s) "
+                + ", ".join(required)
+                + " were configured but the CI verdict does not answer for them",
+            )
+        elif ci_state == "success":
+            gate("status_checks", True, f"required status: {named}{checks_note}")
+        elif ci_state == "unreadable":
+            # Never advise switching the gate off here. The checks may well be
+            # green; JARVIS is simply not allowed to look, and turning off the
+            # gate because of a permission error would disable a working control
+            # on the strength of a misread.
+            missing = ", ".join(reported.get("missing_permissions") or []) or "unknown"
+            gate(
+                "status_checks",
+                False,
+                f"required status: {named} — the Commit Statuses API could not be "
+                f"read, so this is a credential problem and not evidence about CI. "
+                f"Missing: {missing}. Grant the permission; do not remove the "
+                "required context to work around it.",
+            )
+        else:
+            gate("status_checks", False, f"required status: {named}{checks_note}")
+    elif require_status_checks:
+        reported = dict(status or {})
+        ci_state = str(reported.get("state") or "none")
+        # A verdict that names a commit must name the right one. Older callers
+        # send no SHA at all, so absence is not held against them; a mismatch is.
+        status_sha = str(reported.get("sha") or "")
+        verified_sha = attempt.commit_sha if attempt is not None else ""
+        if status_sha and verified_sha and status_sha != verified_sha:
+            ci_state = "wrong_commit"
+        if ci_state == "wrong_commit":
+            detail = (
+                f"the CI verdict describes {status_sha[:12]}, not the verified "
+                f"commit {verified_sha[:12]}"
+            )
+        elif ci_state == "success":
+            detail = f"{reported.get('count', 0)} check(s) green: " + ", ".join(
+                reported.get("contexts") or []
+            )
+        elif ci_state == "unreadable":
+            # Never advise switching the gate off here. The checks may well be
+            # green; JARVIS is simply not allowed to look, and turning off the
+            # gate because of a permission error would disable a working control
+            # on the strength of a misread.
+            missing = ", ".join(reported.get("missing_permissions") or []) or "unknown"
+            detail = (
+                "JARVIS is not permitted to read CI on the head commit — the "
+                f"GitHub token is missing: {missing}. This is a credential "
+                "problem, not evidence about CI. Grant the permission; do not "
+                "set require_status_checks = false to work around it."
+            )
+        elif ci_state == "none":
+            detail = (
+                "no status or check-run reported on the head commit; "
+                "set [reliability.merge] require_status_checks = false only "
+                "if this repository genuinely runs no CI"
+            )
+        else:
+            contexts = ", ".join(reported.get("contexts") or [])
+            detail = f"checks are '{ci_state}'" + (f" ({contexts})" if contexts else "")
+        gate("status_checks", ci_state == "success", detail)
     else:
         gate(
             "status_checks",
@@ -530,6 +651,9 @@ class AutoMerger:
     base_branch: str = "main"
     branch_prefix: str = "jarvis/incident-"
     require_status_checks: bool = True
+    #: Status contexts that must each be green on the verified commit. Empty
+    #: keeps the conservative whole-picture rule.
+    required_status_contexts: List[str] = field(default_factory=list)
     delete_branch_on_merge: bool = False
     notifier: Any = None
     actor: str = "jarvis-automerge"
@@ -566,8 +690,6 @@ class AutoMerger:
                 record.base_ref = str(pull_request.get("base_ref") or "")
                 observed_base = self._base_sha()
                 record.base_sha_observed = observed_base
-                if self.require_status_checks and record.observed_head_sha:
-                    status = self.github.combined_status(record.observed_head_sha)
             except Exception as exc:  # noqa: BLE001 - refusal, not a crash
                 logger.warning("merge: could not read PR #%s: %s", expected, exc)
                 record.error = f"could not read the pull request: {exc}"
@@ -581,6 +703,39 @@ class AutoMerger:
                 self._notify_outcome(incident, record)
                 return record
 
+            if self.require_status_checks and record.observed_head_sha:
+                # Read separately from the pull request, so a CI read that fails
+                # produces a *status* verdict rather than aborting the whole
+                # evaluation as "could not read the pull request" — which is how
+                # a missing token scope used to be reported as a missing PR.
+                #
+                # Asked about the *verified* commit, not the observed one, for
+                # the same reason the merge call names the verified SHA: a gate
+                # proves the two are equal, and asking about the verified commit
+                # means a bug in that gate still cannot produce a green verdict
+                # for code nobody checked.
+                subject = record.verified_head_sha or record.observed_head_sha
+                required = [c for c in self.required_status_contexts if c]
+                try:
+                    status = (
+                        self.github.combined_status(subject, required_contexts=required)
+                        if required
+                        # Called exactly as before when no contexts are named, so
+                        # a source that predates the argument keeps working.
+                        else self.github.combined_status(subject)
+                    )
+                except Exception as exc:  # noqa: BLE001 - a gate result, not a crash
+                    logger.warning("merge: could not read CI status: %s", exc)
+                    status = {
+                        "state": "unreadable",
+                        "contexts": [],
+                        "count": 0,
+                        "sha": subject,
+                        "required_configured": bool(required),
+                        "required": {name: "unreadable" for name in required},
+                        "missing_permissions": [f"unreadable: {exc}"],
+                    }
+
         decision = evaluate_merge(
             incident,
             attempt,
@@ -591,6 +746,8 @@ class AutoMerger:
             expected_pr_number=expected,
             status=status,
             require_status_checks=self.require_status_checks,
+            required_status_contexts=list(self.required_status_contexts),
+            prior_post_merge_failure=self._prior_post_merge_failure(incident),
             base_sha_at_verification=record.base_sha_at_verification,
             observed_base_sha=observed_base,
         )
@@ -616,6 +773,8 @@ class AutoMerger:
             )
             record.merged = bool(result.get("merged"))
             record.merge_commit_sha = str(result.get("sha") or "")
+            if record.merged:
+                record.merged_at = now_iso()
             if not record.merged:
                 record.error = str(result.get("message") or "GitHub declined the merge")
         except Exception as exc:  # noqa: BLE001 - reported, never swallowed
@@ -628,6 +787,12 @@ class AutoMerger:
         return record
 
     # -- internals --------------------------------------------------------
+
+    def _prior_post_merge_failure(self, incident: Incident) -> Optional[Dict[str, Any]]:
+        """Any recorded post-merge production failure for this fingerprint."""
+        from openjarvis.reliability.postmerge import post_merge_failure_for
+
+        return post_merge_failure_for(self.store, incident.fingerprint)
 
     @staticmethod
     def _last_attempt(incident: Incident) -> Optional[RepairAttempt]:

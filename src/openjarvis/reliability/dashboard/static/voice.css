@@ -1,0 +1,264 @@
+/* Sir Voice — a call screen, held one-handed, in the dark, in a hurry.
+ *
+ * Sized for a thumb rather than a cursor: the two decisions that matter are
+ * large circular targets at the bottom of the screen, where a thumb already is,
+ * and nothing else on the page can be hit by accident. Dark by default because
+ * this is read at night more often than not.
+ */
+
+:root {
+  --bg: #0b0d10;
+  --panel: #151a21;
+  --line: #232b36;
+  --text: #e8edf3;
+  --muted: #93a1b3;
+  --answer: #2f9e5e;
+  --decline: #d0453c;
+  --confirm: #d99320;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  /* The home indicator and notch: a call button underneath either is a call
+     button that cannot be pressed. */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right)
+           env(safe-area-inset-bottom) env(safe-area-inset-left);
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+.screen {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: 24px 20px 32px;
+}
+
+/* ------------------------------------------------------------ ringing */
+
+.caller {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 6px;
+}
+
+.avatar {
+  width: 132px;
+  height: 132px;
+  border-radius: 50%;
+  background: var(--panel);
+  padding: 18px;
+  border: 1px solid var(--line);
+}
+
+.avatar--ringing { animation: pulse 2s ease-in-out infinite; }
+.avatar--small { width: 44px; height: 44px; padding: 7px; }
+
+@keyframes pulse {
+  0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(47, 158, 94, 0.35); }
+  50%      { transform: scale(1.03); box-shadow: 0 0 0 18px rgba(47, 158, 94, 0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .avatar--ringing { animation: none; }
+}
+
+h1 { font-size: 30px; font-weight: 600; margin: 14px 0 0; letter-spacing: .01em; }
+h2 { font-size: 17px; margin: 0; }
+.subtitle { color: var(--muted); margin: 0; font-size: 16px; }
+.detail { color: var(--muted); margin: 4px 20px 0; font-size: 14px; }
+
+/* ------------------------------------------------------------- actions */
+
+.actions {
+  display: flex;
+  justify-content: space-evenly;
+  align-items: flex-end;
+  gap: 24px;
+  padding-top: 20px;
+}
+
+.round {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.round span {
+  display: grid;
+  place-items: center;
+  /* 72px: comfortably above the 44px minimum, because this is pressed by
+     someone who has just been woken up. */
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  font-size: 27px;
+  transition: transform .12s ease;
+}
+
+.round:active span { transform: scale(0.94); }
+.round em { font-style: normal; font-size: 13px; color: var(--muted); }
+
+.round--answer span  { background: var(--answer); }
+.round--decline span { background: var(--decline); }
+.round--talk span    { background: var(--panel); border: 2px solid var(--line); }
+
+body.listening .round--talk span {
+  background: var(--answer);
+  border-color: var(--answer);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+/* ---------------------------------------------------------------- call */
+
+.call-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.status { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+
+.transcript {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  -webkit-overflow-scrolling: touch;
+}
+
+.line {
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: 16px;
+  max-width: 85%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.line--you {
+  align-self: flex-end;
+  background: #23405e;
+  border-bottom-right-radius: 5px;
+}
+
+.line--sir {
+  align-self: flex-start;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-bottom-left-radius: 5px;
+}
+
+/* A refusal should not look like an answer. */
+.line--confirm { border-color: var(--confirm); background: #2a2317; }
+.line--note { background: transparent; border: 0; color: var(--muted); font-size: 13px; }
+
+.composer { display: flex; gap: 8px; padding: 10px 0; }
+
+.composer input {
+  flex: 1;
+  min-width: 0;
+  padding: 12px 14px;
+  border-radius: 22px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--text);
+  /* 16px exactly: anything smaller and iOS zooms the page on focus. */
+  font-size: 16px;
+}
+
+.pill {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--text);
+  border-radius: 22px;
+  padding: 10px 16px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.pill--approve { border-color: var(--answer); }
+.pill--decline { border-color: var(--decline); }
+
+/* ------------------------------------------------------------- pending */
+
+.pending {
+  margin: 0 20px 20px;
+  padding: 14px 16px;
+  background: var(--panel);
+  border: 1px solid var(--confirm);
+  border-radius: 14px;
+}
+
+.pending h3 { margin: 0 0 10px; font-size: 14px; color: var(--confirm); }
+.pending ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
+
+.pending li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 14px;
+}
+
+.pending li span { flex: 1; min-width: 140px; }
+
+/* Sir's own health. Green is earned, not assumed: anything unverified renders
+   amber, so an unchecked component never reads as working. */
+.pending--health { border-color: var(--line); }
+.pending--health h3 { color: var(--muted); }
+.pending--health li { justify-content: space-between; font-size: 13px; }
+.pending--health b { font-weight: 600; }
+.pending--health .ok { color: var(--answer); }
+.pending--health .warn { color: var(--confirm); }
+.pending--health button { margin-top: 12px; width: 100%; }
+/* The microphone's evidence line wraps onto its own row: it is a sentence, not
+   a status word, and it is the one line in this panel worth reading. */
+.pending--health li:has(small) { flex-wrap: wrap; }
+.pending--health small {
+  flex-basis: 100%;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.tiny {
+  margin: 0 20px 18px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+@media (min-width: 700px) {
+  .screen { max-width: 560px; margin: 0 auto; width: 100%; }
+  .pending { max-width: 560px; margin-inline: auto; }
+}

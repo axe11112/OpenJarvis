@@ -586,3 +586,157 @@ class TestMonitorActionsToggle:
             return_value=httpx.Response(200, json={"full_name": REPO})
         )
         assert _source(monitor_actions=False).health().reachable is True
+
+
+# ---------------------------------------------------------------------------
+# Commit status as the merge gate's evidence
+# ---------------------------------------------------------------------------
+
+SHA = "093896b92f3c1aa07ff34b725a8a8e04636ec142"
+OTHER_SHA = "15153d23ee5bcd10f1c26be3bebcdf46e634e610"
+
+
+def _statuses(respx_mock, *, contexts, sha=SHA, code=200):
+    """Mock the Commit Statuses API with one entry per (context, state) pair."""
+    route = respx_mock.get(f"{API}/repos/{REPO}/commits/{SHA}/status")
+    if code != 200:
+        route.mock(return_value=httpx.Response(code))
+        return
+    route.mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "sha": sha,
+                "state": "success",
+                "statuses": [
+                    {"context": name, "state": state} for name, state in contexts
+                ],
+            },
+        )
+    )
+
+
+def _check_runs(respx_mock, *, runs=(), code=200):
+    route = respx_mock.get(f"{API}/repos/{REPO}/commits/{SHA}/check-runs")
+    if code != 200:
+        route.mock(return_value=httpx.Response(code))
+        return
+    route.mock(return_value=httpx.Response(200, json={"check_runs": list(runs)}))
+
+
+class TestRequiredStatusContexts:
+    """A named context turns "is anything red" into "did *this* report green".
+
+    That distinction is what makes the gate usable by a GitHub fine-grained
+    token, which has no Checks permission to grant and is therefore refused by
+    the check-runs endpoint however it is scoped.
+    """
+
+    def test_required_context_success_passes(self, respx_mock):
+        _statuses(respx_mock, contexts=[("Vercel", "success")])
+        _check_runs(respx_mock)
+        verdict = _source().combined_status(SHA, required_contexts=["Vercel"])
+        assert verdict["state"] == "success"
+        assert verdict["required"] == {"Vercel": "success"}
+        assert verdict["sha"] == SHA
+
+    def test_required_context_failure_refuses(self, respx_mock):
+        _statuses(respx_mock, contexts=[("Vercel", "failure")])
+        _check_runs(respx_mock)
+        verdict = _source().combined_status(SHA, required_contexts=["Vercel"])
+        assert verdict["state"] == "failure"
+        assert verdict["required"] == {"Vercel": "failure"}
+
+    def test_required_context_pending_refuses(self, respx_mock):
+        """A build still running is not a build that succeeded."""
+        _statuses(respx_mock, contexts=[("Vercel", "pending")])
+        _check_runs(respx_mock)
+        verdict = _source().combined_status(SHA, required_contexts=["Vercel"])
+        assert verdict["state"] == "pending"
+
+    def test_required_context_error_refuses(self, respx_mock):
+        _statuses(respx_mock, contexts=[("Vercel", "error")])
+        _check_runs(respx_mock)
+        verdict = _source().combined_status(SHA, required_contexts=["Vercel"])
+        assert verdict["state"] == "failure"
+
+    def test_required_context_missing_refuses(self, respx_mock):
+        """Nothing named Vercel reported. Absence is not success."""
+        _statuses(respx_mock, contexts=[("other/ci", "success")])
+        _check_runs(respx_mock)
+        verdict = _source().combined_status(SHA, required_contexts=["Vercel"])
+        assert verdict["state"] == "none"
+        assert verdict["required"] == {"Vercel": "missing"}
+        assert verdict["missing_required"] == ["Vercel"]
+
+    def test_status_for_another_commit_is_not_evidence(self, respx_mock):
+        """Green, but about somebody else's code."""
+        _statuses(respx_mock, contexts=[("Vercel", "success")], sha=OTHER_SHA)
+        _check_runs(respx_mock)
+        verdict = _source().combined_status(SHA, required_contexts=["Vercel"])
+        assert verdict["state"] == "unreadable"
+        assert verdict["sha"] == SHA
+
+    def test_statuses_api_forbidden_refuses(self, respx_mock):
+        """The API the answer now rests on cannot be read: that is a blind spot."""
+        _statuses(respx_mock, contexts=[], code=403)
+        _check_runs(respx_mock)
+        verdict = _source().combined_status(SHA, required_contexts=["Vercel"])
+        assert verdict["state"] == "unreadable"
+        assert verdict["statuses_api"] == "unavailable"
+        assert "Commit statuses: Read" in verdict["missing_permissions"]
+
+    def test_checks_api_forbidden_does_not_poison_a_named_context(self, respx_mock):
+        """The case this exists for: a fine-grained PAT reading a Vercel status.
+
+        The Checks denial is reported, never silently read as consent — but it
+        no longer overrules a required context that was found and is green.
+        """
+        _statuses(respx_mock, contexts=[("Vercel", "success")])
+        _check_runs(respx_mock, code=403)
+        verdict = _source().combined_status(SHA, required_contexts=["Vercel"])
+        assert verdict["state"] == "success"
+        assert verdict["checks_api"] == "unavailable"
+        assert "Checks: Read" in verdict["missing_permissions"]
+
+    def test_checks_forbidden_still_hides_an_unnamed_context(self, respx_mock):
+        """A required context absent from the readable half could be in the other."""
+        _statuses(respx_mock, contexts=[("Vercel", "success")])
+        _check_runs(respx_mock, code=403)
+        verdict = _source().combined_status(SHA, required_contexts=["Vercel", "build"])
+        assert verdict["state"] == "unreadable"
+        assert verdict["required"]["build"] == "unreadable"
+
+    def test_observed_failure_still_refuses_a_green_required_context(self, respx_mock):
+        """Narrowing what must be green does not license ignoring a seen red."""
+        _statuses(
+            respx_mock,
+            contexts=[("Vercel", "success"), ("other/ci", "failure")],
+        )
+        _check_runs(respx_mock)
+        verdict = _source().combined_status(SHA, required_contexts=["Vercel"])
+        assert verdict["state"] == "failure"
+
+    def test_a_context_reported_twice_keeps_the_worse_state(self, respx_mock):
+        """A green re-run does not erase the red one it was run because of."""
+        _statuses(respx_mock, contexts=[("Vercel", "success")])
+        _check_runs(
+            respx_mock,
+            runs=[{"name": "Vercel", "status": "completed", "conclusion": "failure"}],
+        )
+        verdict = _source().combined_status(SHA, required_contexts=["Vercel"])
+        assert verdict["state"] == "failure"
+
+    def test_without_required_contexts_the_old_rule_stands(self, respx_mock):
+        """No named contract: a Checks 403 is still a blind spot, as before."""
+        _statuses(respx_mock, contexts=[("Vercel", "success")])
+        _check_runs(respx_mock, code=403)
+        verdict = _source().combined_status(SHA)
+        assert verdict["state"] == "unreadable"
+        assert verdict["required_configured"] is False
+        assert "required" not in verdict
+
+    def test_without_required_contexts_all_green_passes(self, respx_mock):
+        _statuses(respx_mock, contexts=[("Vercel", "success")])
+        _check_runs(respx_mock)
+        assert _source().combined_status(SHA)["state"] == "success"

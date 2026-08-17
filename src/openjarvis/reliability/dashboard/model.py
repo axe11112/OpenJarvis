@@ -313,6 +313,10 @@ class Snapshot:
     probe_verification: str = "off"
     watcher: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
+    #: How often JARVIS handled things without a person. Shown so that "Sir
+    #: gives up too easily" is a number somebody can watch rather than an
+    #: impression — and so the opposite failure is just as visible.
+    autonomy: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the whole snapshot for the API."""
@@ -333,6 +337,7 @@ class Snapshot:
             "incidents": [i.to_dict() for i in self.incidents],
             "safety": self.safety.to_dict(),
             "blind_spots": list(self.blind_spots),
+            "autonomy": dict(self.autonomy),
             "open_incident_count": self.open_incident_count,
             "resolved_incident_count": self.resolved_incident_count,
             "audit_chain_intact": self.audit_chain_intact,
@@ -444,6 +449,18 @@ def safety_panel(config: Any, *, stop_flag_engaged: bool) -> SafetyPanel:
                 + ("" if rc.merge.require_status_checks else "; CI checks NOT required")
                 if rc.merge.enabled
                 else "[reliability.merge] enabled = false"
+            ),
+        ),
+        SafetyRow(
+            label="Required merge statuses",
+            value=", ".join(rc.merge.required_status_contexts) or "none",
+            detail=(
+                "each must be present and green on the verified commit"
+                if rc.merge.required_status_contexts
+                else (
+                    "no named contexts: every status and check-run must be "
+                    "readable and green"
+                )
             ),
         ),
         SafetyRow(
@@ -966,6 +983,7 @@ def build_snapshot(
     watcher: Optional[Dict[str, Any]] = None,
     generated_at: str = "",
     notes: Optional[List[str]] = None,
+    autonomy: Optional[Dict[str, Any]] = None,
 ) -> Snapshot:
     """Assemble the whole read model from state that was already gathered.
 
@@ -1039,6 +1057,7 @@ def build_snapshot(
         probe_verification=probe_verification,
         watcher=watcher,
         notes=list(notes or []),
+        autonomy=dict(autonomy or {}),
     )
 
 
@@ -1098,6 +1117,27 @@ def incident_detail(
         key: redact(str(value))[:600]
         for key, value in (payload.get("metadata") or {}).items()
     }
+    # Promoted out of metadata rather than left to be stringified there: this
+    # is the thing a person reads first when they open an escalated incident,
+    # and "what I tried" truncated to 600 characters of JSON is not readable.
+    handover = (incident.metadata or {}).get("handover")
+    if isinstance(handover, dict):
+        payload["handover"] = {
+            "what_failed": redact(str(handover.get("what_failed", "")))[:300],
+            "cause": redact(str(handover.get("cause", "")))[:600],
+            "cause_class": str(handover.get("cause_class", "")),
+            "evidence": [
+                redact(str(line))[:300] for line in (handover.get("evidence") or [])
+            ][:10],
+            "tried": [
+                redact(str(line))[:300] for line in (handover.get("tried") or [])
+            ][:10],
+            "why_failed": redact(str(handover.get("why_failed", "")))[:1000],
+            "what_is_needed": redact(str(handover.get("what_is_needed", "")))[:600],
+            "history": redact(str(handover.get("history", "")))[:300],
+            "complete": bool(handover.get("complete")),
+        }
+
     payload["audit"] = {
         "transitions": [t.to_dict() for t in transitions],
         "chain_intact": chain_intact,

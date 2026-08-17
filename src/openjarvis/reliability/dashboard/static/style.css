@@ -486,3 +486,29 @@ table.probes .num { font-family: var(--mono); font-size: 12px; color: var(--ink-
   .incident { grid-template-columns: 76px 1fr; }
   .imeta { grid-column: 1 / -1; text-align: left; }
 }
+
+
+/* ---------------------------------------------------------------- autonomy
+ *
+ * One line, above the incident list. Deliberately understated: it is context
+ * for the list below it, not a scoreboard. A number rendered large enough to
+ * be a target becomes one, and the target here would be "escalate less",
+ * which is the wrong thing to optimise.
+ */
+.autonomy {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.autonomy-rate { font-size: 18px; font-weight: 600; }
+.autonomy-label { color: var(--muted); font-size: 12px; }
+.autonomy-warn {
+  flex-basis: 100%;
+  color: var(--warn);
+  font-size: 12px;
+}
