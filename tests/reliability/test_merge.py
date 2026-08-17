@@ -1168,3 +1168,160 @@ class TestPriorPostMergeFailureGate:
         )
         assert not record.decision.allowed
         assert not github.merge_calls
+
+
+# ---------------------------------------------------------------------------
+# The pre-activation audit
+#
+# Written the day automatic merge was switched on, and it exists to answer one
+# question a year from now: which of the conditions the owner asked for is this
+# code actually still checking?
+#
+# The list below is theirs, transcribed. Each entry names the gate that answers
+# it. A refactor that renames or drops a gate fails here rather than quietly
+# reducing what "verified" means, which is the failure mode that matters — every
+# other test in this file proves one gate refuses; this one proves none has gone
+# missing.
+# ---------------------------------------------------------------------------
+
+#: owner's condition -> gate name
+REQUIRED_GATES = {
+    "the switch is on": "merge_enabled",
+    "no previous merge for this fingerprint broke production": (
+        "no_prior_post_merge_failure"
+    ),
+    "the incident is not already with a human": "incident_state",
+    "the check is not flapping": "not_flapping",
+    "a repair attempt exists": "attempt_recorded",
+    "independent verification passed": "verified",
+    "the verified commit is known": "verified_sha_known",
+    "scope validation passed": "scope",
+    "no protected path was touched": "no_protected_paths",
+    "nothing secret-like was touched": "no_secret_like_paths",
+    "lint passed": "check_lint",
+    "typecheck passed": "check_typecheck",
+    "tests passed": "check_tests",
+    "build passed": "check_build",
+    "a preview deployment existed to verify against": "preview_deployment",
+    "the probe that opened the incident is the one that was re-run": (
+        "original_reproduction"
+    ),
+    "the PR belongs to this incident": "pr_belongs_to_incident",
+    "the PR is on the expected JARVIS branch": "pr_head_is_incident_branch",
+    "the PR targets the default branch": "pr_base_is_default_branch",
+    "the PR is open and unmerged": "pr_open",
+    "the PR is not a draft": "pr_not_draft",
+    "there are no merge conflicts": "no_conflicts",
+    "the head SHA is still the verified one": "head_sha_unchanged",
+    "the base branch has not moved": "base_unchanged",
+    "the required status context reported success": "status_checks",
+}
+
+
+class TestPreActivationAudit:
+    def test_every_required_gate_is_evaluated(self):
+        """All of them, on a decision that passes. None may be absent."""
+        decision = _decide(
+            status={
+                "state": "success",
+                "sha": VERIFIED_SHA,
+                "required_configured": True,
+                "required": {"Vercel": "success"},
+                "contexts": ["Vercel"],
+                "count": 1,
+            },
+            required_status_contexts=["Vercel"],
+        )
+        assert decision.allowed, decision.reason
+        evaluated = {g.name for g in decision.gates}
+        missing = {
+            condition: gate
+            for condition, gate in REQUIRED_GATES.items()
+            if gate not in evaluated
+        }
+        assert not missing, f"conditions no longer checked: {missing}"
+
+    def test_every_evaluated_gate_passed_on_the_happy_path(self):
+        decision = _decide(
+            status={
+                "state": "success",
+                "sha": VERIFIED_SHA,
+                "required_configured": True,
+                "required": {"Vercel": "success"},
+                "contexts": ["Vercel"],
+                "count": 1,
+            },
+            required_status_contexts=["Vercel"],
+        )
+        failed = [g.name for g in decision.gates if not g.passed]
+        assert failed == [], failed
+
+    def test_the_gate_list_has_not_silently_shrunk(self):
+        """A count, so adding a condition to the dict above is deliberate."""
+        assert len(REQUIRED_GATES) == 25
+
+
+class TestRequiredVercelContextOnTheVerifiedCommit:
+    """Condition 19 and 20, in their own class because they are the new ones.
+
+    The named context must report success *on the commit that was verified*.
+    Everything else — absent, pending, failed, errored, green for a different
+    commit, or green on a summary that never evaluated the named context — is a
+    refusal.
+    """
+
+    def _status(self, **overrides):
+        facts = {
+            "state": "success",
+            "sha": VERIFIED_SHA,
+            "required_configured": True,
+            "required": {"Vercel": "success"},
+            "contexts": ["Vercel"],
+            "count": 1,
+        }
+        facts.update(overrides)
+        return facts
+
+    def _decide_ctx(self, **status_overrides):
+        return _decide(
+            status=self._status(**status_overrides),
+            required_status_contexts=["Vercel"],
+        )
+
+    def test_success_on_the_verified_commit_is_accepted(self):
+        assert self._decide_ctx().allowed
+
+    def test_pending_is_refused(self):
+        decision = self._decide_ctx(state="pending", required={"Vercel": "pending"})
+        assert _refused(decision, "status_checks")
+
+    def test_failure_is_refused(self):
+        decision = self._decide_ctx(state="failure", required={"Vercel": "failure"})
+        assert _refused(decision, "status_checks")
+
+    def test_error_is_refused(self):
+        decision = self._decide_ctx(state="error", required={"Vercel": "error"})
+        assert _refused(decision, "status_checks")
+
+    def test_a_missing_context_is_refused(self):
+        decision = self._decide_ctx(required={}, required_configured=False)
+        assert _refused(decision, "status_checks")
+
+    def test_green_for_another_commit_is_refused(self):
+        decision = self._decide_ctx(sha="9" * 40)
+        assert _refused(decision, "status_checks")
+        assert "not the" in decision.reason
+
+    def test_unreadable_is_refused_and_never_advises_disabling_the_gate(self):
+        decision = self._decide_ctx(
+            state="unreadable",
+            required={"Vercel": "unreadable"},
+            missing_permissions=["Checks: Read"],
+        )
+        assert _refused(decision, "status_checks")
+        assert "do not remove the required context" in decision.reason
+
+    def test_a_summary_that_did_not_evaluate_the_context_is_refused(self):
+        """"Some CI was green" is not "Vercel said yes about this commit"."""
+        decision = self._decide_ctx(required={"other-ci": "success"})
+        assert _refused(decision, "status_checks")

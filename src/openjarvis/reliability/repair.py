@@ -222,6 +222,9 @@ class RepairLoop:
     #: "merged" is not "production works" and nothing else here can tell the
     #: difference.
     post_merge_verifier: Any = None
+    #: Production URL to re-check against before handing an incident to a human.
+    #: Empty disables the re-check, which is the previous behaviour.
+    production_url: str = ""
 
     def __post_init__(self) -> None:
         if self.checks is None:
@@ -282,7 +285,7 @@ class RepairLoop:
                 reason=gate.reason,
             )
         if not gate:
-            self._escalate(incident, gate.reason)
+            self._escalate(incident, gate.reason, spec=spec)
             return RepairOutcome(
                 resolved=False,
                 attempts=incident.attempts_used,
@@ -307,7 +310,7 @@ class RepairLoop:
                     "every hypothesis I have was tried and none of them held: "
                     + ", ".join(history.strategies_tried(incident))
                 )
-                self._escalate(incident, reason)
+                self._escalate(incident, reason, spec=spec)
                 return RepairOutcome(
                     resolved=False,
                     attempts=incident.attempts_used,
@@ -330,7 +333,7 @@ class RepairLoop:
                 return self._succeed(incident, attempt, verification, spec)
 
             if stop_reason:
-                self._escalate(incident, stop_reason)
+                self._escalate(incident, stop_reason, spec=spec)
                 return RepairOutcome(
                     resolved=False,
                     attempts=incident.attempts_used,
@@ -349,7 +352,7 @@ class RepairLoop:
         reason = (
             f"{self.policy.max_attempts} repair attempts did not produce a verified fix"
         )
-        self._escalate(incident, reason)
+        self._escalate(incident, reason, spec=spec)
         return RepairOutcome(
             resolved=False,
             attempts=incident.attempts_used,
@@ -850,6 +853,68 @@ class RepairLoop:
             f"{str(marker.get('reason', ''))[:200]}"
         )
 
+    def _still_failing(self, incident: Incident, spec: Any) -> bool:
+        """Whether the original problem is still there, checked just now.
+
+        Called immediately before handing an incident to a human, and it is the
+        cheapest autonomy available: every one of the first nine escalations in
+        this system's history was for a fault that had already cleared by the
+        time anybody could have looked at it. Waking somebody for a problem that
+        no longer exists is the most expensive kind of false alarm, because it
+        teaches them the next one is probably nothing too.
+
+        Fails *closed*. No production URL, no spec, an unreadable verdict or a
+        crash all mean "assume it is still broken and escalate": the alternative
+        is silently dropping a real outage because a check could not run.
+
+        Only consulted when the incident's state already permits RESOLVED, which
+        in practice means after a verification attempt. That is deliberate — see
+        the caller.
+        """
+        if not self.production_url or spec is None:
+            return True
+        try:
+            verdict = self.verifier.verify(
+                spec, target_url=self.production_url, incident_id=incident.id
+            )
+        except Exception:  # noqa: BLE001 - unverifiable means still broken
+            logger.exception(
+                "incident %s: could not re-check before escalating", incident.id
+            )
+            return True
+        if not getattr(verdict, "passed", False):
+            return True
+        logger.info(
+            "incident %s: the problem no longer reproduces against production; "
+            "closing instead of escalating",
+            incident.id,
+        )
+        self._add_note(
+            incident,
+            "Recovered before escalation",
+            content=(
+                "Re-checked against production immediately before handing this "
+                "over, and the original probe now passes:\n\n"
+                f"{getattr(verdict, 'actual', '') or 'the probe passed'}\n\n"
+                "Nobody was woken. The fault is recorded here in full."
+            ),
+        )
+        return False
+
+    def _recovered_instead(self, incident: Incident, reason: str) -> None:
+        """Close an incident that fixed itself while JARVIS was working on it."""
+        try:
+            self.store.transition(
+                incident,
+                IncidentState.RESOLVED,
+                reason=(
+                    "the problem stopped reproducing against production before "
+                    f"escalation ({reason})"
+                ),
+            )
+        except Exception:
+            logger.exception("could not resolve %s after recovery", incident.id)
+
     def _escalate(
         self,
         incident: Incident,
@@ -857,6 +922,7 @@ class RepairLoop:
         *,
         notify: bool = True,
         result: Any = None,
+        spec: Any = None,
     ) -> None:
         """Stop touching code and hand the incident to a human — with a handover.
 
@@ -871,6 +937,26 @@ class RepairLoop:
         owed is what failed, what was believed to be causing it, the evidence,
         what was tried, why it did not work, and what is actually being asked.
         """
+        # Evidence before escalation, not instead of it. If the fault has
+        # cleared there is nothing to hand over and nobody to wake.
+        #
+        # Conditional on the state machine already permitting RESOLVED, and that
+        # condition is load-bearing rather than defensive. Reaching RESOLVED only
+        # through VERIFYING is the structural guarantee behind "never trust the
+        # coding agent's claim that it fixed something" — a test asserts it —
+        # and widening the table so this path could always close an incident
+        # would trade that guarantee for a convenience. So where closing is not
+        # legal, this escalates exactly as before: a human hearing about a fault
+        # that has cleared is a much smaller problem than a state machine that
+        # can be talked into RESOLVED.
+        if (
+            spec is not None
+            and incident.can_transition_to(IncidentState.RESOLVED)
+            and not self._still_failing(incident, spec)
+        ):
+            self._recovered_instead(incident, reason)
+            return
+
         logger.warning("Incident %s requires a human: %s", incident.id, reason)
 
         handover = build_handover(

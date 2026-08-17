@@ -66,9 +66,22 @@ JARGON = (
     "health vocabulary",
     "probe fleet",
     "incident lifecycle",
-    "HUMAN_REQUIRED",
-    "RESOLVED",
     "combined_status",
+)
+
+#: Jargon that is only jargon in its own spelling.
+#:
+#: "resolved" is a perfectly good English word and is the owner's own wording for
+#: a finished repair; ``RESOLVED`` is a state name being read aloud. Matching
+#: these case-sensitively keeps the check on the property that matters — no
+#: identifier from the state machine or the GitHub API reaches a phone — without
+#: banning the vocabulary a person would actually use.
+JARGON_TOKENS = (
+    "HUMAN_REQUIRED",
+    "RECOVERY_REQUIRED",
+    "ROLLED_BACK",
+    "RESOLVED",
+    "MERGED",
     "SHA",
 )
 
@@ -80,6 +93,8 @@ def _assert_owner_readable(text: str) -> None:
     lowered = text.lower()
     for word in JARGON:
         assert word.lower() not in lowered, f"internal jargon leaked: {word!r}"
+    for token in JARGON_TOKENS:
+        assert token not in text, f"an internal identifier leaked: {token!r}"
     assert len(text.splitlines()) <= 6, f"too long for a phone:\n{text}"
 
 
@@ -604,18 +619,29 @@ def _result(**overrides):
 
 
 class TestProductionOutcomeMessages:
-    def test_a_live_fix_says_it_is_live(self):
+    def test_a_live_fix_is_two_lines_in_the_owners_own_words(self):
+        """The end of a long sequence, said in the shortest true way.
+
+        Problem found, repaired, four check suites, a preview, a merge, a
+        production deployment, the original reproduction and the whole probe
+        fleet re-run against production. None of that belongs on a phone, and
+        neither does the component or the cause: there is nothing here for the
+        owner to decide.
+        """
         incident = _incident()
         incident.resolution.root_cause = "the callback dropped the session cookie"
         record = type("M", (), {"pr_number": 210, "merge_commit_sha": "e" * 40})()
         text = render_production_verified(incident, record=record, result=_result())
 
         _assert_owner_readable(text)
-        assert text.splitlines()[0] == "Sir, it's fixed."
-        assert "The fix is live and all checks are passing." in text
+        assert text == (
+            "Sir, it's fixed.\n"
+            "The issue is resolved and everything is working normally."
+        )
         # The identifiers that made this true stay in the dashboard.
         assert "dpl_aNDR9i1G" not in text
         assert "e" * 12 not in text
+        assert "210" not in text
 
     def test_a_bad_deployment_asks_for_help_without_the_forensics(self):
         incident = _incident()

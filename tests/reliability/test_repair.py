@@ -1016,3 +1016,156 @@ class TestSafetyPolicy:
     def test_default_branch_push_with_override(self):
         policy = SafetyPolicy(allow_push_to_default_branch=True)
         assert policy.may_push_to("main", "main")
+
+
+# ---------------------------------------------------------------------------
+# Evidence before escalation
+#
+# Every one of the first nine escalations in this system's history was for a
+# fault that had already cleared by the time anybody could have looked at it.
+# Waking somebody for a problem that no longer exists is the most expensive
+# false alarm there is, because it teaches them the next one is probably
+# nothing too.
+#
+# The rule is asymmetric on purpose: only a probe that *passes* against
+# production can prevent an escalation. No URL, no spec, a crash, or any
+# unreadable verdict all escalate.
+# ---------------------------------------------------------------------------
+
+
+class TestRecheckBeforeEscalating:
+    def test_a_fault_that_cleared_is_closed_not_escalated(self, store, incident):
+        """Keyed on the target URL, not on call order.
+
+        What matters is *where* the probe passed: a preview that never came good
+        and a production site that did. Scripting by position would pass for the
+        wrong reason the moment the loop changed how many times it verifies.
+        """
+
+        class _PreviewFailsProductionPasses:
+            def __init__(self):
+                self.targets = []
+
+            def verify(self, spec, *, target_url, incident_id=""):
+                self.targets.append(target_url)
+                production = target_url == "https://www.example.com"
+                return VerificationResult(
+                    passed=production,
+                    probe_id=spec.id,
+                    target_url=target_url,
+                    actual="the probe passes here" if production else "still broken",
+                )
+
+            @staticmethod
+            def summarize_for_retry(v):
+                return ""
+
+        verifier = _PreviewFailsProductionPasses()
+        loop = _loop(
+            store,
+            # Real changes, so the loop reaches VERIFYING — the only state from
+            # which RESOLVED is legal, which is the point of the guard.
+            FakeCodeAgent(
+                [CodeAgentResult(claim="Fixed it.", changed_files=["app/auth.ts"])]
+            ),
+            verifier=verifier,
+            production_url="https://www.example.com",
+        )
+        outcome = loop.run(incident, _spec())
+
+        assert incident.state is IncidentState.RESOLVED
+        assert not outcome.resolved  # JARVIS did not fix it; it recovered
+        assert "https://www.example.com" in verifier.targets
+        notes = " ".join(e.summary or "" for e in store.get(incident.id).evidence)
+        assert "Recovered before escalation" in notes
+
+    def test_it_never_widens_the_path_to_resolved(self, store, incident):
+        """The structural guarantee is not traded for this convenience.
+
+        RESOLVED is reachable autonomously only through VERIFYING — that is what
+        makes "never trust the agent's claim that it fixed something" a property
+        of the state machine rather than of a code path. An agent that produces
+        no diff never reaches VERIFYING, so even with production demonstrably
+        healthy this escalates rather than closing.
+        """
+
+        class _AlwaysPasses:
+            def verify(self, spec, *, target_url, incident_id=""):
+                return VerificationResult(passed=True, probe_id=spec.id)
+
+            @staticmethod
+            def summarize_for_retry(v):
+                return ""
+
+        loop = _loop(
+            store,
+            FakeCodeAgent(),  # no changed files, so the loop stops at FIXING
+            verifier=_AlwaysPasses(),
+            production_url="https://www.example.com",
+        )
+        loop.run(incident, _spec())
+        assert incident.state is IncidentState.HUMAN_REQUIRED
+
+    def test_a_fault_that_persists_still_escalates(self, store, incident):
+        loop = _loop(
+            store,
+            FakeCodeAgent(),
+            verifier=_verifier([False, False, False, False]),
+            production_url="https://www.example.com",
+        )
+        loop.run(incident, _spec())
+        assert incident.state is IncidentState.HUMAN_REQUIRED
+
+    def test_without_a_production_url_the_check_is_skipped(self, store, incident):
+        """Absence of the re-check is never less safe, only noisier."""
+        loop = _loop(store, FakeCodeAgent(), verifier=_verifier([False, False, False]))
+        loop.run(incident, _spec())
+        assert incident.state is IncidentState.HUMAN_REQUIRED
+
+    def test_a_re_check_that_crashes_escalates(self, store, incident):
+        """Fails closed. An unverifiable production is not a healthy one."""
+
+        class _Exploding:
+            def __init__(self):
+                self.calls = 0
+
+            def verify(self, spec, *, target_url, incident_id=""):
+                self.calls += 1
+                if self.calls <= 3:
+                    return VerificationResult(passed=False, probe_id=spec.id)
+                raise RuntimeError("the browser died")
+
+            @staticmethod
+            def summarize_for_retry(v):
+                return ""
+
+        loop = _loop(
+            store,
+            FakeCodeAgent(),
+            verifier=_Exploding(),
+            production_url="https://www.example.com",
+        )
+        loop.run(incident, _spec())
+        assert incident.state is IncidentState.HUMAN_REQUIRED
+
+    def test_a_policy_refusal_that_needs_a_human_is_re_checked_too(self, store):
+        """Not only the exhausted-attempts path."""
+        critical = store.create(
+            Incident(
+                fingerprint="fp_c",
+                severity=Severity.CRITICAL,
+                component="auth",
+                title="down",
+                probe_id="auth-login",
+            )
+        )
+        loop = _loop(
+            store,
+            FakeCodeAgent(),
+            verifier=_verifier([True]),
+            policy=_policy(max_attempts=0),
+            production_url="https://www.example.com",
+        )
+        loop.run(critical, _spec())
+        # attempts_exhausted needs a human, but production is fine now.
+        assert critical.state is IncidentState.RESOLVED

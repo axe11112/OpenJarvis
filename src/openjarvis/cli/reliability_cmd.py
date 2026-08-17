@@ -371,7 +371,20 @@ def _build_repair_loop(config: Any, store: Any, sources: list) -> Any:
         notifier=_build_notifier(config),
         auto_merger=_build_auto_merger(config, store, github),
         post_merge_verifier=_build_post_merge_verifier(config, store, vercel),
+        # So a fault that cleared while JARVIS was working on it is closed
+        # rather than handed to a person. Empty disables the re-check.
+        production_url=_resolve_production_url(config),
     )
+
+
+def _resolve_production_url(config: Any) -> str:
+    """The production URL, or empty when it cannot be resolved."""
+    from openjarvis.reliability.target import resolve_target
+
+    try:
+        return resolve_target(config).production_url or ""
+    except Exception:  # noqa: BLE001 - no URL simply disables the re-check
+        return ""
 
 
 def _build_post_merge_verifier(config: Any, store: Any, vercel: Any) -> Any:

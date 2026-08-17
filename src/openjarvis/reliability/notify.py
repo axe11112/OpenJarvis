@@ -319,19 +319,24 @@ def render_production_verified(
 ) -> str:
     """The one message a successful repair sends once merging is enabled.
 
-    The live-mode counterpart of :func:`render_resolved`, and it says the one
-    thing that differs: the fix is not waiting for anybody, it is already
-    running. No deployment IDs, no merge SHAs — those are dashboard facts.
+    Two lines, and they are the owner's own words rather than a summary of the
+    pipeline. This message is the end of a sequence — problem found, repaired,
+    four check suites, a preview, a merge, a production deployment, the original
+    reproduction and the whole probe fleet re-run against production — and none
+    of that belongs on a phone. Anyone who wants the deployment id, the merge SHA
+    or the per-probe results has a dashboard and an audit log.
+
+    Deliberately does *not* name the component or the cause. Every other message
+    here does, because in those the owner has something to decide. Here there is
+    nothing to decide: it is fixed, and the shortest true sentence is the kindest
+    one at three in the morning.
     """
-    lines = [_sir(persona, "it's fixed.")]
-    cause = _short_cause(incident)
-    subject = plain_subject(incident)
-    if cause:
-        lines.append(f"{subject} was failing because {cause}.")
-    else:
-        lines.append(f"{subject} was failing.")
-    lines.append("The fix is live and all checks are passing.")
-    return "\n".join(lines)
+    return "\n".join(
+        [
+            _sir(persona, "it's fixed."),
+            "The issue is resolved and everything is working normally.",
+        ]
+    )
 
 
 def render_post_merge_failed(
