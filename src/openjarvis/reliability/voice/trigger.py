@@ -148,7 +148,7 @@ class CallTrigger:
                 detail="hourly call limit reached",
                 incident_id=incident.id,
             )
-        if not self._claim(incident.id):
+        if not self._claim(self._key(incident)):
             return CallDecision(
                 False,
                 reason=reason,
@@ -222,8 +222,21 @@ class CallTrigger:
                 return False
         return True
 
+    @staticmethod
+    def _key(incident: Incident) -> str:
+        """What "the same problem" means for suppression.
+
+        The fingerprint, not the incident id. A flapping probe opens a *new*
+        incident every time it fails — observed here: one fingerprint produced
+        INC-00014 at 05:35 and INC-00021 at 01:15 the next morning, with two
+        more in between. Keyed by id, every recurrence is a fresh problem and
+        rings again; keyed by fingerprint, it is recognised as the same thing
+        going wrong repeatedly, which is exactly what it is.
+        """
+        return getattr(incident, "fingerprint", "") or incident.id
+
     def _claim(self, incident_id: str) -> bool:
-        """Whether this incident may be called about now."""
+        """Whether this problem may be called about now."""
         with self._lock:
             now = self.clock()
             last = self._called.get(incident_id)

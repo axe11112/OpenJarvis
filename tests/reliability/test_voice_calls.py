@@ -552,6 +552,41 @@ class TestCallWatchdog:
                 calls.answered(call.id)
         assert rang <= 3, f"rang {rang} times in an hour despite the cap"
 
+    def test_a_recurring_flap_is_one_problem_not_many(self):
+        """The guard that per-incident dedup cannot provide.
+
+        A flapping probe opens a *new* incident every time it fails. Observed on
+        this machine: one fingerprint produced INC-00014 at 05:35 and INC-00021
+        at 01:15 the next morning, with two more in between. Keyed by incident
+        id, each is a fresh problem and rings again.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        from openjarvis.reliability.types import IncidentState, Severity
+        from openjarvis.reliability.voice.trigger import CallTrigger
+
+        old = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+        trigger = CallTrigger(clock=_Clock(), minimum_age_seconds=0)
+        calls = _orchestrator()
+
+        rang = 0
+        for index in range(6):
+            # Same fingerprint, different incident id — a flap, not six faults.
+            incident = _incident(
+                id=f"INC-{index}",
+                state=IncidentState.HUMAN_REQUIRED,
+                severity=Severity.CRITICAL,
+                fingerprint="fp_the_same_flapping_probe",
+            )
+            incident.created_at = old
+            watchdog = _watchdog([incident], trigger=trigger, calls=calls)
+            call = watchdog.tick()
+            if call:
+                rang += 1
+                calls.answered(call.id)
+
+        assert rang == 1, f"one flapping probe rang {rang} times"
+
     def test_the_reliability_core_does_not_import_voice(self):
         """The architectural rule, asserted rather than hoped for: a microphone
         must never be able to break the repair loop."""
