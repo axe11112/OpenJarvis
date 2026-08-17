@@ -528,26 +528,26 @@ class TestTranscription:
 
 class TestCallTrigger:
     def test_an_ordinary_incident_does_not_ring(self):
-        trigger = CallTrigger(clock=_Clock())
+        trigger = CallTrigger(clock=_Clock(), minimum_age_seconds=0)
         incident = _incident(state=IncidentState.FIXING, severity=Severity.HIGH)
         incident.id = "INC-1"
         assert not trigger.evaluate(incident)
 
     def test_a_successful_repair_does_not_ring(self):
-        trigger = CallTrigger(clock=_Clock())
+        trigger = CallTrigger(clock=_Clock(), minimum_age_seconds=0)
         incident = _incident(state=IncidentState.RESOLVED, severity=Severity.CRITICAL)
         incident.id = "INC-1"
         assert not trigger.evaluate(incident)
 
     def test_a_critical_jarvis_is_working_on_does_not_ring(self):
         """It rings if JARVIS stops, not because the fault is severe."""
-        trigger = CallTrigger(clock=_Clock())
+        trigger = CallTrigger(clock=_Clock(), minimum_age_seconds=0)
         incident = _incident(state=IncidentState.FIXING, severity=Severity.CRITICAL)
         incident.id = "INC-1"
         assert not trigger.evaluate(incident)
 
     def test_a_post_merge_failure_rings(self):
-        trigger = CallTrigger(clock=_Clock())
+        trigger = CallTrigger(clock=_Clock(), minimum_age_seconds=0)
         incident = _incident(state=IncidentState.HUMAN_REQUIRED)
         incident.id = "INC-1"
         incident.metadata["post_merge_failure"] = {"reason": "still red"}
@@ -555,21 +555,21 @@ class TestCallTrigger:
         assert decision and decision.reason == "post_merge_failure"
 
     def test_human_required_on_a_production_change_rings(self):
-        trigger = CallTrigger(clock=_Clock())
+        trigger = CallTrigger(clock=_Clock(), minimum_age_seconds=0)
         incident = _incident(state=IncidentState.HUMAN_REQUIRED)
         incident.id = "INC-1"
         assert trigger.evaluate(incident, production_authority_used=True)
 
     def test_human_required_with_nothing_live_does_not_ring(self):
         """A repair that gave up before touching production is a message."""
-        trigger = CallTrigger(clock=_Clock())
+        trigger = CallTrigger(clock=_Clock(), minimum_age_seconds=0)
         incident = _incident(state=IncidentState.HUMAN_REQUIRED, severity=Severity.HIGH)
         incident.id = "INC-1"
         assert not trigger.evaluate(incident, production_authority_used=False)
 
     def test_the_same_incident_does_not_ring_twice(self):
         clock = _Clock()
-        trigger = CallTrigger(clock=clock, cooldown_seconds=3600)
+        trigger = CallTrigger(clock=clock, cooldown_seconds=3600, minimum_age_seconds=0)
         incident = _incident(state=IncidentState.HUMAN_REQUIRED)
         incident.id = "INC-1"
         incident.metadata["post_merge_failure"] = {"reason": "red"}
@@ -580,7 +580,7 @@ class TestCallTrigger:
         assert trigger.evaluate(incident), "after the cooldown it may ring again"
 
     def test_a_storm_of_events_produces_one_call(self):
-        trigger = CallTrigger(clock=_Clock())
+        trigger = CallTrigger(clock=_Clock(), minimum_age_seconds=0)
         incident = _incident(state=IncidentState.HUMAN_REQUIRED)
         incident.id = "INC-1"
         rang = [

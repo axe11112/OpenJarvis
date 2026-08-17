@@ -392,7 +392,8 @@ def _watchdog(incidents, **kwargs):
     calls = kwargs.pop("calls", None) or _orchestrator()
     return CallWatchdog(
         store=_Store(incidents),
-        trigger=kwargs.pop("trigger", None) or CallTrigger(clock=_Clock()),
+        trigger=kwargs.pop("trigger", None)
+        or CallTrigger(clock=_Clock(), minimum_age_seconds=0),
         calls=calls,
         **kwargs,
     )
@@ -470,6 +471,86 @@ class TestCallWatchdog:
         assert "Login" in call.detail
         assert "authentication" not in call.detail
         assert "HUMAN_REQUIRED" not in call.detail
+
+    def test_a_flapping_incident_is_not_called_about_immediately(self):
+        """The guard that exists because of real behaviour on this machine.
+
+        CRITICAL probe timeouts open, escalate because CRITICAL is not in the
+        auto-repair allowlist, and clear themselves minutes later — six in one
+        day. Ringing on sight turns a flapping screenshot into a phone call at
+        two in the morning about something that fixed itself.
+        """
+        from openjarvis.reliability.types import IncidentState, Severity
+        from openjarvis.reliability.voice.trigger import CallTrigger
+
+        fresh = _incident(
+            state=IncidentState.HUMAN_REQUIRED, severity=Severity.CRITICAL
+        )
+        watchdog = _watchdog(
+            [fresh], trigger=CallTrigger(clock=_Clock(), minimum_age_seconds=300)
+        )
+        assert watchdog.tick() is None, "a brand-new incident must prove itself first"
+
+    def test_a_problem_that_persists_does_ring(self):
+        """The other half: waiting must not mean never."""
+        from datetime import datetime, timedelta, timezone
+
+        from openjarvis.reliability.types import IncidentState, Severity
+        from openjarvis.reliability.voice.trigger import CallTrigger
+
+        old = _incident(state=IncidentState.HUMAN_REQUIRED, severity=Severity.CRITICAL)
+        old.created_at = (
+            datetime.now(timezone.utc) - timedelta(minutes=20)
+        ).isoformat()
+        watchdog = _watchdog(
+            [old], trigger=CallTrigger(clock=_Clock(), minimum_age_seconds=300)
+        )
+        assert watchdog.tick() is not None
+
+    def test_a_post_merge_failure_ignores_the_waiting_period(self):
+        """Unreviewed code is live and production is unwell. That does not
+        improve by waiting to see."""
+        from openjarvis.reliability.types import IncidentState
+        from openjarvis.reliability.voice.trigger import CallTrigger
+
+        fresh = _incident(state=IncidentState.HUMAN_REQUIRED)
+        fresh.metadata["post_merge_failure"] = {"reason": "still red"}
+        watchdog = _watchdog(
+            [fresh], trigger=CallTrigger(clock=_Clock(), minimum_age_seconds=300)
+        )
+        assert watchdog.tick() is not None
+
+    def test_many_flapping_probes_cannot_exceed_the_hourly_cap(self):
+        """Per-incident guards do not help when ten different probes flap."""
+        from datetime import datetime, timedelta, timezone
+
+        from openjarvis.reliability.types import IncidentState, Severity
+        from openjarvis.reliability.voice.trigger import CallTrigger
+
+        old = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+        incidents = []
+        for index in range(10):
+            incident = _incident(
+                id=f"INC-{index}",
+                state=IncidentState.HUMAN_REQUIRED,
+                severity=Severity.CRITICAL,
+            )
+            incident.created_at = old
+            incidents.append(incident)
+
+        trigger = CallTrigger(
+            clock=_Clock(), minimum_age_seconds=0, max_calls_per_hour=3
+        )
+        calls = _orchestrator()
+        watchdog = _watchdog(incidents, trigger=trigger, calls=calls)
+
+        rang = 0
+        for _ in range(20):
+            call = watchdog.tick()
+            if call:
+                rang += 1
+                calls.answered(call.id)
+        assert rang <= 3, f"rang {rang} times in an hour despite the cap"
 
     def test_the_reliability_core_does_not_import_voice(self):
         """The architectural rule, asserted rather than hoped for: a microphone
