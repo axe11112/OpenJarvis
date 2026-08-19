@@ -159,6 +159,13 @@ class PreviewObserver:
     fetch_build_logs: bool = True
     deployment_page_size: int = 40
 
+    #: Which deployments to look at: ``"preview"`` or ``"production"``. The
+    #: matching rule is identical either way — the exact commit, and READY means
+    #: READY — so post-ship verification reuses this class rather than growing a
+    #: second one that would drift. A merge produces a production deployment and
+    #: nothing else about the question changes.
+    target: str = "preview"
+
     #: Injected so tests do not sleep and do not depend on a clock.
     sleep: Callable[[float], None] = time.sleep
     monotonic: Callable[[], float] = time.monotonic
@@ -239,7 +246,7 @@ class PreviewObserver:
         try:
             return list(
                 self.vercel.list_deployments(
-                    limit=self.deployment_page_size, target="preview"
+                    limit=self.deployment_page_size, target=self.target
                 )
                 or []
             )
