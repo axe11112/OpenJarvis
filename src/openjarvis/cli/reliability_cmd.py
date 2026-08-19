@@ -1905,11 +1905,16 @@ def _build_voice(config: Any, store: Any, console: Any, access: Any) -> Any:
     # The only thing that decides to ring, and it lives here rather than in the
     # watcher on purpose: kill voice entirely and JARVIS keeps monitoring,
     # repairing and messaging exactly as before.
-    from openjarvis.reliability.voice.trigger import CallTrigger
+    from openjarvis.reliability.voice.trigger import CallTrigger, call_record_path
     from openjarvis.reliability.voice.watchdog import CallWatchdog
 
     watchdog = CallWatchdog(
-        store=store, trigger=CallTrigger(), calls=calls, endpoints=endpoints
+        store=store,
+        # Given a path, so that restarting does not ring the owner again about
+        # a problem they have already been woken for.
+        trigger=CallTrigger(path=call_record_path(config)),
+        calls=calls,
+        endpoints=endpoints,
     )
     watchdog.start()
     endpoints.watchdog = watchdog

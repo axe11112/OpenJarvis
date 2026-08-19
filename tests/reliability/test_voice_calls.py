@@ -598,3 +598,107 @@ class TestCallWatchdog:
             assert "voice" not in source.replace("invoice", ""), (
                 f"{name} must not depend on the voice subsystem"
             )
+
+
+class TestARestartDoesNotRingAgain:
+    """The suppression guards were memory, and a restart is what destroys memory.
+
+    `CallWatchdog` re-reads every open incident thirty seconds after start, and
+    `minimum_age_seconds` holds nothing back — an incident open for an hour
+    passes an age check immediately. So a watcher that restarted overnight rang
+    the owner again about the problem they had already been woken for, and the
+    supervisor that restarts a dead watcher could do it on a loop.
+    """
+
+    @staticmethod
+    def _trigger(tmp_path, clock, wall):
+        from openjarvis.reliability.voice.trigger import CallTrigger
+
+        return CallTrigger(
+            path=tmp_path / "called.json",
+            clock=clock,
+            wall_clock=wall,
+            minimum_age_seconds=0,
+        )
+
+    def test_the_same_problem_is_not_rung_about_after_a_restart(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        from openjarvis.reliability.types import IncidentState, Severity
+
+        old = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+        incident = _incident(
+            state=IncidentState.HUMAN_REQUIRED, severity=Severity.CRITICAL
+        )
+        incident.created_at = old
+
+        clock, wall = _Clock(), _Clock()
+        wall.now = 1_700_000_000.0
+        before = self._trigger(tmp_path, clock, wall)
+        assert before.evaluate(incident, event="human_required_production")
+
+        # The machine sleeps for ten minutes and the watcher comes back. The
+        # monotonic clock restarts from zero; the wall clock does not.
+        clock2, wall2 = _Clock(), _Clock()
+        wall2.now = wall.now + 600.0
+        after = self._trigger(tmp_path, clock2, wall2)
+        assert not after.evaluate(incident, event="human_required_production")
+
+    def test_it_rings_again_once_the_cooldown_has_genuinely_passed(self, tmp_path):
+        from datetime import datetime, timedelta, timezone
+
+        from openjarvis.reliability.types import IncidentState, Severity
+
+        old = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+        incident = _incident(
+            state=IncidentState.HUMAN_REQUIRED, severity=Severity.CRITICAL
+        )
+        incident.created_at = old
+
+        clock, wall = _Clock(), _Clock()
+        wall.now = 1_700_000_000.0
+        before = self._trigger(tmp_path, clock, wall)
+        assert before.evaluate(incident, event="human_required_production")
+
+        clock2, wall2 = _Clock(), _Clock()
+        wall2.now = wall.now + 7200.0  # two hours, past the one-hour cooldown
+        after = self._trigger(tmp_path, clock2, wall2)
+        assert after.evaluate(incident, event="human_required_production")
+
+    def test_a_backwards_wall_clock_suppresses_rather_than_rings(self, tmp_path):
+        """A nonsense timestamp reads as 'just called', not 'called in the future'."""
+        from datetime import datetime, timedelta, timezone
+
+        from openjarvis.reliability.types import IncidentState, Severity
+
+        old = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+        incident = _incident(
+            state=IncidentState.HUMAN_REQUIRED, severity=Severity.CRITICAL
+        )
+        incident.created_at = old
+
+        clock, wall = _Clock(), _Clock()
+        wall.now = 1_700_000_000.0
+        before = self._trigger(tmp_path, clock, wall)
+        assert before.evaluate(incident, event="human_required_production")
+
+        clock2, wall2 = _Clock(), _Clock()
+        wall2.now = wall.now - 3600.0  # the clock went backwards
+        after = self._trigger(tmp_path, clock2, wall2)
+        assert not after.evaluate(incident, event="human_required_production")
+
+    def test_no_path_still_works(self):
+        """Voice is optional and so is its state file."""
+        from datetime import datetime, timedelta, timezone
+
+        from openjarvis.reliability.types import IncidentState, Severity
+        from openjarvis.reliability.voice.trigger import CallTrigger
+
+        old = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+        incident = _incident(
+            state=IncidentState.HUMAN_REQUIRED, severity=Severity.CRITICAL
+        )
+        incident.created_at = old
+        trigger = CallTrigger(clock=_Clock(), minimum_age_seconds=0)
+        assert trigger.evaluate(incident, event="human_required_production")
+        assert not trigger.evaluate(incident, event="human_required_production")

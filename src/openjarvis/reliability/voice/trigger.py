@@ -19,17 +19,20 @@ exactly once.
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
+from openjarvis.reliability.statefile import write_json_atomic
 from openjarvis.reliability.types import Incident, IncidentState, Severity
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["CallDecision", "CallTrigger", "REASONS"]
+__all__ = ["CallDecision", "CallTrigger", "REASONS", "call_record_path"]
 
 #: Why a call may be placed. Each is a situation where JARVIS has stopped and
 #: production is, or may be, broken.
@@ -41,6 +44,22 @@ REASONS = {
     "attempts_exhausted": "repair attempts ran out on a production outage",
     "security_event": "a security control refused something",
 }
+
+
+def call_record_path(config: Any) -> Path:
+    """Where the record of what has already been rung about lives.
+
+    Beside the incident database and the notification ledger, for the same
+    reason they are beside each other: the watcher and the Control Center must
+    not disagree about what the owner has already been told.
+    """
+    from openjarvis.core.paths import get_config_dir
+
+    configured = getattr(getattr(config, "reliability", None), "db_path", "")
+    if configured:
+        return Path(configured).expanduser().parent / "called.json"
+    return get_config_dir() / "reliability" / "called.json"
+
 
 #: How long the same incident stays suppressed after a call.
 DEFAULT_COOLDOWN_SECONDS = 3600.0
@@ -89,9 +108,28 @@ class CallTrigger:
     #: it, ten separate flapping probes are ten calls.
     max_calls_per_hour: int = MAX_CALLS_PER_HOUR
     clock: Callable[[], float] = time.monotonic
+    #: Where the record of what has already been rung about is kept.
+    #:
+    #: Without it both guards below are memory, and memory is exactly what a
+    #: restart destroys. ``CallWatchdog`` re-reads every open incident thirty
+    #: seconds after start, and ``minimum_age_seconds`` does not hold anything
+    #: back — an incident that has been open for an hour passes an age check
+    #: immediately. So a watcher that restarts overnight rang the phone again
+    #: about a problem the owner had already been woken for, and the supervisor
+    #: that restarts a dead watcher could do it repeatedly.
+    path: Optional[Path] = None
+    #: Wall clock, kept separately from ``clock``. Suppression is measured with
+    #: ``time.monotonic`` because it cannot go backwards, but a monotonic value
+    #: means nothing in the next process — it is relative to a boot, not an
+    #: epoch. What goes on disk is therefore wall-clock, converted back into
+    #: this process's monotonic frame on load.
+    wall_clock: Callable[[], float] = time.time
     _called: Dict[str, float] = field(default_factory=dict, repr=False)
     _recent_calls: List[float] = field(default_factory=list, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def __post_init__(self) -> None:
+        self._load()
 
     # -- the policy -------------------------------------------------------
 
@@ -243,12 +281,66 @@ class CallTrigger:
             if last is not None and now - last < self.cooldown_seconds:
                 return False
             self._called[incident_id] = now
+            self._save()
             return True
 
     def forget(self, incident_id: str) -> None:
         """Drop the suppression for one incident, so it may ring again."""
         with self._lock:
             self._called.pop(incident_id, None)
+            self._save()
+
+    # -- surviving a restart ----------------------------------------------
+
+    def _load(self) -> None:
+        """Restore suppression from disk, in this process's monotonic frame."""
+        if self.path is None or not self.path.exists():
+            return
+        try:
+            saved = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 - an unreadable record costs a call,
+            logger.warning("voice: could not read the call record at %s", self.path)
+            return  # ...never a crash.
+
+        mono_now, wall_now = self.clock(), self.wall_clock()
+
+        def _to_monotonic(then: Any) -> Optional[float]:
+            # Ages are clamped at zero. A wall clock that jumped backwards
+            # while the machine was asleep would otherwise produce a negative
+            # age and read as "called in the future", and the safe reading of a
+            # nonsense timestamp is that the owner was just called.
+            try:
+                age = max(0.0, wall_now - float(then))
+            except (TypeError, ValueError):
+                return None
+            return mono_now - age
+
+        for key, then in dict(saved.get("called") or {}).items():
+            restored = _to_monotonic(then)
+            if restored is not None and mono_now - restored < self.cooldown_seconds:
+                self._called[str(key)] = restored
+        for then in list(saved.get("recent_calls") or []):
+            restored = _to_monotonic(then)
+            if restored is not None and mono_now - restored < 3600.0:
+                self._recent_calls.append(restored)
+
+    def _save(self) -> None:
+        """Persist as wall-clock. Caller holds the lock."""
+        if self.path is None:
+            return
+        mono_now, wall_now = self.clock(), self.wall_clock()
+
+        def _to_wall(then: float) -> float:
+            return wall_now - (mono_now - then)
+
+        write_json_atomic(
+            self.path,
+            {
+                "saved_at": wall_now,
+                "called": {k: _to_wall(v) for k, v in self._called.items()},
+                "recent_calls": [_to_wall(t) for t in self._recent_calls],
+            },
+        )
 
 
 #: States where JARVIS is actively working the problem. A CRITICAL fault it is
