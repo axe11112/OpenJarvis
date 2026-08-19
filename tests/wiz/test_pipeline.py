@@ -118,12 +118,20 @@ class ScriptedEngineer(ClaudeCodeEngineeringAgent):
 class FakeCheckResult:
     passed: bool = True
     summary: str = "all checks passed"
+    #: The command's actual output, as the real CheckSuiteResult renders it.
+    output: str = ""
     results: List[Dict[str, Any]] = field(default_factory=list)
 
+    def feedback(self, *, max_chars: int = 6000):
+        return self.output
+
     def to_dict(self):
+        # Deliberately shaped like the real one, which has no "summary" key —
+        # that is a property, and reading it off the dict silently returned
+        # nothing.
         return {
             "passed": self.passed,
-            "summary": self.summary,
+            "ran_any": True,
             "results": self.results
             or [
                 {
@@ -861,3 +869,51 @@ class TestTheReviewIsAdvisory:
         feature = pipeline.submit(REQUEST, actor=operator_actor())
         pipeline.run(feature.id)
         assert reviewer.calls == []
+
+
+class TestTheEvidenceAGateProduces:
+    def test_the_next_attempt_gets_the_command_output_not_the_headline(
+        self, tmp_path, clock
+    ):
+        # "tests: failed" is a headline. "Property 'total' does not exist on
+        # type 'Session'" is a bug report, and it is what makes the second
+        # attempt a fix rather than a guess.
+        engineer = ScriptedEngineer()
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            engineer=engineer,
+            suite_results=[
+                FakeCheckResult(
+                    passed=False,
+                    summary="✗ tests: failed",
+                    output=(
+                        "### tests failed\n\n"
+                        "src/Summary.tsx(14,22): error TS2339: Property 'total' "
+                        "does not exist on type 'Session'."
+                    ),
+                ),
+                FakeCheckResult(passed=True),
+            ],
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        second = engineer.build_calls[1][0].render()
+        assert "TS2339" in second
+        assert "does not exist on type" in second
+
+    def test_the_record_carries_a_summary_the_pull_request_can_show(
+        self, tmp_path, clock
+    ):
+        # The real CheckSuiteResult.to_dict has no "summary" key, and the pull
+        # request body read one. It silently showed nothing.
+        pipeline = build_pipeline(
+            tmp_path, clock, suite_results=[FakeCheckResult(summary="✓ tests: passed")]
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.metadata["gates"]["summary"] == "✓ tests: passed"
+
+        from openjarvis.wiz.features.shipping import pull_request_body
+
+        assert "tests: passed" in pull_request_body(result)

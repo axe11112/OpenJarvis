@@ -443,13 +443,18 @@ class FeaturePipeline:
 
         suite = self.check_suite_factory(self.profile)
         result = suite.run(workspace=worktree.path)
-        attempt.checks = result.to_dict() if hasattr(result, "to_dict") else {}
+        attempt.checks = _checks_record(result)
         feature.metadata["gates"] = attempt.checks
 
         if not getattr(result, "passed", False):
-            attempt.failure = getattr(result, "summary", "the local checks failed")
+            # ``feedback()`` is the command's actual output — the type error,
+            # the failing assertion — and ``summary`` is one line per check.
+            # The next attempt needs the first; the pull request body and the
+            # operator need the second. Sending the summary to Claude is how a
+            # second attempt ends up being told "tests: failed" and guessing.
+            evidence = _gate_feedback(result)
             self.store.save(feature)
-            return self._retry_or_stop(feature, attempt, attempt.failure)
+            return self._retry_or_stop(feature, attempt, evidence)
 
         message = _commit_message(feature)
         attempt.commit_sha = self.workspace.commit_all(worktree, message)
@@ -833,6 +838,32 @@ def _brief_for(feature: FeatureRequest) -> str:
     if feature.desired_outcome and feature.desired_outcome != feature.operator_request:
         lines.append(f"What should be true afterwards: {feature.desired_outcome}")
     return "\n".join(lines)
+
+
+def _checks_record(result: Any) -> Dict[str, Any]:
+    """The gate outcome, as a dict that carries its own summary.
+
+    ``CheckSuiteResult.to_dict`` deliberately does not include ``summary`` —
+    it is a property, and the incident record does not need it. The feature
+    record does: the pull request body and the Control Center both show "what
+    the checks said", and reading a key that is not there had them silently
+    showing nothing.
+    """
+    if not hasattr(result, "to_dict"):
+        return {}
+    record = dict(result.to_dict())
+    record.setdefault("summary", str(getattr(result, "summary", "")))
+    return record
+
+
+def _gate_feedback(result: Any, *, fallback: str = "the local checks failed") -> str:
+    """What the next attempt is told about a failed gate."""
+    feedback = getattr(result, "feedback", None)
+    if callable(feedback):
+        rendered = str(feedback() or "").strip()
+        if rendered:
+            return rendered
+    return str(getattr(result, "summary", "") or fallback)
 
 
 def _commit_message(feature: FeatureRequest) -> str:
