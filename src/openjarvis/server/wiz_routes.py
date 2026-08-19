@@ -150,6 +150,32 @@ def get_memory(
     return _result_or_error(_handle("product.recent", limit=limit))
 
 
+@router.get("/morning")
+def get_morning() -> Dict[str, Any]:
+    """This morning's summary, and whether it is worth sending anywhere.
+
+    ``worth_sending`` is returned rather than acted on. Nothing in this process
+    delivers it; who does, and whether they are allowed to, is a separate
+    decision made somewhere that holds an authority.
+    """
+    from openjarvis.wiz.briefing import compose
+
+    runtime = _runtime()
+    pipeline = getattr(getattr(runtime, "product", None), "pipeline", None)
+
+    def reliability_status() -> Any:
+        outcome = _handle("reliability.status")
+        return outcome.result if outcome.handled else {"available": False}
+
+    briefing = compose(
+        store=getattr(pipeline, "store", None),
+        memory=getattr(getattr(runtime, "product", None), "memory", None),
+        reliability=reliability_status,
+        site_name="Wize",
+    )
+    return {"ok": True, "result": briefing.to_dict(), "text": briefing.render()}
+
+
 # ---------------------------------------------------------------------------
 # Writing
 # ---------------------------------------------------------------------------

@@ -335,3 +335,35 @@ def ask(question: tuple) -> None:
         console.print(result["say"])
     else:
         click.echo(json.dumps(result, indent=2, sort_keys=True, default=str))
+
+
+@wiz.command("morning")
+@click.option("--force", is_flag=True, default=False, help="Print it even if empty.")
+def morning(force: bool) -> None:
+    """What Wiz would tell you this morning.
+
+    Prints nothing when there is nothing worth saying, unless asked. A summary
+    that arrives every day saying "nothing happened" is one nobody reads by the
+    end of the second week, and by then it is the one carrying the sentence that
+    mattered.
+    """
+    console = _console()
+
+    from openjarvis.wiz.briefing import compose
+
+    runtime = _runtime()
+    store = getattr(getattr(runtime, "product", None), "pipeline", None)
+    memory = getattr(getattr(runtime, "product", None), "memory", None)
+
+    def reliability_status():
+        outcome = _handle(capability="reliability.status")
+        return outcome.result if outcome.handled else {"available": False}
+
+    briefing = compose(
+        store=getattr(store, "store", None),
+        memory=memory,
+        reliability=reliability_status,
+        site_name="Wize",
+    )
+    if briefing.worth_sending or force:
+        console.print(briefing.render())

@@ -207,3 +207,27 @@ class TestThePage:
         assert "http://" not in _PAGE
         assert "cdn" not in _PAGE.lower()
         assert "<script src=" not in _PAGE
+
+
+class TestTheMorningSummary:
+    def test_it_is_readable_and_says_whether_it_is_worth_sending(self, client):
+        body = client.get("/api/wiz/morning").json()
+        assert body["ok"]
+        assert "Good morning" in body["text"]
+        assert "worth_sending" in body["result"]
+
+    def test_a_recorded_request_shows_up_as_work_in_progress(self, client):
+        client.post("/api/wiz/features", json={"text": "Add a download button"})
+        body = client.get("/api/wiz/morning").json()
+        # RECEIVED is not "in progress" — nothing has started — so the honest
+        # answer is that there is nothing to report yet.
+        assert body["result"]["worth_sending"] is False
+
+    def test_reading_the_summary_is_a_read(self, client):
+        # A route that delivered the summary anywhere would be a POST. This one
+        # is a GET, and asking twice changes nothing — the delivery decision is
+        # made somewhere that holds an authority, not here.
+        first = client.get("/api/wiz/morning").json()
+        second = client.get("/api/wiz/morning").json()
+        assert first["text"] == second["text"]
+        assert client.post("/api/wiz/morning").status_code == 405
