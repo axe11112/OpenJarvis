@@ -254,8 +254,9 @@ def test_history_never_raises_when_the_store_is_broken():
         def list_by_fingerprint(self, *a, **k):
             raise RuntimeError("disk on fire")
 
-    incident = Incident(fingerprint="fp", severity=Severity.HIGH, component="a",
-                        title="b")
+    incident = Incident(
+        fingerprint="fp", severity=Severity.HIGH, component="a", title="b"
+    )
     assert IncidentHistory(_Broken()).previous(incident) == []
 
 
@@ -287,6 +288,59 @@ def test_autonomy_separates_repairs_from_things_that_fixed_themselves(store):
     metrics = AutonomyMetrics(store).snapshot()
     assert metrics["repaired_by_jarvis"] == 1
     assert metrics["recovered_on_their_own"] == 1
+
+
+def _merged(store, **overrides):
+    """Walk an incident to MERGED along the only legal path."""
+    incident = _incident(store, **overrides)
+    for state in (
+        IncidentState.INVESTIGATING,
+        IncidentState.REPRODUCING,
+        IncidentState.FIXING,
+        IncidentState.TESTING,
+        IncidentState.VERIFYING,
+        IncidentState.MERGED,
+    ):
+        store.transition(incident, state, reason="step")
+    return incident
+
+
+def test_a_merge_awaiting_production_is_not_counted_as_handled(store):
+    """MERGED means the code is live and nothing has said whether that helped.
+
+    Counting it as closed put it in `handled_without_a_human` while it appeared
+    in neither `repaired_by_jarvis` nor `recovered_on_their_own`, so one
+    incident stuck mid-verification reported an autonomy rate of 1.0 with a
+    breakdown that summed to nothing. `watch.py` treats the same state as
+    in-flight and parks it for a human on restart.
+    """
+    _merged(store)
+
+    metrics = AutonomyMetrics(store).snapshot()
+    assert metrics["closed"] == 0
+    assert metrics["handled_without_a_human"] == 0
+    assert metrics["autonomy_rate"] is None
+    assert metrics["merged_awaiting_production"] == 1
+
+
+def test_the_breakdown_reconciles_with_the_headline(store):
+    """The tell for a flattered rate is a breakdown that does not add up."""
+    repaired = _incident(store)
+    store.add_attempt(repaired, RepairAttempt(number=1, outcome="verified"))
+    store.transition(repaired, IncidentState.RESOLVED, reason="fixed")
+    recovered = _incident(store, fingerprint="fp-b")
+    store.transition(recovered, IncidentState.RESOLVED, reason="recovered")
+    escalated = _incident(store, fingerprint="fp-c")
+    store.transition(escalated, IncidentState.HUMAN_REQUIRED, reason="stuck")
+    _merged(store, fingerprint="fp-d")
+
+    m = AutonomyMetrics(store).snapshot()
+    assert m["closed"] == m["handled_without_a_human"] + m["escalated"]
+    assert (
+        m["closed"]
+        == m["repaired_by_jarvis"] + m["recovered_on_their_own"] + (m["escalated"])
+    )
+    assert m["merged_awaiting_production"] == 1
 
 
 def test_autonomy_reports_unavailable_rather_than_zero_when_it_cannot_read():
@@ -328,9 +382,7 @@ def test_a_slow_page_no_longer_wakes_anybody(store, component, probe, took, budg
         steps_completed=4,
         error=f"took {took}s, over the {budget}s budget",
     )
-    verdict = classify(
-        component=component, result=result, declared=Severity.CRITICAL
-    )
+    verdict = classify(component=component, result=result, declared=Severity.CRITICAL)
     assert verdict.severity is Severity.LOW
     assert verdict.rule == "responded_but_slow"
 

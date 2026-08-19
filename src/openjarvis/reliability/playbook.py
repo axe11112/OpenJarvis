@@ -595,10 +595,21 @@ class AutonomyMetrics:
             if (getattr(i, "metadata", {}) or {}).get("handover", {}).get("complete")
         )
 
+        # Surfaced rather than merely excluded. An incident whose production
+        # verification never finished is the most interesting thing on this
+        # list, and dropping it silently from the denominator would be its own
+        # way of flattering the number.
+        merged = [
+            i
+            for i in incidents
+            if str(getattr(getattr(i, "state", None), "value", "")) == "MERGED"
+        ]
+
         return {
             "available": True,
             "considered": len(incidents),
             "closed": len(closed),
+            "merged_awaiting_production": len(merged),
             "handled_without_a_human": handled,
             "escalated": len(escalated),
             "still_waiting_for_you": sum(1 for i in closed if _needs_human(i)),
@@ -611,12 +622,26 @@ class AutonomyMetrics:
 
 
 def _is_terminal(incident: Any) -> bool:
+    """Whether the incident has an outcome yet.
+
+    ``MERGED`` is deliberately absent. It means the change is on the default
+    branch and production has not yet said whether that helped — the one state
+    where the outcome is genuinely unknown. ``watch.py`` agrees and lists it in
+    ``IN_FLIGHT_STATES``, parking it for a human if the process restarts while
+    it sits there.
+
+    Counting it as closed put it in ``handled_without_a_human`` — it has not
+    reached a person — while it appeared in neither ``repaired_by_jarvis`` nor
+    ``recovered_on_their_own``, both of which require ``RESOLVED``. A single
+    incident stuck mid-verification therefore reported an autonomy rate of
+    1.0 with a breakdown that summed to nothing, which is the failure this
+    class's own docstring warns about.
+    """
     return str(getattr(getattr(incident, "state", None), "value", "")) in (
         "RESOLVED",
         "HUMAN_REQUIRED",
         "FAILED",
         "ROLLED_BACK",
-        "MERGED",
     )
 
 
