@@ -19,9 +19,11 @@ configured, so a machine with none of them still starts.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from openjarvis.wiz.approvals import ApprovalStore
 from openjarvis.wiz.features.acceptance import Viewport
 from openjarvis.wiz.features.engineer import ClaudeCodeEngineeringAgent
 from openjarvis.wiz.features.pipeline import FeaturePipeline
@@ -83,6 +85,10 @@ def assemble(
     engineer = ClaudeCodeEngineeringAgent()
     queue = DevelopmentQueue(max_concurrent=1, production_busy=production_busy)
 
+    # In memory, and deliberately so: an approval that survives a restart is
+    # consent granted to a process the operator has not seen since.
+    approvals = ApprovalStore(clock=time.monotonic)
+
     pipeline = FeaturePipeline(
         store=store,
         profile=profile,
@@ -92,6 +98,7 @@ def assemble(
         preview=_preview_observer(config, profile),
         verifier=_verifier(Path(resolved.evidence_root).expanduser()),
         queue=queue,
+        approvals=approvals,
         journal=None,  # set by build_wiz, which owns the journal
         max_attempts=resolved.max_attempts,
         reviewer=_reviewer(engineer, workspace)

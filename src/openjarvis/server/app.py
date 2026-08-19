@@ -443,6 +443,15 @@ def create_app(
 
     app.include_router(reliability_router)
     app.include_router(reliability_dashboard_router)
+
+    # Wiz's product-development side. Mounted unconditionally for the same
+    # reason: with no engineering target configured the routes report what is
+    # missing, which is more useful than a 404.
+    from openjarvis.server.wiz_dashboard import router as wiz_dashboard_router
+    from openjarvis.server.wiz_routes import router as wiz_router
+
+    app.include_router(wiz_router)
+    app.include_router(wiz_dashboard_router)
     include_all_routes(app)
 
     # Restore SendBlue channel bindings from database on startup
