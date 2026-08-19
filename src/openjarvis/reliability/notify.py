@@ -896,18 +896,42 @@ class NotificationRouter:
         }
 
     def _prepare(self, message: str) -> str:
-        """Redact outbound content before it leaves the device."""
+        """Redact outbound content before it leaves the device.
+
+        Both layers run, always, and the order matters.
+
+        ``BoundaryGuard`` is the richer of the two, but it does not fail loudly
+        when its Rust-backed scanners are missing: it logs a warning, disables
+        the scanners and returns the text *unchanged*. Because that is not an
+        exception, an ``except`` clause guarding this call never fires, and the
+        fallback it guards never runs — which is how a GitHub token reached a
+        notifier verbatim. A degraded guard is indistinguishable from a clean
+        message, so it cannot be the only thing standing between a credential
+        and Telegram.
+
+        ``CredentialStripper`` is pure Python with no native dependency, so it
+        works everywhere and is applied unconditionally afterwards. Running it
+        over already-redacted text is a cheap no-op; running it over text the
+        guard silently passed through is the whole point.
+        """
         if not self.redact:
             return message
         from openjarvis.security.credential_stripper import CredentialStripper
 
+        prepared = message
         try:
             from openjarvis.security.boundary import BoundaryGuard
 
-            return BoundaryGuard(mode="redact").scan_outbound(
-                message, destination=self.notifier.notifier_id
+            prepared = BoundaryGuard(mode="redact").scan_outbound(
+                prepared, destination=self.notifier.notifier_id
             )
-        except Exception:  # pragma: no cover - defensive
-            # Never send raw on a redaction failure: fall back to the stripper.
-            logger.exception("outbound redaction failed; falling back to the stripper")
-            return CredentialStripper().strip(message)
+        except Exception:
+            logger.exception("outbound redaction failed; the stripper still runs")
+
+        try:
+            return CredentialStripper().strip(prepared)
+        except Exception:
+            # Nothing can vouch for this text, so send the part that is known
+            # safe rather than the part that might carry a credential.
+            logger.exception("credential stripping failed; withholding the body")
+            return "(message withheld: outbound redaction is unavailable)"

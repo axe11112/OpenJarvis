@@ -337,6 +337,46 @@ class TestOutboundRedaction:
         router.notify("token ghp_" + "b" * 36, severity=Severity.HIGH)
         assert "ghp_" + "b" * 36 not in notifier.sent[0]
 
+    def test_a_guard_that_silently_does_nothing_is_not_trusted(self, monkeypatch):
+        """The failure that actually happened, and raised nothing.
+
+        ``BoundaryGuard`` disables its scanners and returns the text unchanged
+        when the Rust extension is missing. That is not an exception, so the
+        fallback above never ran and the token went out verbatim. Both layers
+        run now, so a pass-through guard costs nothing.
+        """
+        import openjarvis.security.boundary as boundary_module
+
+        class _PassThrough:
+            def __init__(self, *a, **k):
+                pass
+
+            def scan_outbound(self, message, destination=""):
+                return message
+
+        monkeypatch.setattr(boundary_module, "BoundaryGuard", _PassThrough)
+        notifier = ConsoleNotifier()
+        router = NotificationRouter(notifier=notifier, min_severity=Severity.LOW)
+        router.notify("token ghp_" + "c" * 36, severity=Severity.HIGH)
+        assert "ghp_" + "c" * 36 not in notifier.sent[0]
+
+    def test_the_body_is_withheld_when_nothing_can_redact_it(self, monkeypatch):
+        """Silence beats a credential when every layer is unavailable."""
+        import openjarvis.security.boundary as boundary_module
+        import openjarvis.security.credential_stripper as stripper_module
+
+        class _Exploding:
+            def __init__(self, *a, **k):
+                raise RuntimeError("unavailable")
+
+        monkeypatch.setattr(boundary_module, "BoundaryGuard", _Exploding)
+        monkeypatch.setattr(stripper_module, "CredentialStripper", _Exploding)
+        notifier = ConsoleNotifier()
+        router = NotificationRouter(notifier=notifier, min_severity=Severity.LOW)
+        router.notify("token ghp_" + "d" * 36, severity=Severity.HIGH)
+        assert "ghp_" + "d" * 36 not in notifier.sent[0]
+        assert "withheld" in notifier.sent[0]
+
 
 class TestIncidentHelpers:
     def _router(self, **kwargs):
