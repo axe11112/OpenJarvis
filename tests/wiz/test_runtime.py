@@ -85,6 +85,57 @@ class TestHonesty:
             Request(text="", actor=operator(Channel.CLI)),
             capability="reliability.status",
         )
+        # Refused at the capability gate, and the refusal says why. The verb is
+        # never reached, so there is no path on which an empty answer could be
+        # mistaken for a quiet site.
+        assert not outcome.handled
+        assert "no incident database" in outcome.message
+
+    def test_the_probe_and_the_handler_consult_the_same_store(self, tmp_path):
+        # The bug this pins: the probe read a fixed path on disk while the
+        # handler used an injected factory, so on a machine that happened to
+        # have a database at that path the capability reported itself available
+        # and then answered from something else entirely. Availability must be
+        # a statement about the store that will actually be read.
+        def no_database():
+            raise FileNotFoundError("no incident database")
+
+        runtime = build_wiz(
+            home=tmp_path,
+            policy=AuthorityPolicy(
+                grants={Channel.CLI: frozenset({Authority.READ})}
+            ),
+            journal=WizJournal(tmp_path / "j.jsonl"),
+            store_factory=no_database,
+        )
+        described = {s["name"]: s for s in runtime.registry.describe()}
+        assert described["reliability.status"]["configured"] is False
+        assert described["reliability.incidents"]["configured"] is False
+
+    def test_a_store_that_dies_after_the_probe_still_answers_honestly(self, tmp_path):
+        # The probe passing is not a promise that the next call succeeds: a
+        # database can be moved between the two. The handler keeps its own
+        # defence, and reports "I could not see" rather than "nothing wrong".
+        opened: list[int] = []
+
+        def flaky():
+            opened.append(1)
+            if len(opened) > 1:
+                raise FileNotFoundError("the database went away")
+            return _FakeStore([])
+
+        runtime = build_wiz(
+            home=tmp_path,
+            policy=AuthorityPolicy(
+                grants={Channel.CLI: frozenset({Authority.READ})}
+            ),
+            journal=WizJournal(tmp_path / "j.jsonl"),
+            store_factory=flaky,
+        )
+        outcome = runtime.wiz.handle(
+            Request(text="", actor=operator(Channel.CLI)),
+            capability="reliability.status",
+        )
         assert outcome.handled
         assert outcome.result["available"] is False
 

@@ -99,6 +99,33 @@ def _incident_store_available(config: Any = None) -> Availability:
     return Availability.ready(str(path))
 
 
+def incident_probe_for(store_factory: Optional[Callable[[], Any]]) -> Callable[[], Availability]:
+    """An availability probe that agrees with the store the handler will use.
+
+    The probe and the handler must consult the same source. When they do not,
+    "I have no incident database" and "here are your incidents" can both be
+    true in one process — which is how the Phase A tests came to pass only on a
+    machine that happened to have a live database at the default path, while
+    injecting a store that had nothing to do with it.
+
+    So an injected factory *is* the answer: if it produces a store, the
+    capability is available; if it raises, it is not. When nothing is injected
+    the default path check stands, because there is no factory to ask yet.
+    """
+    if store_factory is None:
+        return lambda: _incident_store_available(None)
+
+    def probe() -> Availability:
+        try:
+            store = store_factory()
+        except Exception as exc:
+            return Availability.missing(str(exc) or "the incident store cannot be opened")
+        WizRuntime._close(store)
+        return Availability.ready("the incident store is reachable")
+
+    return probe
+
+
 def claude_cli_available(executable: str = "claude") -> Availability:
     """Whether the coding engine is present.
 
@@ -286,13 +313,18 @@ class WizRuntime:
 # ---------------------------------------------------------------------------
 
 
-def default_capabilities(config: Any = None) -> List[CapabilitySpec]:
+def default_capabilities(
+    config: Any = None,
+    *,
+    incident_probe: Optional[Callable[[], Availability]] = None,
+) -> List[CapabilitySpec]:
     """Everything Wiz declares in Phase A.
 
     All ``READ``. All ``LOW`` risk. Adding a verb that writes anything means
     adding it here with the authority it truly needs, which is a diff a reviewer
     can see.
     """
+    reliability_probe = incident_probe or (lambda: _incident_store_available(config))
     return [
         CapabilitySpec(
             name="wiz.capabilities",
@@ -320,14 +352,14 @@ def default_capabilities(config: Any = None) -> List[CapabilitySpec]:
             summary="report whether the site is currently in trouble",
             authority=Authority.READ,
             risk=Risk.LOW,
-            probe=lambda: _incident_store_available(config),
+            probe=reliability_probe,
         ),
         CapabilitySpec(
             name="reliability.incidents",
             summary="list recent incidents",
             authority=Authority.READ,
             risk=Risk.LOW,
-            probe=lambda: _incident_store_available(config),
+            probe=reliability_probe,
         ),
     ]
 
@@ -362,7 +394,11 @@ def build_wiz(
 
     return WizRuntime(
         policy=resolved_policy,
-        registry=CapabilityRegistry(default_capabilities(config)),
+        registry=CapabilityRegistry(
+            default_capabilities(
+                config, incident_probe=incident_probe_for(store_factory)
+            )
+        ),
         journal=resolved_journal,
         store_factory=store_factory,
         config=config,
