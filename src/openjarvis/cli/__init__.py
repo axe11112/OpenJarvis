@@ -41,6 +41,7 @@ from openjarvis.cli.skill_cmd import skill
 from openjarvis.cli.telemetry_cmd import telemetry
 from openjarvis.cli.tool_cmd import tool
 from openjarvis.cli.vault_cmd import vault
+from openjarvis.cli.wiz_cmd import wiz
 from openjarvis.cli.workflow_cmd import workflow
 
 
@@ -108,6 +109,7 @@ cli.add_command(scheduler, "scheduler")
 cli.add_command(doctor, "doctor")
 cli.add_command(agent, "agents")
 cli.add_command(workflow, "workflow")
+cli.add_command(wiz, "wiz")
 cli.add_command(skill, "skill")
 cli.add_command(start, "start")
 cli.add_command(stop, "stop")
