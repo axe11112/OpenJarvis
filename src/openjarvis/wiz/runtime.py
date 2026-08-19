@@ -421,6 +421,13 @@ def build_wiz(
         config, incident_probe=incident_probe_for(store_factory)
     )
     if product is not None:
+        # One journal for the whole assistant. A feature pipeline writing to a
+        # second, unchained file would give the audit trail a hole exactly where
+        # the code-writing happens.
+        pipeline = getattr(product, "pipeline", None)
+        if pipeline is not None and getattr(pipeline, "journal", None) is None:
+            pipeline.journal = resolved_journal
+
         from openjarvis.wiz.product import product_capabilities
 
         specs.extend(
