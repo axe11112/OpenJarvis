@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from openjarvis.reliability.statefile import write_json_atomic
 from openjarvis.reliability.types import Incident, Severity, now_iso
 
 logger = logging.getLogger(__name__)
@@ -199,10 +200,10 @@ class NotificationLedger:
             self._entries = {}  # ...never a crash.
 
     def _save(self) -> None:
+        # Atomic, because the restarts this ledger exists to survive are the
+        # same events that can interrupt a write. A half-written ledger reads
+        # back as no ledger, and no ledger means the owner is told everything
+        # they already know, all over again.
         if self.path is None:
             return
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(self._entries, indent=2), encoding="utf-8")
-        except OSError:
-            logger.exception("could not persist the notification ledger")
+        write_json_atomic(self.path, self._entries)

@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from openjarvis.reliability.statefile import write_json_atomic
 from openjarvis.reliability.types import now_iso
 
 logger = logging.getLogger(__name__)
@@ -217,11 +218,7 @@ class MicrophoneRecord:
     def _save(self) -> None:
         if self.path is None:
             return
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
-        except OSError:
-            logger.exception("voice: could not persist the microphone record")
+        write_json_atomic(self.path, self._data)
 
 
 # ---------------------------------------------------------------------------

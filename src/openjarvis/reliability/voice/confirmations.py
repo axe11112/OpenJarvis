@@ -19,7 +19,6 @@ probably forgotten the question.
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import uuid
@@ -27,6 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from openjarvis.reliability.statefile import write_json_atomic
 from openjarvis.reliability.types import now_iso
 
 logger = logging.getLogger(__name__)
@@ -174,9 +174,4 @@ class ConfirmationStore:
         """Best-effort snapshot. A store that cannot write still refuses."""
         if self.path is None:
             return
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            payload = [p.to_dict() for p in self.all()]
-            self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        except OSError:
-            logger.exception("voice: could not persist pending confirmations")
+        write_json_atomic(self.path, [p.to_dict() for p in self.all()])

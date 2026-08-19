@@ -29,13 +29,14 @@ import base64
 import hashlib
 import json
 import logging
-import os
 import secrets
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
+from openjarvis.reliability.statefile import write_json_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -154,10 +155,10 @@ class VapidKey:
             )
 
         key = cls.generate()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handle = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(handle, "w", encoding="utf-8") as fh:
-            json.dump(key.to_dict(), fh)
+        # Atomic and 0600. A torn write here reads back as unreadable on the
+        # next start, and the recovery for that is generating a *new* key —
+        # which silently invalidates every push subscription already issued.
+        write_json_atomic(path, key.to_dict(), mode=0o600)
         return key
 
     # -- signing ----------------------------------------------------------
@@ -354,11 +355,4 @@ class SubscriptionStore:
     def _save(self) -> None:
         if self.path is None:
             return
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
-                json.dumps([s.to_dict() for s in self._items.values()], indent=2),
-                encoding="utf-8",
-            )
-        except OSError:
-            logger.exception("voice: could not persist push subscriptions")
+        write_json_atomic(self.path, [s.to_dict() for s in self._items.values()])
