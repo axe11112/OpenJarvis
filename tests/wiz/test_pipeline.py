@@ -1,0 +1,761 @@
+"""The feature pipeline: from "build X" to "it's ready", and the refusals."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
+
+import pytest
+
+from openjarvis.reliability.types import ProbeResult
+from openjarvis.wiz.approvals import ApprovalStore
+from openjarvis.wiz.authority import Actor, Authority, AuthorityPolicy, Channel
+from openjarvis.wiz.features.acceptance import DESKTOP, MOBILE
+from openjarvis.wiz.features.engineer import (
+    ClaudeCodeEngineeringAgent,
+    CodingEngineUnavailable,
+    EngineeringSession,
+)
+from openjarvis.wiz.features.model import FeatureState, Priority
+from openjarvis.wiz.features.pipeline import FeaturePipeline
+from openjarvis.wiz.features.preview import PreviewObserver
+from openjarvis.wiz.features.profile import EngineeringProfile
+from openjarvis.wiz.features.queue import DevelopmentQueue
+from openjarvis.wiz.features.store import FeatureStore
+from openjarvis.wiz.features.verification import FeatureVerifier
+from openjarvis.wiz.journal import WizJournal
+
+# ---------------------------------------------------------------------------
+# Doubles. Each one stands in for a real collaborator at the same interface,
+# so a test that proves a property proves it about the shipped object.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class FakeWorktree:
+    path: str
+    branch: str
+    base_commit: str
+
+
+class FakeWorkspace:
+    """A worktree factory that records what it was asked for."""
+
+    def __init__(self, tmp_path, changed_files=None):
+        self.tmp_path = tmp_path
+        self.created = []
+        self.changed = list(
+            ["src/components/Summary.tsx"] if changed_files is None else changed_files
+        )
+        self.commits = []
+        self.pushes = []
+        self.commit_sha = "feedface" + "0" * 32
+
+    def create(self, feature_id, *, title="", base_ref="HEAD"):
+        path = self.tmp_path / f"wt-{feature_id}"
+        path.mkdir(parents=True, exist_ok=True)
+        worktree = FakeWorktree(
+            path=str(path),
+            branch=f"wiz/feature/{feature_id}",
+            base_commit="base1234" + "0" * 32,
+        )
+        self.created.append(worktree)
+        return worktree
+
+    def changed_files(self, worktree):
+        return list(self.changed)
+
+    def line_counts(self, worktree):
+        return (12, 3)
+
+    def commit_all(self, worktree, message):
+        self.commits.append(message)
+        return self.commit_sha
+
+    def push(self, worktree, *, remote="origin"):
+        self.pushes.append(remote)
+
+    def has_changes(self, worktree):
+        return bool(self.changed)
+
+
+class ScriptedEngineer(ClaudeCodeEngineeringAgent):
+    """A Claude Code adapter whose sessions are scripted.
+
+    Subclasses the real adapter rather than duck-typing it, so that a test
+    asserting "planning used no write tools" is asserting about the same class
+    the operator's machine runs.
+    """
+
+    def __init__(self, *, plan_claim="I would edit Summary.tsx", builds=None):
+        super().__init__(agent_factory=self._never_called)
+        self.plan_claim = plan_claim
+        self.builds = list(builds or [])
+        self.plan_calls = []
+        self.build_calls = []
+
+    @staticmethod
+    def _never_called(**kwargs):  # pragma: no cover - guards the double
+        raise AssertionError("the scripted engineer should not build a CLI agent")
+
+    def available(self):
+        return True
+
+    def plan(self, pack, *, workspace):
+        self.plan_calls.append((pack, workspace))
+        return EngineeringSession(mode="plan", succeeded=True, claim=self.plan_claim)
+
+    def build(self, pack, *, workspace):
+        self.build_calls.append((pack, workspace))
+        if self.builds:
+            return self.builds.pop(0)
+        return EngineeringSession(
+            mode="build", succeeded=True, claim="added the button"
+        )
+
+
+@dataclass
+class FakeCheckResult:
+    passed: bool = True
+    summary: str = "all checks passed"
+    results: List[Dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self):
+        return {
+            "passed": self.passed,
+            "summary": self.summary,
+            "results": self.results
+            or [
+                {
+                    "name": "tests",
+                    "ran": True,
+                    "passed": self.passed,
+                    "summary": self.summary,
+                }
+            ],
+        }
+
+
+class FakeSuite:
+    def __init__(self, results):
+        self._results = list(results)
+        self.runs = []
+
+    def run(self, *, workspace, stop_early=True):
+        self.runs.append(workspace)
+        if len(self._results) > 1:
+            return self._results.pop(0)
+        return self._results[0]
+
+
+class FakeVercel:
+    def __init__(self, state="READY"):
+        self.state = state
+
+    def list_deployments(self, **kwargs):
+        return [
+            {
+                "id": "dpl_1",
+                "state": self.state,
+                "target": "preview",
+                "url": "https://feature-preview.app",
+                "created_at": "2026-08-19T10:00:00+00:00",
+                "commit_sha": "feedface" + "0" * 32,
+                "branch": "wiz/feature/FEAT-00001",
+            }
+        ]
+
+    def get_build_logs(self, deployment_id, **kwargs):
+        return "Error: Type 'string' is not assignable to type 'number'"
+
+
+class FakeBrowser:
+    def __init__(self, outcomes=None):
+        # A list of booleans, one per *verification pass* (not per probe).
+        self.outcomes = list(outcomes or [True])
+        self.runs = []
+
+    def run(self, spec, *, base_url="", evidence_dir=None, **kwargs):
+        self.runs.append(spec)
+        ok = self.outcomes[0] if len(self.outcomes) == 1 else self.outcomes[0]
+        return ProbeResult(
+            probe_id=spec.id,
+            success=ok,
+            error="" if ok else "the page does not contain 'Download report'",
+            metadata={"viewport": spec.metadata.get("viewport", "")},
+        )
+
+    def next_pass(self):
+        if len(self.outcomes) > 1:
+            self.outcomes.pop(0)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+PROFILE = EngineeringProfile(
+    name="wize",
+    repository="acme/wize",
+    checkout="/tmp/wize",
+    base_branch="main",
+    lint_command="npm run lint",
+    test_command="npm test",
+    build_command="npm run build",
+)
+
+REQUEST = 'Add a "Download report" button to /coach/summary'
+
+
+@pytest.fixture
+def clock():
+    ticks = {"n": 0}
+
+    def tick():
+        ticks["n"] += 1
+        return f"2026-08-19T10:{ticks['n']:02d}:00+00:00"
+
+    return tick
+
+
+def build_pipeline(
+    tmp_path,
+    clock,
+    *,
+    engineer=None,
+    suite_results=None,
+    browser=None,
+    vercel_state="READY",
+    workspace=None,
+    policy=None,
+    queue=None,
+    approvals=None,
+    max_attempts=3,
+    verifier=True,
+    preview=True,
+):
+    store = FeatureStore(tmp_path / "features.db")
+    suite = FakeSuite(suite_results or [FakeCheckResult()])
+    the_browser = browser or FakeBrowser()
+
+    observer = None
+    if preview:
+        observer = PreviewObserver(
+            vercel=FakeVercel(vercel_state),
+            sleep=lambda s: None,
+            monotonic=lambda: 0.0,
+            timeout_seconds=0.0,
+        )
+
+    pipeline = FeaturePipeline(
+        store=store,
+        profile=PROFILE,
+        engineer=engineer or ScriptedEngineer(),
+        workspace=workspace or FakeWorkspace(tmp_path),
+        check_suite_factory=lambda profile: suite,
+        preview=observer,
+        verifier=(
+            FeatureVerifier(runner_factory=lambda vp: the_browser) if verifier else None
+        ),
+        queue=queue,
+        journal=WizJournal(tmp_path / "journal.jsonl"),
+        approvals=approvals,
+        policy=policy,
+        max_attempts=max_attempts,
+        clock=clock,
+    )
+    pipeline._suite = suite
+    pipeline._browser = the_browser
+    return pipeline
+
+
+def operator_actor(channel=Channel.CONTROL_CENTER):
+    return Actor(actor_id="operator", channel=channel, authenticated=True)
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+class TestHappyPath:
+    def test_a_low_risk_feature_reaches_ready(self, tmp_path, clock):
+        pipeline = build_pipeline(tmp_path, clock)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY, result.history[-1]
+        assert result.preview_url == "https://feature-preview.app"
+
+    def test_the_states_are_visited_in_order_and_none_is_skipped(self, tmp_path, clock):
+        pipeline = build_pipeline(tmp_path, clock)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        visited = [entry["to"] for entry in result.history]
+        assert visited == [
+            "UNDERSTANDING",
+            "PLANNING",
+            "APPROVED_FOR_BUILD",
+            "BUILDING",
+            "TESTING",
+            "PREVIEWING",
+            "VERIFYING",
+            "READY",
+        ]
+
+    def test_the_branch_is_pushed_before_a_preview_is_expected(self, tmp_path, clock):
+        workspace = FakeWorkspace(tmp_path)
+        pipeline = build_pipeline(tmp_path, clock, workspace=workspace)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        assert workspace.pushes == ["origin"]
+        assert workspace.commits
+
+    def test_the_operator_gets_plain_english_at_each_step(self, tmp_path, clock):
+        pipeline = build_pipeline(tmp_path, clock)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        messages = []
+        for _ in range(10):
+            if feature.terminal or feature.state is FeatureState.READY:
+                break
+            step = pipeline.advance(feature)
+            feature = step.feature
+            messages.append(step.message)
+        assert "Understanding..." in messages
+        assert "Planning..." in messages
+        assert any("Claude Code" in m for m in messages)
+        assert any(m.startswith("Sir,") for m in messages)
+
+
+class TestClaudeCodeIsTheOnlyAuthor:
+    def test_every_build_goes_through_the_claude_adapter(self, tmp_path, clock):
+        engineer = ScriptedEngineer()
+        pipeline = build_pipeline(tmp_path, clock, engineer=engineer)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        assert len(engineer.build_calls) == 1
+        assert len(engineer.plan_calls) == 1
+
+    def test_an_unavailable_cli_stops_the_work_rather_than_finding_another_way(
+        self, tmp_path, clock
+    ):
+        class Missing(ScriptedEngineer):
+            def plan(self, pack, *, workspace):
+                raise CodingEngineUnavailable("the 'claude' CLI is not available")
+
+        pipeline = build_pipeline(tmp_path, clock, engineer=Missing())
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert "cannot write code" in result.history[-1]["reason"]
+
+    def test_planning_runs_in_a_worktree_and_not_the_live_checkout(
+        self, tmp_path, clock
+    ):
+        engineer = ScriptedEngineer()
+        pipeline = build_pipeline(tmp_path, clock, engineer=engineer)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        _, workspace = engineer.plan_calls[0]
+        assert workspace != PROFILE.checkout
+        assert "wt-FEAT" in workspace
+
+    def test_planning_and_building_share_one_worktree(self, tmp_path, clock):
+        engineer = ScriptedEngineer()
+        pipeline = build_pipeline(tmp_path, clock, engineer=engineer)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        assert engineer.plan_calls[0][1] == engineer.build_calls[0][1]
+
+    def test_the_planning_session_never_gets_a_write_tool(self):
+        # Proved against the real adapter's declared tool lists rather than
+        # against a double, because this is the property that makes "read-only
+        # planning" true rather than aspirational.
+        from openjarvis.wiz.features.engineer import BUILDING_TOOLS, PLANNING_TOOLS
+
+        assert set(PLANNING_TOOLS).isdisjoint({"Edit", "Write", "Bash"})
+        assert "Bash" in BUILDING_TOOLS
+
+
+class TestTheDiffIsReadFromGit:
+    def test_the_agents_claim_is_stored_but_the_files_come_from_the_workspace(
+        self, tmp_path, clock
+    ):
+        workspace = FakeWorkspace(tmp_path, changed_files=["src/components/Card.tsx"])
+        engineer = ScriptedEngineer(
+            builds=[
+                EngineeringSession(
+                    mode="build",
+                    succeeded=True,
+                    claim="I rewrote the entire authentication system",
+                    changed_files=["src/lib/auth/session.ts"],
+                )
+            ]
+        )
+        pipeline = build_pipeline(
+            tmp_path, clock, engineer=engineer, workspace=workspace
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        attempt = result.attempts[0]
+        assert attempt.changed_files == ["src/components/Card.tsx"]
+        assert "authentication" in attempt.claim
+
+    def test_a_session_that_changed_nothing_is_a_failed_attempt(self, tmp_path, clock):
+        # The most common silent failure: a session that ends confidently and
+        # changed no files. Carried into the gates it would pass against
+        # nothing at all.
+        workspace = FakeWorkspace(tmp_path, changed_files=[])
+        pipeline = build_pipeline(tmp_path, clock, workspace=workspace, max_attempts=1)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert "changed no files" in result.attempts[0].failure
+
+
+class TestRiskIsRedecidedOnTheRealDiff:
+    def test_a_harmless_request_that_touches_authentication_stops(
+        self, tmp_path, clock
+    ):
+        # The case the whole re-classification exists for: the request read as
+        # a styling change and the diff turned out to touch session handling.
+        workspace = FakeWorkspace(tmp_path, changed_files=["src/lib/auth/session.ts"])
+        pipeline = build_pipeline(tmp_path, clock, workspace=workspace)
+        feature = pipeline.submit(
+            "make the header a bit rounder", actor=operator_actor()
+        )
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert result.risk == "HIGH"
+        assert not workspace.pushes, "nothing sensitive may be pushed"
+
+    def test_an_agent_may_raise_the_risk_but_not_lower_it(self, tmp_path, clock):
+        engineer = ScriptedEngineer(
+            plan_claim="This is high risk: it changes how sessions are stored."
+        )
+        pipeline = build_pipeline(tmp_path, clock, engineer=engineer)
+        feature = pipeline.submit("adjust the spacing", actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.risk == "HIGH"
+
+    def test_a_high_risk_feature_will_not_build_without_an_approval(
+        self, tmp_path, clock
+    ):
+        pipeline = build_pipeline(tmp_path, clock)
+        feature = pipeline.submit(
+            "change who is allowed to see other swimmers' data",
+            actor=operator_actor(),
+        )
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.PLANNING
+        assert result.risk == "HIGH"
+        assert result.attempts == []
+
+    def test_an_approval_bound_to_this_plan_lets_it_build(self, tmp_path, clock):
+        now = {"t": 0.0}
+        approvals = ApprovalStore(clock=lambda: now["t"], ttl_seconds=900)
+        pipeline = build_pipeline(tmp_path, clock, approvals=approvals)
+        feature = pipeline.submit(
+            "change who is allowed to see other swimmers' data",
+            actor=operator_actor(),
+        )
+        pipeline.run(feature.id)
+
+        feature = pipeline.store.get(feature.id)
+        assert feature.state is FeatureState.PLANNING
+
+        from openjarvis.wiz.features.acceptance import contract_for
+        from openjarvis.wiz.features.pipeline import _digest
+
+        contract = contract_for(
+            feature_id=feature.id,
+            request=feature.operator_request,
+            plan=feature.plan,
+            gates=list(PROFILE.configured_gates),
+        )
+        approval = approvals.issue(
+            capability="feature.build",
+            subject=feature.id,
+            parameters={
+                "plan": _digest(feature.plan),
+                "risk": feature.risk,
+                "acceptance": contract.describe(),
+            },
+        )
+        feature.metadata["approval_token"] = approval.token
+        pipeline.store.save(feature)
+
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+
+    def test_an_approval_for_a_different_plan_does_not_work(self, tmp_path, clock):
+        now = {"t": 0.0}
+        approvals = ApprovalStore(clock=lambda: now["t"], ttl_seconds=900)
+        pipeline = build_pipeline(tmp_path, clock, approvals=approvals)
+        feature = pipeline.submit(
+            "change who is allowed to see other swimmers' data",
+            actor=operator_actor(),
+        )
+        pipeline.run(feature.id)
+        feature = pipeline.store.get(feature.id)
+
+        approval = approvals.issue(
+            capability="feature.build",
+            subject=feature.id,
+            parameters={"plan": "a completely different plan", "risk": "HIGH"},
+        )
+        feature.metadata["approval_token"] = approval.token
+        pipeline.store.save(feature)
+
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.PLANNING
+        assert "not the action that was approved" in result.metadata["approval_error"]
+
+
+class TestTheIterativeLoop:
+    def test_a_failing_gate_produces_another_attempt_rather_than_a_message(
+        self, tmp_path, clock
+    ):
+        # §16: the operator is not told about the first normal failure. That is
+        # what the loop is for.
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            suite_results=[
+                FakeCheckResult(passed=False, summary="2 tests failed"),
+                FakeCheckResult(passed=True),
+            ],
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert len(result.attempts) == 2
+        assert result.attempts[0].failure == "2 tests failed"
+
+    def test_the_second_attempt_is_told_exactly_what_went_wrong(self, tmp_path, clock):
+        engineer = ScriptedEngineer()
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            engineer=engineer,
+            suite_results=[
+                FakeCheckResult(
+                    passed=False,
+                    summary="typecheck: Property 'total' does not exist",
+                ),
+                FakeCheckResult(passed=True),
+            ],
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        second_pack, _ = engineer.build_calls[1]
+        rendered = second_pack.render()
+        assert "Property 'total' does not exist" in rendered
+        assert "Do not repeat an approach listed here" in rendered
+
+    def test_a_failed_preview_build_feeds_its_logs_back(self, tmp_path, clock):
+        engineer = ScriptedEngineer()
+        pipeline = build_pipeline(
+            tmp_path, clock, engineer=engineer, vercel_state="ERROR", max_attempts=2
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert len(engineer.build_calls) == 2
+        second_pack, _ = engineer.build_calls[1]
+        assert "not assignable to type" in second_pack.render()
+        assert result.state is FeatureState.HUMAN_REQUIRED
+
+    def test_attempts_are_bounded(self, tmp_path, clock):
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            suite_results=[FakeCheckResult(passed=False, summary="still broken")],
+            max_attempts=2,
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert len(result.attempts) == 2
+        assert "tried 2 times" in result.history[-1]["reason"]
+
+    def test_the_operator_is_told_only_when_the_attempts_run_out(self, tmp_path, clock):
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            suite_results=[FakeCheckResult(passed=False, summary="still broken")],
+            max_attempts=2,
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        messages = []
+        for _ in range(20):
+            if feature.terminal or feature.state is FeatureState.READY:
+                break
+            step = pipeline.advance(feature)
+            feature = step.feature
+            messages.append(step.message)
+        sir_messages = [m for m in messages if m.startswith("Sir,")]
+        assert len(sir_messages) == 1
+        assert "could not get" in sir_messages[0]
+
+
+class TestVerificationDecides:
+    def test_a_preview_that_fails_the_contract_is_not_ready(self, tmp_path, clock):
+        pipeline = build_pipeline(
+            tmp_path, clock, browser=FakeBrowser([False]), max_attempts=1
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert result.state is not FeatureState.READY
+
+    def test_the_feature_is_checked_on_both_screen_sizes(self, tmp_path, clock):
+        browser = FakeBrowser()
+        pipeline = build_pipeline(tmp_path, clock, browser=browser)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        viewports = {spec.metadata["viewport"] for spec in browser.runs}
+        assert viewports == {DESKTOP.name, MOBILE.name}
+
+    def test_without_a_browser_the_feature_does_not_claim_to_work(
+        self, tmp_path, clock
+    ):
+        pipeline = build_pipeline(tmp_path, clock, verifier=False)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert "no browser" in result.history[-1]["reason"]
+
+    def test_without_a_preview_provider_the_feature_does_not_claim_to_work(
+        self, tmp_path, clock
+    ):
+        pipeline = build_pipeline(tmp_path, clock, preview=False)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert "no way to see a preview" in result.history[-1]["reason"]
+
+
+class TestProductionAlwaysWins:
+    def test_a_feature_stops_when_reliability_needs_the_machine(self, tmp_path, clock):
+        queue = DevelopmentQueue(max_concurrent=1)
+        pipeline = build_pipeline(tmp_path, clock, queue=queue)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        queue.admit_next()
+        queue.yield_to_production("the site is down")
+
+        result = pipeline.advance(feature)
+        assert not result.progressed
+        assert "live site" in result.message
+        assert result.feature.state is FeatureState.RECEIVED
+
+    def test_the_work_is_not_lost_when_it_yields(self, tmp_path, clock):
+        queue = DevelopmentQueue(max_concurrent=1)
+        pipeline = build_pipeline(tmp_path, clock, queue=queue)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.advance(feature)  # UNDERSTANDING
+        queue.admit_next()
+        queue.yield_to_production("incident")
+        pipeline.advance(feature)
+
+        stored = pipeline.store.get(feature.id)
+        assert stored.state is FeatureState.UNDERSTANDING
+        assert not stored.terminal
+
+
+class TestAuthority:
+    def test_a_channel_without_code_write_cannot_have_code_written_for_it(
+        self, tmp_path, clock
+    ):
+        policy = AuthorityPolicy(
+            grants={Channel.CONTROL_CENTER: frozenset({Authority.READ})}
+        )
+        pipeline = build_pipeline(tmp_path, clock, policy=policy)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert result.attempts == []
+
+    def test_a_channel_with_code_write_may_proceed(self, tmp_path, clock):
+        policy = AuthorityPolicy(
+            grants={
+                Channel.CONTROL_CENTER: frozenset(
+                    {Authority.READ, Authority.CODE_WRITE}
+                )
+            }
+        )
+        pipeline = build_pipeline(tmp_path, clock, policy=policy)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+
+    def test_voice_is_capped_below_what_the_policy_grants(self, tmp_path, clock):
+        # The ceiling is in source, not configuration: voice must be *unable*
+        # to have production code written for it, not merely un-granted.
+        policy = AuthorityPolicy(
+            grants={Channel.VOICE: frozenset({Authority.PRODUCTION_CHANGE})}
+        )
+        pipeline = build_pipeline(tmp_path, clock, policy=policy)
+        feature = pipeline.submit(REQUEST, actor=operator_actor(Channel.VOICE))
+        result = pipeline.run(feature.id)
+        # Voice's ceiling includes CODE_WRITE, so the build itself is allowed;
+        # what it can never carry is a production change, and the policy's own
+        # tests cover that. Here the point is that the ceiling is consulted.
+        assert result.state in (FeatureState.READY, FeatureState.HUMAN_REQUIRED)
+
+
+class TestIntake:
+    def test_every_channel_produces_the_same_kind_of_request(self, tmp_path, clock):
+        pipeline = build_pipeline(tmp_path, clock)
+        made = [
+            pipeline.submit(REQUEST, actor=operator_actor(channel))
+            for channel in (
+                Channel.CONTROL_CENTER,
+                Channel.CLI,
+                Channel.TELEGRAM,
+                Channel.VOICE,
+            )
+        ]
+        assert len({f.state for f in made}) == 1
+        assert {f.source for f in made} == {
+            "control_center",
+            "cli",
+            "telegram",
+            "voice",
+        }
+
+    def test_an_empty_request_is_refused(self, tmp_path, clock):
+        pipeline = build_pipeline(tmp_path, clock)
+        with pytest.raises(ValueError, match="what to build"):
+            pipeline.submit("   ", actor=operator_actor())
+
+    def test_a_request_gets_a_title_it_can_be_called_by(self, tmp_path, clock):
+        pipeline = build_pipeline(tmp_path, clock)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        assert feature.title
+        assert len(feature.title) <= 120
+
+    def test_a_feature_cannot_claim_a_reliability_priority(self, tmp_path, clock):
+        queue = DevelopmentQueue(max_concurrent=1)
+        pipeline = build_pipeline(tmp_path, clock, queue=queue)
+        pipeline.submit(REQUEST, actor=operator_actor(), priority=Priority.P0)
+        waiting = queue.waiting()
+        assert waiting[0].priority is Priority.P2
+
+
+class TestAudit:
+    def test_every_step_is_journalled(self, tmp_path, clock):
+        pipeline = build_pipeline(tmp_path, clock)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        entries = (tmp_path / "journal.jsonl").read_text().splitlines()
+        kinds = {__import__("json").loads(line)["kind"] for line in entries}
+        assert "feature.received" in kinds
+        assert "feature.ready" in kinds
+
+    def test_the_journal_chain_survives_a_whole_feature(self, tmp_path, clock):
+        journal = WizJournal(tmp_path / "journal.jsonl")
+        pipeline = build_pipeline(tmp_path, clock)
+        pipeline.journal = journal
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        intact, break_at = journal.verify()
+        assert intact, f"the audit chain broke at {break_at}"

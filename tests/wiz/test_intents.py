@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from openjarvis.wiz.intents import IntentRule, RuleClassifier
-import re
 
 
 class TestRecognition:

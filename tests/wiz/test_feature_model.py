@@ -5,12 +5,12 @@ from __future__ import annotations
 import pytest
 
 from openjarvis.wiz.features.model import (
+    LEGAL_TRANSITIONS,
+    TERMINAL_STATES,
     FeatureRequest,
     FeatureState,
     InvalidFeatureTransition,
-    LEGAL_TRANSITIONS,
     Priority,
-    TERMINAL_STATES,
 )
 
 
@@ -105,7 +105,9 @@ class TestTheIterativeLoop:
     def test_attempts_are_numbered_and_remember_their_hypothesis(self):
         feature = _feature()
         first = feature.next_attempt(at="t1", hypothesis="the grid is not responsive")
-        second = feature.next_attempt(at="t2", hypothesis="the container is fixed width")
+        second = feature.next_attempt(
+            at="t2", hypothesis="the container is fixed width"
+        )
         assert (first.number, second.number) == (1, 2)
         assert feature.attempts_used == 2
         assert second.hypothesis == "the container is fixed width"

@@ -8,11 +8,10 @@ import pytest
 
 from openjarvis.reliability.code_agent import CodeAgentResult
 from openjarvis.wiz.features.engineer import (
-    BUILDING_TOOLS,
+    PLANNING_TOOLS,
     ClaudeCodeEngineeringAgent,
     CodingEngineUnavailable,
     ContextPack,
-    PLANNING_TOOLS,
 )
 
 

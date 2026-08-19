@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, FrozenSet, List, Optional
+from typing import Any, Dict, FrozenSet, List
 
 __all__ = [
     "FeatureAttempt",
@@ -338,9 +338,7 @@ class FeatureRequest:
     def attempts_used(self) -> int:
         return len(self.attempts)
 
-    def transition(
-        self, target: FeatureState, *, at: str, reason: str = ""
-    ) -> None:
+    def transition(self, target: FeatureState, *, at: str, reason: str = "") -> None:
         """Move to *target*, refusing anything the table does not allow."""
         target = FeatureState.parse(target)
         check_transition(self.state, target)
@@ -416,9 +414,7 @@ class FeatureRequest:
             plan=str(raw.get("plan", "")),
             affected_components=list(raw.get("affected_components") or []),
             acceptance=list(raw.get("acceptance") or []),
-            attempts=[
-                FeatureAttempt.from_dict(a) for a in (raw.get("attempts") or [])
-            ],
+            attempts=[FeatureAttempt.from_dict(a) for a in (raw.get("attempts") or [])],
             branch=str(raw.get("branch", "")),
             worktree=str(raw.get("worktree", "")),
             base_sha=str(raw.get("base_sha", "")),

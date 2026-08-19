@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from openjarvis.wiz.features.model import FeatureRequest, FeatureState, Priority
+from openjarvis.wiz.features.model import FeatureRequest, FeatureState
 from openjarvis.wiz.features.store import FeatureStore
 
 
@@ -36,7 +36,7 @@ class TestIdentity:
         assert store.next_id() == "FEAT-00002"
 
     def test_a_deleted_id_is_never_reused(self, store):
-        first = store.create(_feature())
+        store.create(_feature())
         second = store.create(_feature())
         store.delete(second.id)
         # FEAT-00002 has existed. It may have named a branch or a pull request,

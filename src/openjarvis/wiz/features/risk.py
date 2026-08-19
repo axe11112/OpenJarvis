@@ -74,6 +74,18 @@ HIGH_RISK_WORDS: List[Pattern[str]] = _patterns(
     r"\b(delete|drop|purge|wipe|destroy|truncate)\b",
     r"\b(health|biometric|medical|patient)\s+(data|record)",
     r"\b(security|firewall|cors|csrf)\b",
+    # Authorisation as an operator actually phrases it. Nobody asks to "modify
+    # the RBAC policy"; they ask to change who can see something. Without these
+    # the classifier reads the most consequential request Wiz can receive as an
+    # ordinary UI change, because none of the words above appear in it.
+    r"\bwho\s+(can|may|is\s+allowed|are\s+allowed|should\s+(?:be\s+able|see))\b",
+    r"\ballowed\s+to\s+(see|view|read|edit|change|access|download|export)\b",
+    r"\baccess\s+(to|control|level)\b",
+    r"\b(visible|visibility)\s+(to|for)\b",
+    r"\b(share|shares|sharing|shared)\b.{0,30}\b(with|between|across)\b",
+    r"\b(private|public)\s+(data|profile|record|page|link)\b",
+    r"\b(other|another|others'?|other people'?s?)\s+\w*\s*(data|record|profile|"
+    r"result|swimmer|athlete|user|account)",
 )
 
 #: Requests whose wording alone makes them at least MEDIUM.
@@ -192,9 +204,10 @@ def classify(
     reasons = list(from_paths.reasons) + list(from_text.reasons)
     risk = _max(from_text.risk, from_paths.risk, agent_opinion)
 
-    if agent_opinion is not None and _ORDER[agent_opinion] > _ORDER[
-        _max(from_text.risk, from_paths.risk)
-    ]:
+    if (
+        agent_opinion is not None
+        and _ORDER[agent_opinion] > _ORDER[_max(from_text.risk, from_paths.risk)]
+    ):
         reasons.append("the coding agent raised the risk itself")
 
     return RiskAssessment(risk=risk, reasons=tuple(dict.fromkeys(reasons)))

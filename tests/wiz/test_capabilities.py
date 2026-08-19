@@ -16,9 +16,7 @@ from openjarvis.wiz.capabilities import (
 
 
 def _spec(name="thing.read", **kwargs) -> CapabilitySpec:
-    defaults = dict(
-        summary="a thing", authority=Authority.READ, risk=Risk.LOW
-    )
+    defaults = dict(summary="a thing", authority=Authority.READ, risk=Risk.LOW)
     defaults.update(kwargs)
     return CapabilitySpec(name=name, **defaults)
 

@@ -100,9 +100,7 @@ class TestProtectedCheckouts:
             workspace.create("FEAT-00001")
 
     def test_a_root_inside_the_source_checkout_is_refused(self, repo):
-        workspace = FeatureWorkspace(
-            repo_path=str(repo), root=str(repo / "worktrees")
-        )
+        workspace = FeatureWorkspace(repo_path=str(repo), root=str(repo / "worktrees"))
         with pytest.raises(UnsafeWorkspace):
             workspace.create("FEAT-00001")
 

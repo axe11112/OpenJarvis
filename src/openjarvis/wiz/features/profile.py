@@ -126,7 +126,9 @@ class EngineeringProfile:
             preview_provider=str(raw.get("preview_provider", "")),
         )
 
-    def merged_with_discovery(self, checkout: Optional[str] = None) -> "EngineeringProfile":
+    def merged_with_discovery(
+        self, checkout: Optional[str] = None
+    ) -> "EngineeringProfile":
         """This profile, with any unset command filled in from the repository."""
         root = checkout or self.checkout
         if not root:

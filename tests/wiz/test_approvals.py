@@ -10,7 +10,6 @@ import pytest
 
 from openjarvis.wiz.approvals import (
     DEFAULT_TTL_SECONDS,
-    Approval,
     ApprovalError,
     ApprovalStore,
     fingerprint,

@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from openjarvis.reliability.probes.spec import (
@@ -304,9 +304,7 @@ class AcceptanceContract:
         )
         return cls(
             feature_id=str(raw.get("feature_id", "")),
-            criteria=tuple(
-                Criterion.from_dict(c) for c in (raw.get("criteria") or ())
-            ),
+            criteria=tuple(Criterion.from_dict(c) for c in (raw.get("criteria") or ())),
             viewports=viewports or (DESKTOP, MOBILE),
         )
 
@@ -413,6 +411,18 @@ class AcceptanceContract:
             elif criterion.kind == NETWORK:
                 assertions.no_failed_requests = True
                 assertions.max_http_status = 499
+
+        # Last, so the picture is of the finished state rather than of the page
+        # mid-interaction. Taken whether or not the run passes: the operator
+        # approving a feature, and the reviewer reading the pull request, both
+        # want to see what it looks like working, and there is nowhere later to
+        # get that from.
+        steps.append(
+            ProbeStep(
+                action="screenshot",
+                label=f"{route} on {viewport.name}",
+            )
+        )
 
         if not expectations and not (
             assertions.no_console_errors or assertions.no_failed_requests
@@ -600,9 +610,7 @@ def contract_for(
 
     criteria.extend(extra)
 
-    return AcceptanceContract(
-        feature_id=feature_id, criteria=tuple(_dedupe(criteria))
-    )
+    return AcceptanceContract(feature_id=feature_id, criteria=tuple(_dedupe(criteria)))
 
 
 def _dedupe(criteria: Iterable[Criterion]) -> List[Criterion]:

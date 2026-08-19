@@ -299,9 +299,14 @@ class BrowserProbeRunner(BaseProbeRunner):
             page.on("requestfailed", capture.on_request_failed)
             page.on("response", capture.on_response)
 
+            captured_shots: List[tuple[str, str]] = []
             try:
-                for step in spec.steps:
-                    self._execute(page, step, spec, base_url, credentials)
+                for index, step in enumerate(spec.steps):
+                    shot = self._execute(
+                        page, step, spec, base_url, credentials, artifact_dir, index
+                    )
+                    if shot:
+                        captured_shots.append(shot)
                     steps_completed += 1
             except Exception as exc:
                 failure_kind, error = self._classify(exc, redactor)
@@ -359,6 +364,17 @@ class BrowserProbeRunner(BaseProbeRunner):
             evidence = self._build_evidence(
                 capture, redactor, spec, final_url, page_title
             )
+
+            for label, path in captured_shots:
+                evidence.append(
+                    Evidence(
+                        kind=EvidenceKind.SCREENSHOT,
+                        summary=redactor.redact(label)[:200],
+                        artifact_path=path,
+                        source="browser_probe",
+                        trust=TrustLevel.TRUSTED,
+                    )
+                )
 
             # Artifacts only on failure — a healthy site should cost nothing.
             if not success and artifact_dir is not None:
@@ -427,8 +443,14 @@ class BrowserProbeRunner(BaseProbeRunner):
         spec: ProbeSpec,
         base_url: str,
         credentials: Dict[str, str],
-    ) -> None:
-        """Perform one workflow step."""
+        artifact_dir: Optional[Path] = None,
+        step_index: int = 0,
+    ) -> Optional[tuple[str, str]]:
+        """Perform one workflow step.
+
+        Returns ``(label, path)`` when the step captured a screenshot, and
+        ``None`` otherwise.
+        """
         timeout = step.timeout_ms or spec.timeout_ms
         action = step.action
 
@@ -459,9 +481,26 @@ class BrowserProbeRunner(BaseProbeRunner):
         elif action == "wait_for_timeout":
             page.wait_for_timeout(step.timeout_ms or 1000)
         elif action == "screenshot":
-            pass  # captured on failure; an explicit step is a no-op marker
+            # An explicit screenshot step is taken whether or not the run goes
+            # on to fail. Failure screenshots are automatic and are enough for
+            # incident detection, but a probe that is *proving* something — a
+            # feature's acceptance check, say — needs the picture of it working,
+            # and there is nowhere later to get one from.
+            if artifact_dir is None:
+                return None
+            name = re.sub(r"[^a-z0-9]+", "-", (step.label or "step").lower()).strip("-")
+            path = artifact_dir / f"{step_index:02d}-{name or 'screenshot'}.png"
+            try:
+                page.screenshot(path=str(path), full_page=True)
+            except Exception:
+                logger.warning(
+                    "Could not capture a requested screenshot", exc_info=True
+                )
+                return None
+            return (step.label or "Screenshot", str(path))
         else:  # pragma: no cover - spec validation rejects these
             raise ValueError(f"Unsupported action '{action}'")
+        return None
 
     @staticmethod
     def _classify(exc: Exception, redactor: CredentialRedactor) -> tuple[str, str]:

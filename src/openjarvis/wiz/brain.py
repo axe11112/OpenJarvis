@@ -39,7 +39,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 from openjarvis.wiz.authority import (
     Actor,
-    Authority,
     AuthorityDecision,
     AuthorityPolicy,
     Channel,
@@ -188,7 +187,8 @@ class Wiz:
                 capability=name,
                 kind="capability.unavailable",
                 message=(
-                    f"I cannot do that here: {available.detail or 'it is not configured'}."
+                    "I cannot do that here: "
+                    f"{available.detail or 'it is not configured'}."
                 ),
             )
 
@@ -214,9 +214,7 @@ class Wiz:
                 message="That change is not classified as safe to make on my own.",
             )
 
-        decision = self._policy.decide(
-            request.actor, spec.authority, capability=name
-        )
+        decision = self._policy.decide(request.actor, spec.authority, capability=name)
         if not decision.allowed:
             self._record(
                 request,

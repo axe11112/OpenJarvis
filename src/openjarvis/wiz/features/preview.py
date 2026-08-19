@@ -163,9 +163,7 @@ class PreviewObserver:
     sleep: Callable[[float], None] = time.sleep
     monotonic: Callable[[], float] = time.monotonic
 
-    def observe(
-        self, *, commit_sha: str, branch: str = ""
-    ) -> PreviewObservation:
+    def observe(self, *, commit_sha: str, branch: str = "") -> PreviewObservation:
         """Poll until the preview for *commit_sha* is READY, fails, or times out."""
         if not commit_sha:
             raise PreviewUnavailable(

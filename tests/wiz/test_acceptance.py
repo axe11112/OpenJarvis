@@ -14,7 +14,6 @@ from openjarvis.wiz.features.acceptance import (
     MOBILE,
     NETWORK,
     PERFORMANCE,
-    VIEWPORT,
     AcceptanceContract,
     Criterion,
     contract_for,
@@ -79,9 +78,7 @@ class TestSelfVerification:
             ),
         )
         assert not contract.self_verifiable
-        assert contract.unmet_without_a_person() == (
-            "a person checks the wording",
-        )
+        assert contract.unmet_without_a_person() == ("a person checks the wording",)
 
     def test_a_fully_checkable_contract_self_verifies(self):
         contract = AcceptanceContract(
@@ -274,8 +271,18 @@ class TestCompilation:
             ),
         )
         _, spec = contract.probe_specs()[0]
-        assert [s.action for s in spec.steps] == ["goto", "click"]
+        assert [s.action for s in spec.steps] == ["goto", "click", "screenshot"]
         assert spec.expect[0].selector == "[role=dialog]"
+
+    def test_every_probe_ends_by_taking_a_picture(self):
+        # The operator approving a feature and the reviewer reading the pull
+        # request both want to see it working, and there is nowhere later to
+        # get that picture from.
+        contract = contract_for(
+            feature_id="FEAT-00018", request='add a "Go" button to /x'
+        )
+        for _, spec in contract.probe_specs():
+            assert spec.steps[-1].action == "screenshot"
 
 
 class TestSerialisation:
@@ -294,7 +301,11 @@ class TestSerialisation:
     def test_an_unusable_proposal_is_dropped_not_fatal(self):
         parsed = criteria_from_mapping(
             [
-                {"kind": "CONTENT", "description": "the heading is there", "text": "Hi"},
+                {
+                    "kind": "CONTENT",
+                    "description": "the heading is there",
+                    "text": "Hi",
+                },
                 {"kind": "TELEPATHY", "description": "it feels right"},
                 "not even a table",
             ]

@@ -60,9 +60,7 @@ def journal(tmp_path):
 
 
 def _wiz(registry, policy, journal=None, classifier=None):
-    wiz = Wiz(
-        registry=registry, policy=policy, journal=journal, classifier=classifier
-    )
+    wiz = Wiz(registry=registry, policy=policy, journal=journal, classifier=classifier)
     calls = []
     for name in ("thing.read", "thing.write", "thing.deploy", "thing.absent"):
         wiz.register(name, lambda request, n=name: calls.append(n) or n)
@@ -162,9 +160,7 @@ class TestAuthorityIsEnforcedAtDispatch:
         )
         wiz, calls = _wiz(registry, policy, journal)
         outcome = wiz.handle(
-            Request(
-                text="", actor=_actor(Channel.TELEGRAM, authenticated=False)
-            ),
+            Request(text="", actor=_actor(Channel.TELEGRAM, authenticated=False)),
             capability="thing.write",
         )
         assert not outcome.handled
@@ -195,9 +191,7 @@ class TestRisk:
         )
         wiz, calls = _wiz(registry, policy, journal)
         outcome = wiz.handle(
-            Request(
-                text="", actor=_actor(Channel.CONTROL_CENTER), approved=True
-            ),
+            Request(text="", actor=_actor(Channel.CONTROL_CENTER), approved=True),
             capability="thing.deploy",
         )
         assert outcome.handled
@@ -237,9 +231,7 @@ class TestHonesty:
             journal,
             classifier=lambda request: None,
         )
-        outcome = wiz.handle(
-            Request(text="mumble mumble", actor=_actor(Channel.VOICE))
-        )
+        outcome = wiz.handle(Request(text="mumble mumble", actor=_actor(Channel.VOICE)))
         assert not outcome.handled
         assert calls == []
 
@@ -285,9 +277,7 @@ class TestTheJournalRecordsDecisions:
     def test_a_grant_is_recorded(self, registry, journal):
         policy = AuthorityPolicy(grants={Channel.CLI: frozenset({Authority.READ})})
         wiz, _ = _wiz(registry, policy, journal)
-        wiz.handle(
-            Request(text="", actor=_actor(Channel.CLI)), capability="thing.read"
-        )
+        wiz.handle(Request(text="", actor=_actor(Channel.CLI)), capability="thing.read")
         kinds = [entry.kind for entry in journal.entries()]
         assert "authority.granted" in kinds
 

@@ -75,9 +75,7 @@ class TestHonesty:
 
         runtime = build_wiz(
             home=tmp_path,
-            policy=AuthorityPolicy(
-                grants={Channel.CLI: frozenset({Authority.READ})}
-            ),
+            policy=AuthorityPolicy(grants={Channel.CLI: frozenset({Authority.READ})}),
             journal=WizJournal(tmp_path / "j.jsonl"),
             store_factory=no_database,
         )
@@ -102,9 +100,7 @@ class TestHonesty:
 
         runtime = build_wiz(
             home=tmp_path,
-            policy=AuthorityPolicy(
-                grants={Channel.CLI: frozenset({Authority.READ})}
-            ),
+            policy=AuthorityPolicy(grants={Channel.CLI: frozenset({Authority.READ})}),
             journal=WizJournal(tmp_path / "j.jsonl"),
             store_factory=no_database,
         )
@@ -126,9 +122,7 @@ class TestHonesty:
 
         runtime = build_wiz(
             home=tmp_path,
-            policy=AuthorityPolicy(
-                grants={Channel.CLI: frozenset({Authority.READ})}
-            ),
+            policy=AuthorityPolicy(grants={Channel.CLI: frozenset({Authority.READ})}),
             journal=WizJournal(tmp_path / "j.jsonl"),
             store_factory=flaky,
         )
@@ -195,9 +189,7 @@ class TestReliabilityReadPath:
 
         runtime = build_wiz(
             home=tmp_path,
-            policy=AuthorityPolicy(
-                grants={Channel.CLI: frozenset({Authority.READ})}
-            ),
+            policy=AuthorityPolicy(grants={Channel.CLI: frozenset({Authority.READ})}),
             journal=WizJournal(tmp_path / "j.jsonl"),
             store_factory=factory,
         )
@@ -213,9 +205,7 @@ class TestChannelsStillApply:
         anonymous = Actor(
             actor_id="unknown", channel=Channel.TELEGRAM, authenticated=False
         )
-        outcome = runtime.wiz.handle(
-            Request(text="what can you do", actor=anonymous)
-        )
+        outcome = runtime.wiz.handle(Request(text="what can you do", actor=anonymous))
         # READ is permitted unauthenticated, but the policy above grants
         # Telegram nothing at all, so this is still refused.
         assert not outcome.handled
@@ -229,7 +219,5 @@ class TestChannelsStillApply:
                 Authority.PRODUCTION_CHANGE,
                 Authority.SECRET_ACCESS,
             ):
-                actor = Actor(
-                    actor_id="operator", channel=channel, authenticated=True
-                )
+                actor = Actor(actor_id="operator", channel=channel, authenticated=True)
                 assert not runtime.policy.decide(actor, authority).allowed

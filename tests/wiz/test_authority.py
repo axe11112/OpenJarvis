@@ -11,10 +11,10 @@ import json
 import pytest
 
 from openjarvis.wiz.authority import (
+    CHANNEL_CEILING,
     Actor,
     Authority,
     AuthorityPolicy,
-    CHANNEL_CEILING,
     Channel,
     ceiling_for,
     expand,
@@ -115,13 +115,9 @@ class TestAuthentication:
 
     @pytest.mark.parametrize("channel", list(Channel))
     def test_an_unauthenticated_actor_cannot_act(self, channel):
-        policy = AuthorityPolicy(
-            grants={channel: ceiling_for(channel)}
-        )
+        policy = AuthorityPolicy(grants={channel: ceiling_for(channel)})
         for authority in ceiling_for(channel):
-            decision = policy.decide(
-                _actor(channel, authenticated=False), authority
-            )
+            decision = policy.decide(_actor(channel, authenticated=False), authority)
             if authority is Authority.READ:
                 assert decision.allowed
             else:
@@ -164,9 +160,7 @@ class TestThePolicyCannotWidenItself:
         policy = AuthorityPolicy.default()
         granted = policy.granted_to(Channel.VOICE)
         assert isinstance(granted, frozenset)  # nothing to mutate in the first place
-        assert not policy.decide(
-            _actor(Channel.VOICE), Authority.CODE_WRITE
-        ).allowed
+        assert not policy.decide(_actor(Channel.VOICE), Authority.CODE_WRITE).allowed
 
 
 class TestLoading:
@@ -186,9 +180,7 @@ class TestLoading:
             json.dumps({"grants": {"control_center": ["CODE_WRITE", "PR_WRITE"]}})
         )
         policy = AuthorityPolicy.load(path)
-        assert policy.decide(
-            _actor(Channel.CONTROL_CENTER), Authority.PR_WRITE
-        ).allowed
+        assert policy.decide(_actor(Channel.CONTROL_CENTER), Authority.PR_WRITE).allowed
         # And nothing was granted to anyone else by omission.
         assert not policy.decide(_actor(Channel.CLI), Authority.PR_WRITE).allowed
 

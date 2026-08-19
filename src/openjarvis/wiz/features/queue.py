@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 from openjarvis.wiz.features.model import FeatureRequest, Priority

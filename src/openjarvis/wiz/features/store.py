@@ -19,9 +19,9 @@ import logging
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Iterable, List, Optional
 
-from openjarvis.wiz.features.model import FeatureRequest, FeatureState, Priority
+from openjarvis.wiz.features.model import FeatureRequest, FeatureState
 
 logger = logging.getLogger(__name__)
 

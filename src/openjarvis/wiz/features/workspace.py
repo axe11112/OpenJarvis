@@ -25,9 +25,9 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 
-from openjarvis.reliability.workspace import RepairWorkspace, Worktree, WorkspaceError
+from openjarvis.reliability.workspace import RepairWorkspace, WorkspaceError, Worktree
 
 logger = logging.getLogger(__name__)
 

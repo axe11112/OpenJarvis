@@ -90,6 +90,37 @@ class TestWordsDecide:
     def test_building_a_page_is_medium(self):
         assert classify_text("Add a new coach dashboard page").risk is Risk.MEDIUM
 
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # Nobody asks Wiz to "modify the RBAC policy". They ask this, and
+            # every one of these is an authorisation change wearing the clothes
+            # of an ordinary feature request.
+            "Change who can see a swimmer's results",
+            "Let coaches see other swimmers' data",
+            "Make the athlete profile visible to the whole club",
+            "Give parents access to the training log",
+            "Let swimmers share their results with a coach",
+            "Add a public link for a private profile",
+            "Change who is allowed to download the report",
+        ],
+    )
+    def test_authorisation_asked_for_in_plain_english_is_high(self, text):
+        assert classify_text(text).risk is Risk.HIGH, text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # The neighbouring phrasings that must *not* trip it, or every
+            # request becomes HIGH and the approval step stops meaning anything.
+            "Make the share button bigger",
+            "Show the swimmer's name in the header",
+            "Add an access key illustration to the empty state",
+        ],
+    )
+    def test_ordinary_requests_near_those_words_stay_below_high(self, text):
+        assert classify_text(text).risk is not Risk.HIGH, text
+
 
 class TestTheAgentCannotTalkItsWayDown:
     def test_an_agent_calling_an_auth_change_low_is_overruled(self):
@@ -111,10 +142,11 @@ class TestTheAgentCannotTalkItsWayDown:
         assert any("raised the risk itself" in r for r in assessment.reasons)
 
     def test_the_result_is_the_maximum_of_every_signal(self):
-        assert classify(text="change the footer text", paths=["README.md"]).risk is Risk.LOW
         assert (
-            classify(text="add a login page", paths=["README.md"]).risk is Risk.HIGH
+            classify(text="change the footer text", paths=["README.md"]).risk
+            is Risk.LOW
         )
+        assert classify(text="add a login page", paths=["README.md"]).risk is Risk.HIGH
         assert (
             classify(text="change the footer", paths=["app/api/login/route.ts"]).risk
             is Risk.HIGH

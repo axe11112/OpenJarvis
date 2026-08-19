@@ -39,7 +39,7 @@ import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Dict, FrozenSet, Iterable, Mapping, Optional
+from typing import Dict, FrozenSet, Iterable, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -173,9 +173,7 @@ class Channel(str, Enum):
 #: ``SECRET_ACCESS`` appears in no ceiling at all. Wiz has no capability that
 #: requires it, and the way to keep it that way is to make it ungrantable.
 CHANNEL_CEILING: Mapping[Channel, FrozenSet[Authority]] = {
-    Channel.CONTROL_CENTER: expand(
-        {Authority.PR_WRITE, Authority.PRODUCTION_CHANGE}
-    ),
+    Channel.CONTROL_CENTER: expand({Authority.PR_WRITE, Authority.PRODUCTION_CHANGE}),
     Channel.CLI: expand({Authority.PR_WRITE}),
     Channel.VOICE: expand({Authority.CODE_WRITE}),
     Channel.TELEGRAM: expand({Authority.CODE_WRITE}),
@@ -247,7 +245,9 @@ class AuthorityPolicy:
 
     # -- decisions ---------------------------------------------------------
 
-    def decide(self, actor: Actor, required: Authority, *, capability: str = "") -> AuthorityDecision:
+    def decide(
+        self, actor: Actor, required: Authority, *, capability: str = ""
+    ) -> AuthorityDecision:
         """Whether *actor* may exercise *required*.
 
         Deny-by-default: every path that is not an explicit grant returns a
@@ -266,7 +266,8 @@ class AuthorityPolicy:
         ceiling = CHANNEL_CEILING.get(actor.channel)
         if ceiling is None:
             return refuse(
-                f"channel '{actor.channel}' has no ceiling defined, so it has no authority"
+                f"channel '{actor.channel}' has no ceiling defined, "
+                "so it has no authority"
             )
 
         if required not in ceiling:
@@ -282,9 +283,7 @@ class AuthorityPolicy:
 
         granted = self.grants.get(actor.channel, frozenset())
         if required not in granted:
-            return refuse(
-                f"{required.value} is not granted to {actor.channel.value}"
-            )
+            return refuse(f"{required.value} is not granted to {actor.channel.value}")
 
         return AuthorityDecision(
             allowed=True,

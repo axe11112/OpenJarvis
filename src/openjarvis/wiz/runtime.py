@@ -25,10 +25,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from openjarvis.wiz.authority import (
+    CHANNEL_CEILING,
     Actor,
     Authority,
     AuthorityPolicy,
-    CHANNEL_CEILING,
     Channel,
 )
 from openjarvis.wiz.brain import Request, Wiz
@@ -99,7 +99,9 @@ def _incident_store_available(config: Any = None) -> Availability:
     return Availability.ready(str(path))
 
 
-def incident_probe_for(store_factory: Optional[Callable[[], Any]]) -> Callable[[], Availability]:
+def incident_probe_for(
+    store_factory: Optional[Callable[[], Any]],
+) -> Callable[[], Availability]:
     """An availability probe that agrees with the store the handler will use.
 
     The probe and the handler must consult the same source. When they do not,
@@ -119,7 +121,9 @@ def incident_probe_for(store_factory: Optional[Callable[[], Any]]) -> Callable[[
         try:
             store = store_factory()
         except Exception as exc:
-            return Availability.missing(str(exc) or "the incident store cannot be opened")
+            return Availability.missing(
+                str(exc) or "the incident store cannot be opened"
+            )
         WizRuntime._close(store)
         return Availability.ready("the incident store is reachable")
 

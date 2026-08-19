@@ -30,7 +30,7 @@ no handler, no authority and no path to execution. Being able to *say*
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Dict, Iterable, List, Optional
 

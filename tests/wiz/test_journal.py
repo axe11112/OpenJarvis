@@ -114,7 +114,9 @@ class TestTamperEvidence:
             "entry_hash": "f" * 64,
         }
         with open(path, "a") as handle:
-            handle.write(json.dumps(fabricated, sort_keys=True, separators=(",", ":")) + "\n")
+            handle.write(
+                json.dumps(fabricated, sort_keys=True, separators=(",", ":")) + "\n"
+            )
 
         intact, broken_at = journal.verify()
         assert not intact

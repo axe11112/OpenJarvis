@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Pattern, Sequence, TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional, Pattern, Sequence
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from openjarvis.wiz.brain import Request

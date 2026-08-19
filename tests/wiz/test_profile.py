@@ -22,8 +22,12 @@ class TestDiscovery:
     def test_scripts_are_read_from_package_json(self, tmp_path):
         root = _node_project(
             tmp_path,
-            {"test": "vitest", "lint": "eslint .", "build": "next build",
-             "typecheck": "tsc --noEmit"},
+            {
+                "test": "vitest",
+                "lint": "eslint .",
+                "build": "next build",
+                "typecheck": "tsc --noEmit",
+            },
         )
         profile = discover_profile("wize", root)
         assert profile.test_command == "npm test"
@@ -31,7 +35,9 @@ class TestDiscovery:
         assert profile.build_command == "npm run build"
         assert profile.typecheck_command == "npm run typecheck"
 
-    def test_a_missing_script_produces_no_gate_rather_than_a_failing_one(self, tmp_path):
+    def test_a_missing_script_produces_no_gate_rather_than_a_failing_one(
+        self, tmp_path
+    ):
         root = _node_project(tmp_path, {"test": "vitest"})
         profile = discover_profile("wize", root)
         assert profile.typecheck_command == ""
