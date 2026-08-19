@@ -43,7 +43,12 @@ on top.
        ├─ PREVIEWING ............... branch pushed; preview matched on the exact SHA
        ├─ VERIFYING ................ contract checked in a browser, desktop and phone
        ├─ READY .................... every criterion checked and passed
-       └─ pull request ............. if PR_WRITE permits. Merging is a different question.
+       ├─ pull request ............. if PR_WRITE permits. Merging is a different question.
+       │
+       └─ (after a merge somebody authorised)
+            ├─ PRODUCTION_VERIFYING . same contract, same browser, the production deployment
+            ├─ COMPLETE ............. production agreed
+            └─ handed to reliability  production did not — as an incident, one way only
 ```
 
 Any failure between BUILDING and VERIFYING feeds its exact text back into a new
@@ -137,7 +142,7 @@ implement, but neither has met a real deployment.
 
 ## 5. What the pilots found
 
-Two bugs no unit test would have produced, both now fixed with regression tests:
+Four bugs no unit test would have produced, all now fixed with regression tests:
 
 **A backend change was given browser criteria it could never satisfy.** UI
 detection and quoted-label extraction both read the plan. A plan mentions
@@ -154,16 +159,56 @@ without reading, which is worse than not asking. `session` now needs an auth
 qualifier; the *path* patterns are unchanged and still catch
 `src/lib/auth/session.ts` whatever the request called it.
 
-A third finding was a usability bug in the classifier: §25's own example
+Re-running the pilots after clearing their state by hand — which is the shape a
+crash has — found a third: a worktree directory removed out from under git
+leaves git's registration behind, the branch then counts as checked out
+somewhere, and the feature could never be retried. It also surfaced the raw git
+command line reaching the operator, which is precise and useless to somebody who
+is not reading the code.
+
+A fourth was a usability bug in the classifier: §25's own example
 sentence, *"Sir, add export to reports"*, was unrecognised, because the pattern
 demanded the verb come first. That is how a channel ends up feeling broken while
 every test passes.
+
+## 5b. After the merge
+
+`wiz/features/postship.py` covers the window the incident machine already names
+for a reason: a change is live and unproven, and the operator has already been
+told it is done. Production is checked by the same contract, the same browser
+and the same exact-SHA matching the preview was — a feature that passed one bar
+and was spared the other would make the first bar meaningless. Production
+screenshots are filed apart from the preview's so the two can be compared.
+
+The handover is the point of the module. `reliability` must never import `wiz`,
+so it cannot be a callback registered the other way: it is a plain data object
+and a handler. The shipped handler opens an incident through reliability's own
+store, fingerprinted on the *feature* so repeated failures group into one
+incident — which is what the other side's "no second automatic merge after a
+post-merge failure" gate depends on.
+
+Nothing there reverts anything. Undoing a change that is live in front of users
+is a judgement about the product, and it belongs to a person rather than to the
+thing that just built the change and would very much like it to have worked.
+
+## 5c. The morning summary
+
+`wiz/briefing.py` composes it and cannot deliver it — a test checks the imports,
+because that is where a delivery capability would have to come from. Approvals
+go above the good news, because the one thing in a morning summary with a
+deadline is the feature that has been waiting since yesterday. "Wize is healthy"
+is a claim about probes that ran, so a reliability subsystem that cannot answer
+produces no health line rather than a reassuring one.
+
+`worth_sending` is the field that matters: a summary arriving every day saying
+"nothing happened" is one nobody reads by the end of the second week, and by
+then it is the one carrying the sentence that mattered.
 
 ## 6. Test counts
 
 | Suite | Result |
 |---|---|
-| `tests/wiz` | **595 passed** |
+| `tests/wiz` | **641 passed** |
 | `tests/reliability` | 1504 passed, 17 failed — **identical at the branch base** |
 | `reliability` importing `wiz` | **0**, enforced by a test that parses imports |
 
