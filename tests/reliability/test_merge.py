@@ -24,6 +24,8 @@ import json
 import pytest
 
 from openjarvis.reliability.merge import (
+    _ALWAYS_GATES,
+    _ATTEMPT_GATES,
     REQUIRED_CHECKS,
     AutoMerger,
     MergeRecord,
@@ -1322,6 +1324,76 @@ class TestRequiredVercelContextOnTheVerifiedCommit:
         assert "do not remove the required context" in decision.reason
 
     def test_a_summary_that_did_not_evaluate_the_context_is_refused(self):
-        """"Some CI was green" is not "Vercel said yes about this commit"."""
+        """ "Some CI was green" is not "Vercel said yes about this commit"."""
         decision = self._decide_ctx(required={"other-ci": "success"})
         assert _refused(decision, "status_checks")
+
+
+# ---------------------------------------------------------------------------
+# A gate that was never evaluated
+# ---------------------------------------------------------------------------
+
+
+class TestAnAbsentGateIsARefusal:
+    """The decision is made by collecting refusals, so a gate that was never
+    added is indistinguishable from one that passed.
+
+    Both cases below were live fail-opens: the gate was added inside an ``if``
+    that happened to be false in exactly the situation the gate existed for, and
+    ``evaluate_merge`` then reported "every merge gate passed". The fix is that
+    the gates are unconditional, plus a completeness check that refuses when an
+    expected gate is missing whatever the reason.
+    """
+
+    def test_an_unknown_base_is_not_an_unchanged_base(self):
+        """A GitHub read that failed leaves both base SHAs empty.
+
+        ``AutoMerger._base_sha`` returns ``""`` on any exception, so a transient
+        403 used to delete the base-unchanged gate entirely and buy a merge onto
+        a base nobody had looked at.
+        """
+        incident = _incident()
+        incident.attempts[-1].base_commit = ""
+        decision = _decide(
+            incident=incident, base_sha_at_verification="", observed_base_sha=""
+        )
+        assert _refused(decision, "base_unchanged")
+        assert "Unknown is not unchanged" in decision.reason
+
+    def test_an_incident_with_no_probe_cannot_merge_on_another_probes_verdict(self):
+        """``Detector.from_signal`` opens incidents carrying no ``probe_id``.
+
+        The original-reproduction gate was skipped for all of them, so a
+        Vercel- or Supabase-derived incident could merge on the strength of a
+        probe that had nothing to do with it.
+        """
+        incident = _incident(probe_id="")
+        incident.attempts[-1].verification = VerificationResult(
+            passed=True, probe_id="an-unrelated-probe", target_url="https://p.app"
+        )
+        decision = _decide(incident=incident)
+        assert _refused(decision, "original_reproduction")
+
+    def test_the_happy_path_evaluates_every_expected_gate(self):
+        decision = _decide()
+        assert decision.allowed
+        names = {g.name for g in decision.gates}
+        assert not (_ALWAYS_GATES - names)
+        assert not (_ATTEMPT_GATES - names)
+        assert any(g.name == "gates_complete" and g.passed for g in decision.gates)
+
+    def test_a_missing_gate_refuses_and_names_itself(self, monkeypatch):
+        """Simulate a future gate that forgets to fire on some input.
+
+        Asserting through the completeness check rather than through a specific
+        gate is deliberate: this test keeps passing when gates are added, and
+        starts failing the moment one becomes conditional again.
+        """
+        import openjarvis.reliability.merge as merge_mod
+
+        monkeypatch.setattr(
+            merge_mod, "_ALWAYS_GATES", frozenset(_ALWAYS_GATES | {"a_gate_nobody_ran"})
+        )
+        decision = _decide()
+        assert _refused(decision, "gates_complete")
+        assert "a_gate_nobody_ran" in decision.reason

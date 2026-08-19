@@ -79,6 +79,52 @@ __all__ = [
 #: — see ``CheckSuiteResult.passed`` — so ``ran`` is asserted separately.
 REQUIRED_CHECKS = ("lint", "typecheck", "tests", "build")
 
+#: Gates that must appear in every decision, whatever the inputs looked like.
+#:
+#: ``evaluate_merge`` decides by collecting refusals — ``[g for g in gates if not
+#: g.passed]`` — which makes a gate that was never *added* indistinguishable from
+#: one that passed. Two gates were once added inside ``if`` statements and both
+#: disappeared on inputs that should have been the most suspicious ones: an
+#: unreadable base branch, and an incident with no originating probe. Listing the
+#: names here turns "the gate did not run" into a refusal instead of a silent
+#: allow, so the next conditional gate somebody adds fails closed by default
+#: rather than by remembering to.
+_ALWAYS_GATES = frozenset(
+    {
+        "merge_enabled",
+        "no_prior_post_merge_failure",
+        "incident_state",
+        "not_flapping",
+        "attempt_recorded",
+        "verified",
+        "verified_sha_known",
+        "pr_belongs_to_incident",
+        "pr_head_is_incident_branch",
+        "pr_base_is_default_branch",
+        "pr_open",
+        "pr_not_draft",
+        "no_conflicts",
+        "head_sha_unchanged",
+        "base_unchanged",
+        "status_checks",
+    }
+)
+
+#: Gates additionally required once a repair attempt exists to be judged.
+#:
+#: Separate from :data:`_ALWAYS_GATES` because with no attempt there is nothing
+#: for them to describe, and ``attempt_recorded`` has already refused by then.
+_ATTEMPT_GATES = frozenset(
+    {
+        "scope",
+        "no_protected_paths",
+        "no_secret_like_paths",
+        "preview_deployment",
+        "original_reproduction",
+    }
+    | {"check_" + name for name in REQUIRED_CHECKS}
+)
+
 #: Incident states from which no merge is ever attempted.
 _REFUSING_STATES = frozenset(
     {
@@ -403,15 +449,33 @@ def evaluate_merge(
             if attempt.preview_url
             else "no preview deployment was recorded for this attempt",
         )
-        if attempt.verification is not None and incident.probe_id:
-            same_probe = attempt.verification.probe_id == incident.probe_id
+        # Evaluated unconditionally. Previously this gate was skipped when the
+        # incident carried no ``probe_id``, and ``Detector.from_signal`` opens
+        # incidents with exactly that — a Vercel or Supabase signal has no
+        # originating probe. The gate vanished for that whole class, so a
+        # signal-derived incident could merge on the strength of *any* probe.
+        # An incident whose detection cannot be re-run cannot be shown to be
+        # fixed by re-running it, and that is a refusal, not an exemption.
+        verified_probe = (
+            attempt.verification.probe_id if attempt.verification is not None else ""
+        )
+        if not incident.probe_id:
+            gate(
+                "original_reproduction",
+                False,
+                "the incident records no originating probe, so there is no "
+                "reproduction to re-run; a repair for a signal-derived incident "
+                "is verified by a human, not by this gate",
+            )
+        else:
+            same_probe = bool(verified_probe) and verified_probe == incident.probe_id
             gate(
                 "original_reproduction",
                 same_probe,
                 f"re-ran the originating probe '{incident.probe_id}'"
                 if same_probe
                 else (
-                    f"verified probe '{attempt.verification.probe_id}' is not the "
+                    f"verified probe '{verified_probe or 'none'}' is not the "
                     f"probe that opened the incident ('{incident.probe_id}')"
                 ),
             )
@@ -484,10 +548,25 @@ def evaluate_merge(
     )
 
     # -- 10. the branch it would merge into has not moved -----------------
-    if base_sha_at_verification or observed_base_sha:
-        unmoved = bool(base_sha_at_verification) and (
-            observed_base_sha == base_sha_at_verification
+    #
+    # Evaluated unconditionally, including when neither SHA is known. An earlier
+    # version only added this gate when at least one side was populated, which
+    # meant the gate *disappeared* when both were unknown — and both are unknown
+    # in exactly the case that matters, a GitHub read that failed so
+    # ``AutoMerger._base_sha`` returned "". A gate that is absent cannot fail, so
+    # a transient 403 silently bought a merge onto an unexamined base. Not
+    # knowing where the base is, is not evidence that it has not moved.
+    if not base_sha_at_verification or not observed_base_sha:
+        gate(
+            "base_unchanged",
+            False,
+            f"cannot tell whether '{base_branch}' moved: verified against "
+            f"{base_sha_at_verification[:12] or 'an unrecorded base'} and "
+            f"{observed_base_sha[:12] or 'the base tip could not be read'}. "
+            "Unknown is not unchanged.",
         )
+    else:
+        unmoved = observed_base_sha == base_sha_at_verification
         gate(
             "base_unchanged",
             unmoved,
@@ -495,8 +574,8 @@ def evaluate_merge(
             if unmoved
             else (
                 f"'{base_branch}' moved from "
-                f"{base_sha_at_verification[:12] or 'unknown'} to "
-                f"{observed_base_sha[:12] or 'unknown'} since verification; "
+                f"{base_sha_at_verification[:12]} to "
+                f"{observed_base_sha[:12]} since verification; "
                 "the fix was verified against code that is no longer the base"
             ),
         )
@@ -608,6 +687,24 @@ def evaluate_merge(
             "not required ([reliability.merge] require_status_checks = false); "
             "local checks and preview verification are the only evidence",
         )
+
+    # The completeness check itself. Anything expected but absent is a refusal
+    # naming the missing gates, so the failure mode is a loud "this decision is
+    # incomplete" rather than a quiet "every merge gate passed".
+    expected = set(_ALWAYS_GATES) | (
+        set(_ATTEMPT_GATES) if attempt is not None else set()
+    )
+    missing = sorted(expected - {g.name for g in gates})
+    gate(
+        "gates_complete",
+        not missing,
+        "every expected gate was evaluated"
+        if not missing
+        else (
+            "gate(s) never evaluated, so their verdict is unknown and this "
+            "decision cannot be trusted: " + ", ".join(missing)
+        ),
+    )
 
     failures = [g for g in gates if not g.passed]
     if failures:
