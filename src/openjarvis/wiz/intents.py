@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, List, Optional, Pattern, Sequence
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from openjarvis.wiz.brain import Request
 
-__all__ = ["IntentRule", "RuleClassifier", "default_rules"]
+__all__ = ["IntentRule", "RuleClassifier", "default_rules", "intent_rule"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,12 +45,22 @@ class IntentRule:
         return bool(self.pattern.search(text))
 
 
-def _rule(capability: str, pattern: str, weight: int = 0) -> IntentRule:
+def intent_rule(capability: str, pattern: str, weight: int = 0) -> IntentRule:
+    """Build a rule. Public so other modules can contribute their own verbs.
+
+    Contributing a rule is not contributing a capability: the name a rule
+    produces still has to exist in the registry, with an authority and a risk
+    somebody declared, or dispatch refuses it.
+    """
     return IntentRule(
         capability=capability,
         pattern=re.compile(pattern, re.IGNORECASE),
         weight=weight,
     )
+
+
+#: The original private name, kept because this module's own rules use it.
+_rule = intent_rule
 
 
 def default_rules() -> List[IntentRule]:

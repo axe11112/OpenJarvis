@@ -38,7 +38,7 @@ from openjarvis.wiz.capabilities import (
     CapabilitySpec,
     Risk,
 )
-from openjarvis.wiz.intents import RuleClassifier
+from openjarvis.wiz.intents import RuleClassifier, default_rules
 from openjarvis.wiz.journal import WizJournal
 
 logger = logging.getLogger(__name__)
@@ -165,29 +165,44 @@ class WizRuntime:
         journal: Optional[WizJournal] = None,
         store_factory: Optional[Callable[[], Any]] = None,
         config: Any = None,
+        product: Any = None,
     ) -> None:
         self.policy = policy
         self.registry = registry
         self.journal = journal
         self.config = config
+        self.product = product
         self._store_factory = store_factory
+
+        rules = list(default_rules())
+        if product is not None:
+            from openjarvis.wiz.product import product_intent_rules
+
+            rules.extend(product_intent_rules())
+
         self.wiz = Wiz(
             registry=registry,
             policy=policy,
             journal=journal,
-            classifier=RuleClassifier(),
+            classifier=RuleClassifier(rules),
         )
         for name, handler in self._handlers().items():
             self.wiz.register(name, handler)
 
     def _handlers(self) -> Dict[str, Callable[[Request], Any]]:
-        return {
+        handlers: Dict[str, Callable[[Request], Any]] = {
             "wiz.capabilities": self.describe_capabilities,
             "wiz.authority": self.describe_authority,
             "wiz.health": self.describe_health,
             "reliability.status": self.reliability_status,
             "reliability.incidents": self.reliability_incidents,
         }
+        if self.product is not None:
+            # Registered only when the product side is actually assembled, so
+            # that a machine without it says "not built here" rather than
+            # declaring a verb with no handler behind it.
+            handlers.update(self.product.handlers())
+        return handlers
 
     # -- handlers ----------------------------------------------------------
 
@@ -375,12 +390,18 @@ def build_wiz(
     config: Any = None,
     store_factory: Optional[Callable[[], Any]] = None,
     journal: Optional[WizJournal] = None,
+    product: Any = None,
 ) -> WizRuntime:
     """Build the Wiz the CLI and the dashboard both use.
 
     Every dependency is injectable so that tests never touch the operator's real
     journal or incident database — and so that a test proving "voice cannot
     merge" is proving it about the same object production runs.
+
+    *product* is the assembled product-development side — the pipeline and the
+    memory, wrapped in :class:`~openjarvis.wiz.product.ProductVerbs`. Passing
+    ``None`` gives a Wiz that can answer questions and nothing else, which is
+    the right shape on a machine with no engineering target configured.
     """
     root = Path(home) if home is not None else wiz_home()
     resolved_policy = policy or AuthorityPolicy.load(root / AUTHORITY_FILENAME)
@@ -396,17 +417,66 @@ def build_wiz(
                 raise FileNotFoundError("no incident database")
             return IncidentStore(path)
 
+    specs = default_capabilities(
+        config, incident_probe=incident_probe_for(store_factory)
+    )
+    if product is not None:
+        from openjarvis.wiz.product import product_capabilities
+
+        specs.extend(
+            product_capabilities(
+                pipeline_available=lambda: _product_available(product),
+                memory_available=lambda: _memory_available(product),
+            )
+        )
+
     return WizRuntime(
         policy=resolved_policy,
-        registry=CapabilityRegistry(
-            default_capabilities(
-                config, incident_probe=incident_probe_for(store_factory)
-            )
-        ),
+        registry=CapabilityRegistry(specs),
         journal=resolved_journal,
         store_factory=store_factory,
         config=config,
+        product=product,
     )
+
+
+def _product_available(product: Any) -> Availability:
+    """Whether Wiz can actually build something right now.
+
+    Three separate things have to be true, and the answer names which one is
+    missing rather than saying "unavailable": an operator whose ``claude`` CLI
+    has logged out deserves to be told that, not to be told Wiz cannot build
+    features.
+    """
+    pipeline = getattr(product, "pipeline", None)
+    if pipeline is None:
+        return Availability.missing("no engineering target is configured")
+
+    profile = getattr(pipeline, "profile", None)
+    if profile is None or not getattr(profile, "complete", False):
+        return Availability.missing(
+            "the target repository has no test command, so I could not prove "
+            "anything I built"
+        )
+
+    engineer = getattr(pipeline, "engineer", None)
+    if engineer is not None:
+        try:
+            if not engineer.available():
+                return Availability.missing(
+                    "the 'claude' CLI is not available, and it is the only thing "
+                    "here that writes code"
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            return Availability.missing(f"I cannot reach the coding engine: {exc}")
+
+    return Availability.ready(f"target '{profile.name}' is ready to build")
+
+
+def _memory_available(product: Any) -> Availability:
+    if getattr(product, "pipeline", None) is None:
+        return Availability.missing("no engineering target is configured")
+    return Availability.ready()
 
 
 def operator(channel: Channel, actor_id: str = "operator") -> Actor:
