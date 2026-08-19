@@ -57,8 +57,14 @@ def product_intent_rules() -> List[IntentRule]:
     return [
         intent_rule(
             "feature.request",
-            r"^\s*(please\s+)?(build|make|add|create|implement|write)\b|"
-            r"\b(can you (build|make|add|create)|i want|i'd like|we need)\b",
+            # The optional address is not decoration. §25's own example is
+            # "Sir, add export to reports", and an anchor that demands the verb
+            # first classifies the brief's example as unrecognised — which is
+            # how a channel ends up feeling broken while every test passes.
+            r"^\s*(sir|hey wiz|ok wiz|wiz)?[,:\s]*(please\s+)?"
+            r"(build|make|add|create|implement|write)\b|"
+            r"\b(can you (build|make|add|create)|i want|i'd like|"
+            r"i would like|we need)\b",
             weight=12,
         ),
         intent_rule(

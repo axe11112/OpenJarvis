@@ -133,6 +133,13 @@ class TestClassification:
             "Make onboarding easier",
             "Can you build a comparison between two swimmers",
             "I'd like a better mobile dashboard",
+            # The brief's own examples. An anchor demanding the verb first
+            # classified these as unrecognised, which is how a channel ends up
+            # feeling broken while every test passes.
+            "Sir, add export to reports",
+            "Wiz, build a coach weekly summary",
+            "please add a download button",
+            "We need a comparison between two swimmers",
         ],
     )
     def test_a_request_to_build_is_recognised(self, text):
