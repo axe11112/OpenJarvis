@@ -759,3 +759,105 @@ class TestAudit:
         pipeline.run(feature.id)
         intact, break_at = journal.verify()
         assert intact, f"the audit chain broke at {break_at}"
+
+
+class TestReadyOpensAPullRequestAndNothingMore:
+    class FakeShipper:
+        def __init__(self):
+            self.opened = []
+            self.merged = []
+
+        def open_pull_request(self, feature):
+            self.opened.append(feature.id)
+            feature.pr_url = "https://github.com/a/b/pull/7"
+            feature.pr_number = 7
+            return {"created": True, "url": feature.pr_url, "number": 7}
+
+    def test_a_ready_feature_gets_a_pull_request(self, tmp_path, clock):
+        shipper = self.FakeShipper()
+        pipeline = build_pipeline(tmp_path, clock)
+        pipeline.shipper = shipper
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert shipper.opened == [feature.id]
+        assert result.pr_url.endswith("/pull/7")
+
+    def test_a_feature_that_did_not_reach_ready_gets_no_pull_request(
+        self, tmp_path, clock
+    ):
+        shipper = self.FakeShipper()
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            suite_results=[FakeCheckResult(passed=False, summary="broken")],
+            max_attempts=1,
+        )
+        pipeline.shipper = shipper
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        assert shipper.opened == []
+
+    def test_the_pipeline_never_merges_anything(self):
+        # Merging is a separate authority and this module does not hold it.
+        import inspect
+
+        from openjarvis.wiz.features import pipeline as module
+
+        source = inspect.getsource(module)
+        assert "merge_pull_request" not in source
+        assert ".merge(" not in source
+
+    def test_a_shipper_that_fails_does_not_undo_ready(self, tmp_path, clock):
+        class Broken:
+            def open_pull_request(self, feature):
+                raise RuntimeError("403 Forbidden")
+
+        pipeline = build_pipeline(tmp_path, clock)
+        pipeline.shipper = Broken()
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+
+
+class TestTheReviewIsAdvisory:
+    class DisapprovingReviewer:
+        def __init__(self):
+            self.calls = []
+
+        def review(self, feature, *, workspace, worktree=None):
+            self.calls.append(feature.id)
+            return {
+                "ran": True,
+                "text": "This is a critical problem and must not ship.",
+                "blocking_suggested": True,
+            }
+
+    def test_a_disapproving_review_does_not_stop_a_verified_feature(
+        self, tmp_path, clock
+    ):
+        reviewer = self.DisapprovingReviewer()
+        pipeline = build_pipeline(tmp_path, clock)
+        pipeline.reviewer = reviewer
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert reviewer.calls == [feature.id]
+        assert result.metadata["review"]["blocking_suggested"] is True
+
+    def test_a_review_never_runs_on_a_change_that_failed_its_checks(
+        self, tmp_path, clock
+    ):
+        # A review is expensive and there is one Claude slot. Reviewing a change
+        # that already failed its tests spends it on a foregone conclusion.
+        reviewer = self.DisapprovingReviewer()
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            suite_results=[FakeCheckResult(passed=False, summary="broken")],
+            max_attempts=1,
+        )
+        pipeline.reviewer = reviewer
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        assert reviewer.calls == []

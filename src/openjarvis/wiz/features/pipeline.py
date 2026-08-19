@@ -139,6 +139,10 @@ class FeaturePipeline:
     #: Advisory only. Deterministic gates remain authoritative.
     reviewer: Any = None
 
+    #: Opens the pull request when a feature reaches READY. Merging is a
+    #: separate authority this pipeline never exercises.
+    shipper: Any = None
+
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     clock: Callable[[], str] = _now
 
@@ -518,9 +522,10 @@ class FeaturePipeline:
             # Advisory. A review that dislikes the change is recorded and shown
             # to the operator; it does not overrule a contract that passed, and
             # it cannot pass one that failed.
+            worktree = self._worktree_for(feature)
             try:
                 feature.metadata["review"] = self.reviewer.review(
-                    feature, workspace=self._worktree_for(feature).path
+                    feature, workspace=worktree.path, worktree=worktree
                 )
             except Exception as exc:  # pragma: no cover - advisory
                 logger.warning("the review session failed: %s", exc)
@@ -537,12 +542,32 @@ class FeaturePipeline:
             )
 
         self._transition(feature, FeatureState.READY, verification.summary())
+        pr = self._open_pull_request(feature)
         self._release(feature)
-        return StepResult(
-            feature,
-            progressed=False,
-            message=f"Sir, {feature.title} is ready. Preview: {feature.preview_url}",
-        )
+
+        message = f"Sir, {feature.title} is ready. Preview: {feature.preview_url}"
+        if pr.get("url"):
+            message += f" — pull request: {pr['url']}"
+        return StepResult(feature, progressed=False, message=message)
+
+    def _open_pull_request(self, feature: FeatureRequest) -> Dict[str, Any]:
+        """Open the pull request, if there is a shipper and it is permitted.
+
+        Opening one is where Wiz's autonomy over a feature ends by default.
+        Merging is a different authority, deliberately not exercised here — see
+        :mod:`openjarvis.wiz.features.shipping`.
+        """
+        if self.shipper is None:
+            return {}
+        try:
+            result = self.shipper.open_pull_request(feature)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("could not open a pull request: %s", exc)
+            return {}
+        self.store.save(feature)
+        if result.get("created"):
+            self._record(feature, "feature.pr_created", str(result.get("url", "")))
+        return result
 
     # -- the iterative loop -------------------------------------------------
 
