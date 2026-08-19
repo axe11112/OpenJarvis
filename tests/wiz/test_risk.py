@@ -162,3 +162,48 @@ class TestApprovalGate:
 
     def test_medium_risk_does_not(self):
         assert not classify(paths=["src/lib/format.ts"]).requires_approval
+
+
+class TestDomainWordsAreNotAuthWords:
+    """A false HIGH on every request is a false HIGH nobody reads.
+
+    Found by running the pilot: in a swim-training product almost every
+    request mentions "sessions", and bare ``session`` in the word list made
+    almost everything need an approval. An approval that appears on everything
+    is one the operator learns to click through without reading, which is worse
+    than not asking.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Make weekly_distance skip sessions that are marked as skipped",
+            "Show the number of training sessions this week",
+            "Let a coach add a session to the plan",
+        ],
+    )
+    def test_a_training_session_is_not_an_authentication_session(self, text):
+        assert classify_text(text).risk is not Risk.HIGH, text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Make the user session expire after an hour",
+            "Store the session token in a cookie",
+            "Change how the auth session is refreshed",
+            "Increase the session timeout",
+            "Fix session_id handling",
+        ],
+    )
+    def test_an_authentication_session_is_still_high(self, text):
+        assert classify_text(text).risk is Risk.HIGH, text
+
+    def test_the_path_still_decides_whatever_the_request_called_it(self):
+        # The word list is the weaker signal and always was. A change to the
+        # session module is HIGH because of where it lands, not because of how
+        # it was described.
+        assessment = classify(
+            text="tidy up the training session helper",
+            paths=["src/lib/auth/session.ts"],
+        )
+        assert assessment.risk is Risk.HIGH

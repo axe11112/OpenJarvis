@@ -67,7 +67,18 @@ MEDIUM_RISK_PATHS: List[Pattern[str]] = _patterns(
 #: Requests whose wording alone makes them HIGH.
 HIGH_RISK_WORDS: List[Pattern[str]] = _patterns(
     r"\b(auth|authentication|authoris|authoriz|permission|role|rbac)\w*",
-    r"\b(login|log in|sign in|signup|sign up|password|session|token)\w*",
+    r"\b(login|log in|sign in|signup|sign up|password|token)\w*",
+    # "Session" only when it is an *auth* session. Bare ``session`` was in the
+    # line above, and in a swim-training product every other request mentions
+    # training sessions — which meant almost everything needed an approval, and
+    # an approval that appears on everything is one the operator learns to click
+    # through without reading. The path patterns still catch
+    # ``src/lib/auth/session.ts`` whatever the request called it, and paths are
+    # the stronger signal of the two.
+    r"\b(user|auth\w*|login|browser|http|cookie|admin)\s+sessions?\b",
+    r"\bsessions?\s+(token|cookie|id|store|storage|management|expir\w+|"
+    r"timeout|hijack\w*)\b",
+    r"\bsession[_-]?(id|token|cookie)\b",
     r"\b(payment|billing|stripe|checkout|subscription|invoice)\w*",
     r"\b(migration|schema|database table|rls|row level security)\w*",
     r"\b(secret|credential|api key|private key)\w*",

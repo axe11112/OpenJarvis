@@ -453,9 +453,33 @@ class FeaturePipeline:
 
         message = _commit_message(feature)
         attempt.commit_sha = self.workspace.commit_all(worktree, message)
-        self.workspace.push(worktree, remote=self.push_remote)
         attempt.succeeded = False  # not yet: the preview has to agree
         self.store.save(feature)
+
+        if self.preview is None:
+            # Nothing would ever look at the pushed branch, and pushing is not
+            # free: it makes the work visible to CI and to anybody watching the
+            # repository. A machine with no preview provider stops here, with
+            # the change committed locally and an honest account of why.
+            return self._stop(
+                feature,
+                "I have no way to see a preview of this, so I cannot prove it "
+                f"works. The change is committed on {feature.branch} and the "
+                "checks passed.",
+                kind="feature.no_preview_provider",
+            )
+
+        try:
+            self.workspace.push(worktree, remote=self.push_remote)
+        except Exception as exc:
+            # Not a retry: pushing again would fail the same way, and another
+            # coding session cannot fix a credential.
+            return self._stop(
+                feature,
+                f"I built this and the checks passed, but I could not push the "
+                f"branch: {exc}",
+                kind="feature.push_failed",
+            )
 
         self._transition(feature, FeatureState.PREVIEWING, "pushed for a preview")
         return StepResult(feature, message="Creating Preview...")

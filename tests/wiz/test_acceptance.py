@@ -312,3 +312,56 @@ class TestSerialisation:
         )
         assert len(parsed) == 1
         assert parsed[0].text == "Hi"
+
+
+class TestWhatThePilotFound:
+    """Cases from the first real run against a real repository."""
+
+    def test_a_python_backend_change_gets_no_browser_criteria(self):
+        # The pilot request. The first version of the word list read "render"
+        # and gave this three browser criteria against a route that does not
+        # exist — which no amount of correct code could ever satisfy, so the
+        # feature could never reach READY and would look broken.
+        contract = contract_for(
+            feature_id="FEAT-00001",
+            request=(
+                "Add a render_footer function to the report module that "
+                "returns a dash rule, with a test"
+            ),
+            plan=(
+                "I would add render_footer to src/report.py next to "
+                "render_header, which renders the header text, and display "
+                'the result. The docstring says "The top line of a report".'
+            ),
+            gates=["test"],
+        )
+        assert contract.browser_criteria == ()
+        assert contract.gates == ("test",)
+
+    def test_the_plan_cannot_turn_a_backend_change_into_a_ui_change(self):
+        # A plan is prose a model wrote about a codebase: it mentions
+        # rendering, it quotes identifiers, and it talks about the page a
+        # change is near. Reading it here is how the above happened.
+        contract = contract_for(
+            feature_id="FEAT-2",
+            request="bump the retry backoff constant",
+            plan="This affects the dashboard page and the button that renders it.",
+        )
+        assert contract.browser_criteria == ()
+
+    def test_an_apostrophe_is_not_a_quoted_label(self):
+        # "the operator's phrasing (see below)" became a criterion demanding
+        # the page contain "s phrasing (".
+        contract = contract_for(
+            feature_id="FEAT-3",
+            request="Fix the dashboard so it uses the operator's phrasing (see below)",
+        )
+        for criterion in contract.criteria:
+            assert "s phrasing" not in criterion.text
+
+    def test_a_genuinely_quoted_label_still_works(self):
+        contract = contract_for(
+            feature_id="FEAT-4",
+            request='Add a "Download report" button to /coach/summary',
+        )
+        assert any(c.text == "Download report" for c in contract.criteria)

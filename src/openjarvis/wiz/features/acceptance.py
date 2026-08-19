@@ -470,16 +470,23 @@ class AcceptanceContract:
 #: Route mentioned explicitly in a request or plan: ``/coach/summary``.
 _ROUTE = re.compile(r"(?<![\w/])(/[a-z0-9][a-z0-9/_-]*)")
 
-#: Phrases that mean the change has a user interface. Deliberately broad: a
-#: false positive costs a browser check on a page that was going to be checked
-#: anyway; a false negative ships an unverified UI.
+#: Nouns that mean a user interface, and only a user interface.
+#:
+#: The first version of this list included the verbs — ``show``, ``render``,
+#: ``display`` — and the generic nouns ``text``, ``view``, ``title``. It read
+#: "add a render_footer function to the report module" as a UI change and gave
+#: it three browser criteria against a route that does not exist, which no
+#: amount of correct code could ever satisfy. A false negative here costs an
+#: unverified UI; a false positive costs a feature that can never reach READY,
+#: which is worse, because it is indistinguishable from the feature being
+#: broken.
 _UI_WORDS = re.compile(
-    r"\b(button|page|screen|view|dashboard|panel|modal|dialog|form|menu|nav|"
-    r"navigation|banner|card|chart|graph|table|list|tab|tooltip|badge|layout|"
-    r"header|heading|footer|sidebar|ui|interface|display|show|render|colour|"
-    r"color|style|css|responsive|mobile|desktop|onboarding|empty state|"
-    r"title|label|link|icon|toggle|dropdown|checkbox|input|field|section|"
-    r"widget|avatar|breadcrumb|placeholder|spinner|skeleton|image|text)\b",
+    r"\b(button|page|screen|dashboard|panel|modal|dialog|form|menu|navbar|"
+    r"navigation|banner|card|chart|graph|tooltip|badge|layout|"
+    r"header|heading|footer|sidebar|ui|interface|colour|color|css|"
+    r"stylesheet|responsive|mobile|desktop|onboarding|empty state|"
+    r"dropdown|checkbox|toggle|avatar|breadcrumb|spinner|skeleton|"
+    r"landing|hero|sign-?up|sign-?in|login screen)\b",
     re.IGNORECASE,
 )
 
@@ -490,7 +497,11 @@ _API_WORDS = re.compile(
 
 #: Quoted text in a request is almost always the literal string the operator
 #: wants to see: *add a "Download report" button*.
-_QUOTED = re.compile(r"[\"“']([^\"”']{2,60})[\"”']")
+#:
+#: Double quotes only. A single quote is an apostrophe far more often than it
+#: is a delimiter, and treating it as one turned "the operator's phrasing (see
+#: below)" into a criterion demanding the page contain ``s phrasing (``.
+_QUOTED = re.compile(r"[\"“]([^\"”]{2,60})[\"”]")
 
 
 def _first_route(*sources: str) -> str:
@@ -531,7 +542,6 @@ def contract_for(
     because the script does not exist.
     """
     criteria: List[Criterion] = []
-    corpus = f"{request}\n{plan}"
 
     for gate in gates:
         name = str(gate).strip()
@@ -545,11 +555,16 @@ def contract_for(
             )
         )
 
-    is_ui = touches_ui if touches_ui is not None else bool(_UI_WORDS.search(corpus))
-    resolved_route = route or _first_route(request, plan) or ("/" if is_ui else "")
+    # Both of these read the *request*, never the plan. A plan is prose written
+    # by a model about a codebase: it mentions rendering, it quotes identifiers,
+    # and it will talk about the page a change is near even when the change is
+    # in a Python module. Reading it here is how a backend change acquires
+    # browser criteria that nothing could ever satisfy.
+    is_ui = touches_ui if touches_ui is not None else bool(_UI_WORDS.search(request))
+    resolved_route = route or _first_route(request) or ("/" if is_ui else "")
 
     if is_ui:
-        labels = _quoted_labels(request) or _quoted_labels(plan)
+        labels = _quoted_labels(request)
         for label in labels[:3]:
             criteria.append(
                 Criterion(
@@ -593,7 +608,7 @@ def contract_for(
             )
         )
 
-    if _API_WORDS.search(corpus) and not is_ui:
+    if _API_WORDS.search(request) and not is_ui:
         # An API change with no route named cannot be turned into a check
         # automatically. Say so as a MANUAL criterion rather than inventing an
         # endpoint: an invented endpoint check passes against a 404 handler.
