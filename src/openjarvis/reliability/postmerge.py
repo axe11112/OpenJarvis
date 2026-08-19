@@ -366,6 +366,26 @@ class PostMergeVerifier:
         result = PostMergeResult(deployment=observation)
 
         # 1. The original reproduction, against production.
+        #
+        # Its absence is a refusal, not a step to skip. ``spec`` defaults to
+        # None the whole way up the call chain from ``RepairEngine``, and
+        # without it step 3 of this module's contract simply does not happen —
+        # yet the old code fell through to the fleet loop and, with an empty
+        # fleet, reported "reproduction and 0 production probe(s) all pass".
+        # That is a RESOLVED incident, a "Sir, it's fixed" notification, and a
+        # site that was never looked at.
+        if spec is None:
+            result.verified = False
+            result.reason = (
+                "the probe that opened this incident was not supplied to "
+                "post-merge verification, so the original reproduction was "
+                "never re-run against production; nothing here can say the "
+                "merge fixed anything"
+            )
+            result.rule = "reproduction_unavailable"
+            self._record(incident, result)
+            return result
+
         if spec is not None:
             result.reproduction = self._run_probe(
                 spec, target_url=target_url, incident_id=incident.id
@@ -393,7 +413,23 @@ class PostMergeVerifier:
 
         # 2. The rest of the fleet. A fix that repairs one page and breaks
         #    another is not a fix, and only the fleet can say so.
-        for fleet_spec in self._fleet(exclude=getattr(spec, "id", "")):
+        #
+        # A fleet that could not be loaded is unknown, not empty. Returning []
+        # on a provider error made "the fleet raised" and "no other probes are
+        # configured" the same value, and only one of those is evidence.
+        fleet_specs = self._fleet(exclude=getattr(spec, "id", ""))
+        if fleet_specs is None:
+            result.verified = False
+            result.reason = (
+                "the production probe fleet could not be loaded, so a fix that "
+                "repaired this page while breaking another would not be seen; "
+                "production is unverified rather than well"
+            )
+            result.rule = "fleet_unavailable"
+            self._record(incident, result)
+            return result
+
+        for fleet_spec in fleet_specs:
             outcome = self._run_probe(
                 fleet_spec, target_url=target_url, incident_id=incident.id
             )
@@ -417,9 +453,7 @@ class PostMergeVerifier:
                 )
                 result.rule = "fleet_slow_unconfirmed"
             else:
-                result.reason = (
-                    "production probe(s) failed after the merge: " + named
-                )
+                result.reason = "production probe(s) failed after the merge: " + named
                 result.rule = "fleet_failed"
             self._record(incident, result)
             return result
@@ -520,15 +554,20 @@ class PostMergeVerifier:
 
     # -- probes -----------------------------------------------------------
 
-    def _fleet(self, *, exclude: str = "") -> List[Any]:
-        """Enabled production probe specs, minus the reproduction already run."""
+    def _fleet(self, *, exclude: str = "") -> Optional[List[Any]]:
+        """Enabled production probe specs, minus the reproduction already run.
+
+        ``None`` means the fleet could not be determined, which the caller
+        treats as a refusal. An empty list still means what it says — no other
+        probes are configured — and remains a legitimate verification.
+        """
         if self.fleet_provider is None:
             return []
         try:
             specs = list(self.fleet_provider() or [])
         except Exception:  # noqa: BLE001
             logger.exception("post-merge: could not load the production probe fleet")
-            return []
+            return None
         return [
             s
             for s in specs

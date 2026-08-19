@@ -506,7 +506,9 @@ class TestLatencyConfirmation:
         inner = _SlowThenFastVerifier("signup", slow_runs=1)
         verifier = _slow_verifier(inner, store=store)
         incident = _incident(store)
-        result = verifier.verify(incident, merge_record=_record(), spec=_Spec("homepage"))
+        result = verifier.verify(
+            incident, merge_record=_record(), spec=_Spec("homepage")
+        )
 
         assert result.verified, result.reason
         assert inner.runs["signup"] == 2
@@ -560,11 +562,15 @@ class TestLatencyConfirmation:
                 self.runs += 1
                 if self.runs == 1:
                     return VerificationResult(
-                        passed=False, probe_id=spec.id, failure_kind="slow",
+                        passed=False,
+                        probe_id=spec.id,
+                        failure_kind="slow",
                         actual="over budget",
                     )
                 return VerificationResult(
-                    passed=False, probe_id=spec.id, failure_kind="assertion",
+                    passed=False,
+                    probe_id=spec.id,
+                    failure_kind="assertion",
                     actual="the signup form is gone",
                 )
 
@@ -591,3 +597,45 @@ class TestLatencyConfirmation:
         )
         assert not result.verified
         assert result.rule == "reproduction_slow_unconfirmed"
+
+
+class TestNothingCheckedIsNotVerified:
+    """Production cannot be proved by checks that did not run.
+
+    Both cases below used to reach ``verified=True`` — one reporting
+    "reproduction and 0 production probe(s) all pass" for a site nothing had
+    looked at. That verdict resolves the incident and sends the owner "it's
+    fixed", so a vacuous pass here is worse than a crash.
+    """
+
+    def test_a_missing_reproduction_refuses(self, store):
+        """``spec`` defaults to None the whole way up from ``RepairEngine``."""
+        incident = _incident(store)
+        verifier = _verifier(store=store, fleet=())
+        result = verifier.verify(incident, merge_record=_record(), spec=None)
+        assert not result.verified
+        assert result.rule == "reproduction_unavailable"
+
+    def test_a_fleet_that_could_not_be_loaded_refuses(self, store):
+        """Unknown is not empty: only one of the two is evidence."""
+
+        def _explodes():
+            raise RuntimeError("probe registry unavailable")
+
+        incident = _incident(store)
+        verifier = _verifier(store=store)
+        verifier.fleet_provider = _explodes
+        result = verifier.verify(
+            incident, merge_record=_record(), spec=_Spec("homepage")
+        )
+        assert not result.verified
+        assert result.rule == "fleet_unavailable"
+
+    def test_a_genuinely_empty_fleet_still_verifies(self, store):
+        """A single-probe target is a configuration, not a failure."""
+        incident = _incident(store)
+        verifier = _verifier(store=store, fleet=())
+        result = verifier.verify(
+            incident, merge_record=_record(), spec=_Spec("homepage")
+        )
+        assert result.verified
