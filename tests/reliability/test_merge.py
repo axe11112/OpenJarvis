@@ -401,6 +401,41 @@ class TestLocalCheckGates:
 # ---------------------------------------------------------------------------
 
 
+class TestSecurityAdjacentCodeIsMergedByAHuman:
+    """`assess_scope` permits auth/session/permission/role changes on purpose —
+    refusing them would make JARVIS unable to repair a login failure, which is
+    the class of bug it exists for. The pull request body tells the owner the
+    bargain: "JARVIS is permitted to change it, but it is never deployed
+    automatically and deserves a careful read."
+
+    Automatic merge arrived later and did not consult `review_required`, so with
+    deploy-on-merge that sentence had stopped being true.
+    """
+
+    def test_a_diff_touching_session_code_is_not_merged_automatically(self):
+        attempt = _attempt(scope=_scope(review_required=["src/lib/session.ts"]))
+        incident = _incident()
+        incident.attempts = [attempt]
+        decision = _decide(incident=incident, attempt=attempt)
+        assert _refused(decision, "no_security_adjacent_paths")
+        assert "a human merges this one" in decision.reason
+
+    def test_a_lockfile_change_is_not_merged_automatically(self):
+        """The supply-chain half, which `assess_scope` does not report.
+
+        `may_deploy` has always refused a manifest change; automatic merge
+        landed one. With deploy-on-merge those are the same act.
+        """
+        attempt = _attempt(changed_files=["package-lock.json"])
+        incident = _incident()
+        incident.attempts = [attempt]
+        decision = _decide(incident=incident, attempt=attempt)
+        assert _refused(decision, "no_security_adjacent_paths")
+
+    def test_an_ordinary_diff_is_unaffected(self):
+        assert _decide().allowed
+
+
 class TestScopeAndSecurityGates:
     def test_a_scope_violation_is_no_merge(self):
         incident = _incident()

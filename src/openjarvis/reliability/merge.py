@@ -119,6 +119,7 @@ _ATTEMPT_GATES = frozenset(
         "scope",
         "no_protected_paths",
         "no_secret_like_paths",
+        "no_security_adjacent_paths",
         "preview_deployment",
         "original_reproduction",
     }
@@ -424,6 +425,47 @@ def evaluate_merge(
             "touches secret-like path(s): " + ", ".join(secret_like)
             if secret_like
             else "no secret-like paths touched",
+        )
+
+        # -- 4b. security-adjacent code is repaired, but not merged alone --
+        #
+        # ``assess_scope`` deliberately does *not* refuse a diff touching auth,
+        # session, permission or role code: refusing would make JARVIS unable to
+        # repair a login failure, which is the exact class of bug it exists for.
+        # The bargain it strikes instead is written into the pull request body
+        # the owner reads — "JARVIS is permitted to change it, but it is never
+        # deployed automatically and deserves a careful read".
+        #
+        # Automatic merge was added later and did not know about that promise.
+        # With deploy-on-merge configured, merging *is* deploying, so the gates
+        # were quietly contradicting the text. Keeping the promise is the
+        # cheaper half of the fix: the repair still happens, the pull request is
+        # still opened, and a human spends thirty seconds on the one category of
+        # change where their reading is worth most.
+        # Two signals, unioned, because the two halves of "a human should read
+        # this" were written in different places and neither is a superset.
+        # ``assess_scope`` contributes auth/session/permission/role; the deploy
+        # policy contributes those plus dependency manifests, which is the
+        # supply-chain half — a lockfile edit that automatic merge would have
+        # landed and automatic deploy would have refused. Sharing
+        # ``SafetyPolicy._sensitive_paths`` keeps merge and deploy from drifting
+        # apart again, which is how this gap opened in the first place.
+        from openjarvis.reliability.policy import SafetyPolicy
+
+        sensitive = set(scope.get("review_required") or [])
+        sensitive |= set(SafetyPolicy._sensitive_paths(attempt.changed_files or []))
+        review_required = sorted(sensitive)
+        gate(
+            "no_security_adjacent_paths",
+            not review_required,
+            (
+                "touches security-adjacent path(s): "
+                + ", ".join(review_required)
+                + " — repaired and opened as a pull request, but a human merges "
+                "this one"
+            )
+            if review_required
+            else "no security-adjacent paths touched",
         )
 
         # -- 5. the local gates all ran and all passed --------------------
