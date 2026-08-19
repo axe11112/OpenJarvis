@@ -448,6 +448,33 @@ them is combined with automatic repair.
 
 ---
 
+## 15b. Fail-closed, and what changed
+
+Several safety checks were written so that the thing that decides *whether* to
+check could quietly answer "no". Since a refusal is expressed by a check
+failing, a check that never ran was indistinguishable from one that passed.
+Each of these is now a refusal, and each has a test that fails if the
+precondition comes back.
+
+| Was | Is |
+|---|---|
+| `base_unchanged` was skipped when neither base SHA was known — which is what a failed GitHub read produces | Unknown refuses. Not knowing where the base is, is not evidence it has not moved |
+| `original_reproduction` was skipped when the incident had no `probe_id` — every incident opened from a Vercel or Supabase signal | Refuses. A detection that cannot be re-run cannot be shown to be fixed by re-running it |
+| A gate added inside an `if` could vanish silently | `gates_complete` enumerates the expected gates and refuses, naming any that did not run |
+| Auth, session, permission, role and dependency-manifest changes were auto-merged | Refused. The pull request body already promised the owner these are never deployed automatically, and `may_deploy` already honoured it; merge now does too |
+| Post-merge verification reported success with an unloadable probe fleet, or with no reproduction supplied | Both refuse. A fleet that could not be loaded is unknown, not empty |
+| A broken secret or injection scanner returned "clean" | Falls back to the same pattern tables; if even those are unreachable, the briefing is refused |
+| `BoundaryGuard` silently passes text through when its scanners are missing, and does not raise | `CredentialStripper` now always runs after it. If nothing can redact, the body is withheld |
+| Durable state was written with `write_text`, which truncates first | Written atomically. A sleep mid-write no longer empties the notification ledger and re-announces everything |
+| Call suppression lived only in memory | Persisted beside the incident database, in wall-clock, so a restart does not ring the owner again |
+| `MERGED` counted as a closed, human-free success | Excluded from the rate and reported as `merged_awaiting_production` |
+
+None of these makes JARVIS repair less. Every one of them makes it *claim*
+less: the repair still runs, the pull request is still opened, and the only
+step that now waits more often is the last unattended one.
+
+---
+
 ## 16. What is proven, and what is not
 
 **Proven** by `tests/reliability/test_watch_e2e.py`, driving the real monitor,
