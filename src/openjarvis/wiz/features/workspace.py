@@ -138,6 +138,7 @@ class FeatureWorkspace:
         target = Path(self.root) / name
         self._assert_safe(target)
 
+        self._forget_stale_worktrees()
         worktree = self._inner.create(name, base_ref=base_ref)
 
         # Re-checked after the fact: the value that matters is the path the
@@ -150,6 +151,28 @@ class FeatureWorkspace:
             worktree.base_commit[:12],
         )
         return worktree
+
+    def _forget_stale_worktrees(self) -> None:
+        """Drop git's record of worktrees whose directories are gone.
+
+        Git keeps a registration per worktree, and a directory removed out from
+        under it — a killed process, a cleaned temp directory, an operator
+        tidying up — leaves the registration behind. The branch then counts as
+        checked out somewhere, so deleting it fails, so ``worktree add -b``
+        fails, and the feature becomes unrecoverable with a git error the
+        operator cannot act on.
+
+        Pruning first costs a fast git call and turns "this feature can never be
+        retried" into "this feature can be retried". Only stale entries are
+        touched: a worktree that still exists is not pruned, so a build in
+        progress elsewhere is unaffected.
+        """
+        from openjarvis.reliability.workspace import git_output
+
+        try:
+            git_output(["worktree", "prune"], cwd=self.repo_path, check=False)
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("could not prune stale worktrees", exc_info=True)
 
     # -- delegation --------------------------------------------------------
 

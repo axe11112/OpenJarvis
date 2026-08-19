@@ -241,7 +241,7 @@ class FeaturePipeline:
             logger.exception("feature %s failed during %s", feature.id, feature.state)
             return self._stop(
                 feature,
-                f"something went wrong while working on this: {exc}",
+                _plain_failure(exc),
                 kind="feature.failed",
             )
 
@@ -838,6 +838,32 @@ def _brief_for(feature: FeatureRequest) -> str:
     if feature.desired_outcome and feature.desired_outcome != feature.operator_request:
         lines.append(f"What should be true afterwards: {feature.desired_outcome}")
     return "\n".join(lines)
+
+
+def _plain_failure(exc: Exception) -> str:
+    """What the operator is told when something unexpected went wrong.
+
+    The full exception is logged and journalled; what reaches the operator is a
+    sentence they can act on. A dump of `git worktree add -b ... failed (255)`
+    is precise and useless: it tells somebody who is not looking at the code
+    nothing about what to do, and §34 asks for simple English.
+    """
+    from openjarvis.reliability.workspace import WorkspaceError
+
+    if isinstance(exc, WorkspaceError):
+        return (
+            "I could not set up a clean copy of the repository to work in, so "
+            "I have not changed anything. It usually means a previous attempt "
+            "left something behind."
+        )
+    if isinstance(exc, (OSError, PermissionError)):
+        return (
+            "I could not read or write something on disk, so I have stopped "
+            "before changing anything."
+        )
+    # Anything genuinely unforeseen. One line, and the detail is in the log.
+    first = str(exc).strip().split("\n", 1)[0]
+    return f"Something went wrong and I have stopped: {first[:160]}"
 
 
 def _checks_record(result: Any) -> Dict[str, Any]:

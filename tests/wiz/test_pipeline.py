@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List
 
 import pytest
@@ -917,3 +918,68 @@ class TestTheEvidenceAGateProduces:
         from openjarvis.wiz.features.shipping import pull_request_body
 
         assert "tests: passed" in pull_request_body(result)
+
+
+class TestRecoveringFromAMess:
+    def test_a_git_failure_is_explained_in_words_a_person_can_act_on(
+        self, tmp_path, clock
+    ):
+        # A dump of `git worktree add -b ... failed (255)` is precise and
+        # useless to somebody who is not reading the code.
+        from openjarvis.reliability.workspace import WorkspaceError
+
+        class Broken(FakeWorkspace):
+            def create(self, feature_id, *, title="", base_ref="HEAD"):
+                raise WorkspaceError(
+                    "git worktree add -b wiz/feature/X /tmp/x abc failed (255): "
+                    "fatal: a branch named 'wiz/feature/X' already exists"
+                )
+
+        pipeline = build_pipeline(tmp_path, clock, workspace=Broken(tmp_path))
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        message = result.history[-1]["reason"]
+        assert "git worktree" not in message
+        assert "clean copy of the repository" in message
+        assert "not changed anything" in message
+
+    def test_a_stale_worktree_registration_is_pruned_before_creating(self, tmp_path):
+        # Git keeps a registration per worktree; a directory removed out from
+        # under it leaves one behind, and then the branch counts as checked out
+        # somewhere and the feature can never be retried.
+        import subprocess
+
+        from openjarvis.wiz.features.workspace import FeatureWorkspace
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        def run(*args):
+            return subprocess.run(
+                ["git", *args], cwd=repo, capture_output=True, text=True, check=True
+            )
+
+        run("init", "-q", ".")
+        run("config", "user.email", "w@example.com")
+        run("config", "user.name", "W")
+        (repo / "a.txt").write_text("hello")
+        run("add", "-A")
+        run("commit", "-qm", "first")
+
+        workspace = FeatureWorkspace(
+            repo_path=str(repo),
+            root=str(tmp_path / "worktrees"),
+            git_identity=("W", "w@example.com"),
+        )
+        first = workspace.create("FEAT-00001", title="a thing")
+
+        # Simulate the crash: the directory vanishes, git's record does not.
+        import shutil
+
+        shutil.rmtree(first.path)
+
+        # Without the prune this raises "a branch named ... already exists".
+        second = workspace.create("FEAT-00001", title="a thing")
+        assert second.branch == first.branch
+        assert Path(second.path).is_dir()
