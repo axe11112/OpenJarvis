@@ -33,72 +33,77 @@ from openjarvis.wiz.features.model import FeatureRequest, FeatureState, Priority
 from openjarvis.wiz.typed_memory import MemoryCategory, MemorySource, TypedMemoryStore
 
 
+@pytest.fixture
+def pilot_feature() -> FeatureRequest:
+    """Pilot feature: dark mode toggle for Control Center."""
+    return FeatureRequest(
+        id="WIZE-PILOT-001",
+        title="Add Dark Mode Toggle to Control Center",
+        operator_request="Add a UI toggle in the Control Center header to switch between light and dark themes. Save preference to localStorage.",
+        desired_outcome="Users can click toggle in Control Center header. Theme switches instantly. Preference persists across sessions.",
+        source="wiz_pilot",
+        actor_id="wiz_autonomy",
+        target="wize",
+        repository="owner/wize",
+        priority=Priority.P3,
+        state=FeatureState.RECEIVED,
+        risk="LOW",
+    )
+
+
+@pytest.fixture
+def configured_target() -> ConfiguredTarget:
+    """Wize repository configuration."""
+    return ConfiguredTarget(
+        repository="owner/wize",
+        target_branch="main",
+        branch_prefix="wiz/",
+        environment=Environment.STAGING,
+        approval_gate=ApprovalGate.SINGLE_REVIEW,
+        can_modify_source=True,
+        can_run_integration_tests=False,
+        test_command="npm test",
+        max_implementation_time=3600,
+    )
+
+
+@pytest.fixture
+def mock_claude_executor() -> MagicMock:
+    """Mock Claude CLI that returns realistic session result."""
+    executor = MagicMock(spec=ClaudeCliExecutor)
+    executor.get_diagnostics.return_value = ClaudeDiagnostics(
+        available=True,
+        availability=ClaudeAvailability.AVAILABLE,
+        cli_found=True,
+        cli_path="/usr/local/bin/claude",
+        authenticated=True,
+        version="1.0.0",
+    )
+    executor.execute_session.return_value = SessionResult(
+        success=True,
+        session_id="pilot-session-001",
+        returncode=0,
+        stdout="Session created and executed successfully",
+    )
+    return executor
+
+
+@pytest.fixture
+def metrics_store(tmp_path: Path) -> AutonomyMetricsStore:
+    """Autonomy metrics store."""
+    db_path = tmp_path / "metrics.jsonl"
+    return AutonomyMetricsStore(db_path)
+
+
+@pytest.fixture
+def memory_store(tmp_path: Path) -> TypedMemoryStore:
+    """Typed memory store."""
+    db_path = tmp_path / "memory.db"
+    return TypedMemoryStore(db_path)
+
+
 class TestFeaturePilotIntegration:
     """End-to-end feature pilot simulation."""
-
-    @pytest.fixture
-    def pilot_feature(self) -> FeatureRequest:
-        """Pilot feature: dark mode toggle for Control Center."""
-        return FeatureRequest(
-            id="WIZE-PILOT-001",
-            title="Add Dark Mode Toggle to Control Center",
-            operator_request="Add a UI toggle in the Control Center header to switch between light and dark themes. Save preference to localStorage.",
-            desired_outcome="Users can click toggle in Control Center header. Theme switches instantly. Preference persists across sessions.",
-            source="wiz_pilot",
-            actor_id="wiz_autonomy",
-            target="wize",
-            repository="owner/wize",
-            priority=Priority.P3,
-            state=FeatureState.RECEIVED,
-            risk="LOW",
-        )
-
-    @pytest.fixture
-    def configured_target(self) -> ConfiguredTarget:
-        """Wize repository configuration."""
-        return ConfiguredTarget(
-            repository="owner/wize",
-            target_branch="main",
-            branch_prefix="wiz/",
-            environment=Environment.STAGING,
-            approval_gate=ApprovalGate.SINGLE_REVIEW,
-            can_modify_source=True,
-            can_run_integration_tests=False,
-            test_command="npm test",
-            max_implementation_time=3600,
-        )
-
-    @pytest.fixture
-    def mock_claude_executor(self) -> MagicMock:
-        """Mock Claude CLI that returns realistic session result."""
-        executor = MagicMock(spec=ClaudeCliExecutor)
-        executor.get_diagnostics.return_value = ClaudeDiagnostics(
-            available=True,
-            availability=ClaudeAvailability.AVAILABLE,
-            cli_found=True,
-            cli_path="/usr/local/bin/claude",
-            authenticated=True,
-            version="1.0.0",
-        )
-        executor.execute_session.return_value = SessionResult(
-            success=True,
-            session_id="pilot-session-001",
-            returncode=0,
-            stdout="Session created and executed successfully",
-        )
-        return executor
-
-    @pytest.fixture
-    def metrics_store(self, tmp_path: Path) -> AutonomyMetricsStore:
-        """Autonomy metrics store."""
-        db_path = tmp_path / "metrics.jsonl"
-        return AutonomyMetricsStore(db_path)
-
-    @pytest.fixture
-    def memory_store(self, tmp_path: Path) -> TypedMemoryStore:
-        """Typed memory store."""
-        db_path = tmp_path / "memory.db"
-        return TypedMemoryStore(db_path)
 
     def test_pilot_stage_1_feature_request(
         self, pilot_feature: FeatureRequest
@@ -294,7 +299,7 @@ class TestFeaturePilotIntegration:
     ) -> None:
         """Verify pilot decision is recorded in typed memory."""
         # Record decision to run pilot
-        memory_store.remember(
+        memory_store.remember_fact(
             category=MemoryCategory.DECISION,
             content=f"Running feature pilot for {pilot_feature.id}: {pilot_feature.title}",
             source=MemorySource.OPERATOR,
@@ -302,7 +307,7 @@ class TestFeaturePilotIntegration:
         )
 
         # Record that feature is low risk
-        memory_store.remember(
+        memory_store.remember_fact(
             category=MemoryCategory.DECISION,
             content=f"{pilot_feature.id} classified as LOW risk: {pilot_feature.risk}",
             source=MemorySource.INFERENCE,

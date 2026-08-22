@@ -134,7 +134,9 @@ class ShippingAuthority:
                 ):
                     risk = RiskTier.HIGH
 
-            if changed_lines > 500:
+            if changed_lines >= 1000:
+                risk = RiskTier.HIGH
+            elif changed_lines > 500:
                 if risk == RiskTier.LOW:
                     risk = RiskTier.MEDIUM
                 elif risk == RiskTier.MEDIUM:

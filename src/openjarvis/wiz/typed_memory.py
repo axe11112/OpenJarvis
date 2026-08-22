@@ -261,6 +261,29 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             )
             self._conn.commit()
 
+    def remember_fact(
+        self,
+        category: MemoryCategory,
+        content: str,
+        source: MemorySource,
+        confidence: float = 1.0,
+        source_id: str = "",
+    ) -> str:
+        """Convenience method: create and store a memory entry.
+
+        Returns the generated memory ID.
+        """
+        memory = TypedMemory(
+            id="",
+            category=category,
+            content=content,
+            source=source,
+            source_id=source_id,
+            confidence=confidence,
+        )
+        self.remember(memory)
+        return memory.id
+
     def correct(
         self,
         old_id: str,

@@ -119,6 +119,10 @@ class ClaudeCliExecutor:
 
         Returns ClaudeDiagnostics with all status info.
         """
+        # Return cached diagnostics if available
+        if self._diagnostics_cache is not None:
+            return self._diagnostics_cache
+
         # Try to find claude CLI
         claude_path = self._find_claude_cli()
 

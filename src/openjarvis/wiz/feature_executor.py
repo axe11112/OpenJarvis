@@ -192,6 +192,14 @@ Complete the implementation and report success or failure.
 
         # All checks passed
         logger.info("feature %s ready for execution", feature.id)
+        # Record success metric
+        self._metrics_store.record(
+            MetricCategory.FEATURE_PROPOSAL,
+            f"execute:{feature.id}",
+            autonomous=True,
+            success=True,
+            details={"status": "ready"},
+        )
         return FeatureExecutionResult(
             feature_id=feature.id,
             status=ExecutionStatus.PENDING,
