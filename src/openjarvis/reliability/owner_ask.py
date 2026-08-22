@@ -205,14 +205,12 @@ def _stopped_action(context: "_Context") -> str:
     if context.last_good_deployment:
         return (
             "Decide whether to roll production back to "
-            f"{context.last_good_deployment} or let me keep trying. I have "
-            "stopped making changes."
+            f"{context.last_good_deployment} or let me keep trying."
         )
     if context.owner_impacting:
         return (
             "Decide whether to roll the current deployment back or take this "
-            "over. I have stopped making changes and nothing else will happen "
-            "until you do."
+            "over — nothing else will happen until you do."
         )
     return ""
 
