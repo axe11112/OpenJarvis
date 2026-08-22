@@ -173,7 +173,7 @@ def manager(target, tmp_path):
 def _loop(store, manager, github, *, policy=None, **overrides) -> RepairLoop:
     settings = dict(
         checks=CheckSuite.from_config(
-            test_command="python3 -m pytest tests -q", timeout=300
+            test_command=f"{fixture_repo.PYTHON} -m pytest tests -q", timeout=300
         ),
         protected_paths=[".github/workflows/"],
         push_branch=False,
