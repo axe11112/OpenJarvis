@@ -267,8 +267,8 @@ class FeatureGateIntegration:
         reasons = []
         if deterministic_failed:
             reasons.extend(deterministic_failed)
-        if not code_review_approved and inputs.code_review_result:
-            reasons.append("code_review_approved (awaiting human review)")
+        if not code_review_approved:
+            reasons.append("code_review_approved")
 
         decision = GateDecision(
             feature_id=inputs.feature_id,

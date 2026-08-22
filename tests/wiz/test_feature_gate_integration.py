@@ -33,6 +33,7 @@ class TestGateInputs:
 
     def test_create_gate_inputs_with_all_data(self) -> None:
         test_result = SuiteExecutionResult(
+            feature_id="WIZE-PILOT-001",
             total_tests=3,
             passed_tests=3,
             failed_tests=0,
@@ -140,6 +141,7 @@ class TestFeatureGateIntegration:
 
         # Perfect test result (all pass)
         test_result = SuiteExecutionResult(
+            feature_id="WIZE-001",
             total_tests=3,
             passed_tests=3,
             failed_tests=0,
@@ -166,6 +168,7 @@ class TestFeatureGateIntegration:
 
         # Failed tests (success_rate < 1.0)
         test_result = SuiteExecutionResult(
+            feature_id="WIZE-001",
             total_tests=3,
             passed_tests=2,
             failed_tests=1,
@@ -257,6 +260,7 @@ class TestFeatureGateIntegration:
             no_secrets_detected=True,
             no_breaking_changes=True,
             acceptance_test_result=SuiteExecutionResult(
+                feature_id="WIZE-001",
                 total_tests=3,
                 passed_tests=3,
                 failed_tests=0,
@@ -356,6 +360,7 @@ class TestFeatureGateIntegration:
             no_secrets_detected=True,
             no_breaking_changes=True,
             acceptance_test_result=SuiteExecutionResult(
+                feature_id="WIZE-001",
                 total_tests=3,
                 passed_tests=3,
                 failed_tests=0,
@@ -398,6 +403,7 @@ class TestFeatureGateIntegration:
             no_secrets_detected=True,
             no_breaking_changes=True,
             acceptance_test_result=SuiteExecutionResult(
+                feature_id="WIZE-001",
                 total_tests=3,
                 passed_tests=3,
                 failed_tests=0,
