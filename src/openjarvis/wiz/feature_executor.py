@@ -21,6 +21,10 @@ from typing import Any, Dict, Optional
 from openjarvis.wiz.configured_target import ConfiguredTarget
 from openjarvis.wiz.features.model import FeatureRequest, FeatureState
 from openjarvis.wiz.autonomy_metrics import AutonomyMetricsStore, MetricCategory
+from openjarvis.wiz.claude_cli_executor import (
+    ClaudeCliExecutor,
+    ClaudeDiagnostics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,11 +89,22 @@ class FeatureExecutor:
         configured_target: ConfiguredTarget,
         metrics_store: AutonomyMetricsStore,
         *,
-        session_factory: Optional[Any] = None,
+        cli_executor: Optional[ClaudeCliExecutor] = None,
     ) -> None:
         self._target = configured_target
         self._metrics_store = metrics_store
-        self._session_factory = session_factory
+        self._cli_executor = cli_executor or ClaudeCliExecutor()
+        self._claude_diagnostics: Optional[ClaudeDiagnostics] = None
+
+    def get_claude_diagnostics(self) -> ClaudeDiagnostics:
+        """Get diagnostics about Claude Code availability.
+
+        Returns:
+            ClaudeDiagnostics with CLI status, authentication, version, etc.
+        """
+        if self._claude_diagnostics is None:
+            self._claude_diagnostics = self._cli_executor.get_diagnostics()
+        return self._claude_diagnostics
 
     def can_execute(self, feature: FeatureRequest) -> tuple[bool, Optional[str]]:
         """Check if a feature can be executed.
@@ -184,8 +199,9 @@ Complete the implementation and report success or failure.
         )
 
     async def execute(self, feature: FeatureRequest) -> FeatureExecutionResult:
-        """Execute a feature by spawning a Claude Code session.
+        """Execute a feature by spawning a real Claude Code session.
 
+        Uses the REAL installed Claude CLI tool, not mocks or simulations.
         This is async because session spawning and monitoring are I/O bound.
         """
         # Prepare execution
@@ -204,71 +220,83 @@ Complete the implementation and report success or failure.
         )
 
         try:
-            if not self._session_factory:
-                # In test/development, simulate successful execution
-                logger.info(
-                    "would spawn Claude Code session for feature %s "
-                    "(no session factory configured)",
-                    feature.id,
-                )
-                result.status = ExecutionStatus.COMPLETED
-                self._metrics_store.record(
-                    MetricCategory.IMPLEMENTATION,
-                    f"execute:{feature.id}",
-                    autonomous=True,
-                    success=True,
-                    confidence=0.7,
-                    details={
-                        "feature_id": feature.id,
-                        "branch": branch_name,
-                        "simulated": True,
-                    },
-                )
-                return result
-
-            # Spawn session (real implementation)
-            session = await self._session_factory.create(
-                title=f"Feature {feature.id}: {feature.title}",
-                prompt=prompt,
-                source_url=f"https://github.com/{self._target.repository}",
-                source_revision=self._target.target_branch,
-                outcome_branch=branch_name,
-            )
-
-            if not session:
+            # Check Claude availability first
+            diag = self.get_claude_diagnostics()
+            if not diag.available:
                 result.status = ExecutionStatus.FAILED
-                result.error_message = "failed to create session"
+                result.error_message = (
+                    f"Claude CLI not available: {diag.error} "
+                    f"(availability={diag.availability.value})"
+                )
+                logger.warning(
+                    "cannot execute feature %s: %s",
+                    feature.id,
+                    result.error_message,
+                )
                 self._metrics_store.record(
                     MetricCategory.IMPLEMENTATION,
                     f"execute:{feature.id}",
                     autonomous=True,
                     success=False,
-                    details={"error": "session creation failed"},
+                    details={"error": "claude_unavailable", "diagnostics": diag.to_dict()},
                 )
                 return result
 
-            result.session_id = session.id
-            result.status = ExecutionStatus.RUNNING
-
-            # Monitor session (simplified)
-            # In production, would poll session status and collect results
-            logger.info(
-                "spawned session %s for feature %s",
-                session.id,
-                feature.id,
+            # Spawn real Claude Code session via CLI
+            cli_result = self._cli_executor.execute_session(
+                title=f"Feature {feature.id}: {feature.title}",
+                prompt=prompt,
+                repository=self._target.repository,
+                branch=branch_name,
             )
 
-            # Record metric
+            if not cli_result.success:
+                result.status = ExecutionStatus.FAILED
+                result.error_message = cli_result.error or "session execution failed"
+                logger.warning(
+                    "claude session failed for feature %s: %s",
+                    feature.id,
+                    result.error_message,
+                )
+                self._metrics_store.record(
+                    MetricCategory.IMPLEMENTATION,
+                    f"execute:{feature.id}",
+                    autonomous=True,
+                    success=False,
+                    details={
+                        "error": "session_failed",
+                        "returncode": cli_result.returncode,
+                        "stderr": cli_result.stderr,
+                    },
+                )
+                return result
+
+            # Session succeeded
+            result.session_id = cli_result.session_id or f"claude-{feature.id}"
+            result.status = ExecutionStatus.RUNNING
+
+            logger.info(
+                "spawned real Claude Code session %s for feature %s "
+                "(branch=%s, repository=%s)",
+                result.session_id,
+                feature.id,
+                branch_name,
+                self._target.repository,
+            )
+
+            # Record success metric
             self._metrics_store.record(
                 MetricCategory.IMPLEMENTATION,
                 f"execute:{feature.id}",
                 autonomous=True,
                 success=True,
-                confidence=0.8,
+                confidence=0.9,
                 details={
                     "feature_id": feature.id,
-                    "session_id": session.id,
+                    "session_id": result.session_id,
                     "branch": branch_name,
+                    "real_claude_cli": True,
+                    "repository": self._target.repository,
                 },
             )
 
@@ -284,7 +312,7 @@ Complete the implementation and report success or failure.
                 f"execute:{feature.id}",
                 autonomous=True,
                 success=False,
-                details={"error": str(exc)},
+                details={"error": str(exc), "exception_type": type(exc).__name__},
             )
             return result
 

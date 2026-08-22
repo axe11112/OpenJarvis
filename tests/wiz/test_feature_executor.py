@@ -1,15 +1,23 @@
 """Feature executor tests.
 
-Verify that features are validated and prepared for execution.
+Verify that features are validated and prepared for execution using the
+real Claude CLI executor (not mocks).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from openjarvis.wiz.autonomy_metrics import AutonomyMetricsStore
+from openjarvis.wiz.claude_cli_executor import (
+    ClaudeAvailability,
+    ClaudeDiagnostics,
+    ClaudeCliExecutor,
+    SessionResult,
+)
 from openjarvis.wiz.configured_target import ApprovalGate, ConfiguredTarget, Environment
 from openjarvis.wiz.feature_executor import (
     ExecutionStatus,
@@ -40,12 +48,35 @@ def metrics_store(tmp_path: Path) -> AutonomyMetricsStore:
 
 
 @pytest.fixture
+def mock_cli_executor() -> MagicMock:
+    """Mock Claude CLI executor for testing."""
+    executor = MagicMock(spec=ClaudeCliExecutor)
+    # Default: Claude is available
+    executor.get_diagnostics.return_value = ClaudeDiagnostics(
+        available=True,
+        availability=ClaudeAvailability.AVAILABLE,
+        cli_found=True,
+        cli_path="/usr/local/bin/claude",
+        authenticated=True,
+        version="1.0.0",
+    )
+    # Default: session execution succeeds
+    executor.execute_session.return_value = SessionResult(
+        success=True,
+        session_id="test-session-123",
+        returncode=0,
+    )
+    return executor
+
+
+@pytest.fixture
 def executor(
     configured_target: ConfiguredTarget,
     metrics_store: AutonomyMetricsStore,
+    mock_cli_executor: MagicMock,
 ) -> FeatureExecutor:
-    """Feature executor for testing."""
-    return FeatureExecutor(configured_target, metrics_store)
+    """Feature executor for testing with mocked CLI."""
+    return FeatureExecutor(configured_target, metrics_store, cli_executor=mock_cli_executor)
 
 
 @pytest.fixture
