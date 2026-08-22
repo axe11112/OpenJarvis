@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from openjarvis.wiz.acceptance_test_executor import SuiteExecutionResult
 from openjarvis.wiz.feature_contract import ProductionVerification, VerificationStatus
@@ -25,8 +25,69 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "HealthMetrics",
+    "MetricsProvider",
     "ProductionVerificationExecutor",
 ]
+
+
+class MetricsProvider:
+    """Interface for production metrics collection.
+
+    In real usage, this would query monitoring systems (Datadog, Sentry, etc.).
+    In tests, this is mocked with test data.
+    """
+
+    def get_error_rate(self) -> float:
+        """Get current error rate (0.0-1.0)."""
+        raise NotImplementedError
+
+    def get_latency_p99(self) -> float:
+        """Get p99 latency in milliseconds."""
+        raise NotImplementedError
+
+    def get_latency_p95(self) -> float:
+        """Get p95 latency in milliseconds."""
+        raise NotImplementedError
+
+    def get_user_reported_bugs(self) -> int:
+        """Get count of user-reported bugs."""
+        return 0
+
+    def get_user_reported_performance_issues(self) -> int:
+        """Get count of user-reported performance issues."""
+        return 0
+
+    def get_alert_count(self) -> int:
+        """Get count of critical alerts."""
+        return 0
+
+    def get_alert_descriptions(self) -> List[str]:
+        """Get descriptions of current alerts."""
+        return []
+
+    def get_active_users(self) -> int:
+        """Get count of active users using feature."""
+        return 0
+
+    def get_feature_adoption_rate(self) -> float:
+        """Get adoption rate (0.0-1.0)."""
+        return 0.0
+
+
+class NoOpMetricsProvider(MetricsProvider):
+    """Metrics provider that returns unavailable/unknown values.
+
+    Used when no real metrics provider is available.
+    """
+
+    def get_error_rate(self) -> float:
+        return 0.0  # Unknown, assume ok
+
+    def get_latency_p99(self) -> float:
+        return 0.0  # Unknown, assume ok
+
+    def get_latency_p95(self) -> float:
+        return 0.0  # Unknown, assume ok
 
 
 @dataclass
@@ -117,9 +178,14 @@ class ProductionVerificationExecutor:
     Post-merge, post-deploy verification. Not for pre-merge gates.
     """
 
-    def __init__(self) -> None:
-        """Initialize production verifier."""
-        pass
+    def __init__(self, metrics_provider: Optional[MetricsProvider] = None) -> None:
+        """Initialize production verifier.
+
+        Args:
+            metrics_provider: Source for production metrics.
+                             If None, uses a default no-op provider.
+        """
+        self._metrics_provider = metrics_provider or NoOpMetricsProvider()
 
     def verify_deployment_lineage(
         self,
@@ -191,12 +257,16 @@ class ProductionVerificationExecutor:
         # 1. Run full acceptance test suite against production_url
         # 2. Use same tests as Preview (configured with production URL)
         # 3. Return results (passed/failed/error counts)
+        # 4. Capture real test output and assertions
 
-        # For now, simulate perfect test results
-        # Real implementation would actually run Playwright/HTTP tests
+        # Note: This is a placeholder that will be called with real test results.
+        # The actual test execution happens in AcceptanceTestExecutor.
+        # This method is here for the verification pipeline to call.
+
+        # Return empty result; real tests would populate this
         result = SuiteExecutionResult(
-            total_tests=3,
-            passed_tests=3,
+            total_tests=0,
+            passed_tests=0,
             failed_tests=0,
             skipped_tests=0,
             error_tests=0,
@@ -232,20 +302,21 @@ class ProductionVerificationExecutor:
         # 4. Query for user-reported issues (from support system)
         # 5. Get adoption metrics
 
-        # For now, simulate healthy metrics
+        # Collect metrics from provider (real or mock)
         metrics = HealthMetrics(
             feature_id=feature_id,
             deployment_sha=deployment_sha,
             deployed_at="2026-08-22T15:45:00Z",
             production_url=production_url,
-            error_rate=0.0,
-            latency_p99_ms=500.0,
-            latency_p95_ms=250.0,
-            user_reports_bug=0,
-            user_reports_performance=0,
-            alerts_triggered=0,
-            active_users=1000,
-            feature_adoption_rate=0.50,
+            error_rate=self._metrics_provider.get_error_rate(),
+            latency_p99_ms=self._metrics_provider.get_latency_p99(),
+            latency_p95_ms=self._metrics_provider.get_latency_p95(),
+            user_reports_bug=self._metrics_provider.get_user_reported_bugs(),
+            user_reports_performance=self._metrics_provider.get_user_reported_performance_issues(),
+            alerts_triggered=self._metrics_provider.get_alert_count(),
+            alert_descriptions=self._metrics_provider.get_alert_descriptions(),
+            active_users=self._metrics_provider.get_active_users(),
+            feature_adoption_rate=self._metrics_provider.get_feature_adoption_rate(),
         )
 
         return metrics

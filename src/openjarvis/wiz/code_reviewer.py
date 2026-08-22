@@ -334,7 +334,7 @@ Your output will feed back into implementation attempts.
             findings.append(
                 ReviewFinding(
                     severity=ReviewSeverity.CRITICAL,
-                    category="security",
+                    category="secrets",
                     title="Possible secret in code",
                     description="Diff contains patterns that look like secrets",
                 )

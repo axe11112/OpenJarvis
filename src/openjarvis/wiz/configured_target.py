@@ -145,8 +145,10 @@ class ConfiguredTarget:
         if not self.target_branch.replace("-", "").replace("_", "").isalnum():
             errors.append(f"target_branch '{self.target_branch}' contains invalid chars")
 
-        if self.branch_prefix and "/" in self.branch_prefix:
-            errors.append(f"branch_prefix '{self.branch_prefix}' contains /")
+        # Branch prefix like "wiz/" is valid and expected
+        # Only reject if it's empty (should have default) or multiple slashes
+        if self.branch_prefix and self.branch_prefix.count("/") > 1:
+            errors.append(f"branch_prefix '{self.branch_prefix}' contains multiple /")
 
         # Check test command is not empty
         if not self.test_command:

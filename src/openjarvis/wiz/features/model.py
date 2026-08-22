@@ -360,6 +360,29 @@ class FeatureRequest:
         self.attempts.append(attempt)
         return attempt
 
+    def requires_source_change(self) -> bool:
+        """Does this feature require modifying application source code?
+
+        True if the feature involves code changes beyond tests/docs.
+        False for documentation-only, test-only, or configuration changes.
+        """
+        # If there are affected_components that include source files, it requires source change
+        # By default, most feature requests require source changes
+        # Only return False for explicitly non-code features
+        request_lower = self.operator_request.lower()
+
+        # Documentation-only features
+        if any(x in request_lower for x in ["readme", "docs", "documentation", "wiki"]):
+            if not any(x in request_lower for x in ["code", "implementation", "feature"]):
+                return False
+
+        # Configuration-only (environment variables, config files without code)
+        if "config" in request_lower and "code" not in request_lower:
+            return False
+
+        # Default: assume source code changes are needed
+        return True
+
     # -- serialisation -----------------------------------------------------
 
     def to_dict(self) -> Dict[str, Any]:

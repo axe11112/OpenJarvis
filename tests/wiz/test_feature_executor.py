@@ -114,10 +114,10 @@ class TestExecutionValidation:
         executor: FeatureExecutor,
         sample_feature: FeatureRequest,
     ) -> None:
-        sample_feature.state = FeatureState.EXECUTING
+        sample_feature.state = FeatureState.BUILDING
         can_exec, reason = executor.can_execute(sample_feature)
         assert not can_exec
-        assert "EXECUTING" in reason
+        assert "BUILDING" in reason
 
     def test_respects_source_code_constraint(
         self,
@@ -159,7 +159,7 @@ class TestExecutionPreparation:
         executor: FeatureExecutor,
         sample_feature: FeatureRequest,
     ) -> None:
-        sample_feature.state = FeatureState.COMPLETED
+        sample_feature.state = FeatureState.COMPLETE
         result = executor.prepare_execution(sample_feature)
         assert result is not None
         assert result.status == ExecutionStatus.FAILED
@@ -274,7 +274,7 @@ class TestMetricsRecording:
         metrics_store: AutonomyMetricsStore,
         sample_feature: FeatureRequest,
     ) -> None:
-        sample_feature.state = FeatureState.EXECUTING
+        sample_feature.state = FeatureState.BUILDING
         executor.prepare_execution(sample_feature)
 
         # Metrics should be recorded
