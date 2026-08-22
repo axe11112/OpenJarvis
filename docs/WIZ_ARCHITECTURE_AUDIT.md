@@ -595,3 +595,44 @@ switched on. Also missing: cross-incident pattern detection recorded as tasks ra
 autonomous changes (§9 of the day's brief), typed memory with provenance and per-item
 forgetting (§7), and a unified autonomy metric across both the incident and feature halves
 (§13). See the session's final report for what was chosen next and why.
+
+---
+
+## 13. Phase 3 — Proactive pattern detection into tasks — 2026-08-22
+
+`wiz/proactive.py` bridges the gap between diagnostics (read permission) and engineering
+(code-write permission). Reliability's existing fingerprint/flapping/correlate modules detect
+patterns; this module converts them to feature requests, deduplicated, waiting for approval.
+
+### 13.1 Pattern types
+
+**Flapping:** a probe alternates between pass/fail. Usually environmental (slow startup, rate
+limits, one bad node) not a code bug, but should be investigated as a potential root-cause
+issue (capacity, timeouts). Confidence scales with transition count.
+
+**Persistent failures:** same probe failed 3+ times in the window without recovery. Unbroken
+stream suggests systemic problem, not intermittent.
+
+**Recurrence:** same probe closed and reopened multiple times. Suggests the fix was incomplete
+or a deeper root cause masked by workarounds.
+
+### 13.2 Deduplication
+
+Per-pattern-per-window (default 5 minutes). Same flapping probe twice in a row = one task.
+Dedup state lives in memory; system restarts clear it, which is correct (new assessment,
+human attention).
+
+### 13.3 Test results
+
+| Suite | Result |
+|---|---|
+| `tests/wiz/test_proactive.py` | **22 passed** (flapping detection, persistent failures, recurrence, dedup, isolation, conversion, edge cases) |
+| `tests/wiz` | **765 passed** (added 22 new) |
+
+### 13.4 What is still missing
+
+Scheduled proactive runs (every N hours, scan recent incidents, generate tasks), wiring
+proactive tasks into the dispatcher (so they reach approval center), and the tie-in with the
+feature pipeline's queue to ensure proactive work respects reliability's preemption. Also:
+typed memory with provenance (§7), autonomy metrics (§13), and configured engineering target
+with preview/verification loops.
