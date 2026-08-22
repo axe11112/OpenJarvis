@@ -68,6 +68,20 @@ class FakePipeline:
         self.submitted.append((text, actor.channel))
         return feature
 
+    def cancel(self, feature_id, *, reason=""):
+        """Matches ``FeaturePipeline.cancel``'s contract, for the routes tests."""
+        feature = self.store.get(feature_id)
+        if feature is None:
+            raise KeyError(feature_id)
+        if not feature.terminal:
+            feature.transition(
+                FeatureState.CANCELLED,
+                at="2026-08-19T10:05:00+00:00",
+                reason=reason or "cancelled",
+            )
+            self.store.save(feature)
+        return feature
+
 
 @pytest.fixture
 def product(tmp_path):

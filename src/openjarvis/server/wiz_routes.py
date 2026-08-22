@@ -64,8 +64,35 @@ def _runtime() -> Any:
             from openjarvis.wiz.runtime import build_wiz
 
             config = load_config()
-            _RUNTIME = build_wiz(config=config, product=assemble(config=config))
+            _RUNTIME = build_wiz(
+                config=config,
+                product=assemble(config=config),
+                # Wired the same way the CLI wires them (see
+                # `cli/wiz_cmd.py::_runtime`), so `/api/wiz/health` and
+                # `jarvis wiz doctor` answer from the same checks rather than
+                # two implementations of "is Wiz healthy" drifting apart.
+                watcher_status=_watcher_status_probe(config),
+                ledger=_notification_ledger(config),
+            )
         return _RUNTIME
+
+
+def _watcher_status_probe(config: Any) -> Any:
+    try:
+        from openjarvis.reliability.dashboard.supervisor import LaunchdSupervisor
+
+        return LaunchdSupervisor(config).status
+    except Exception:  # noqa: BLE001 - health reporting must not block startup
+        return None
+
+
+def _notification_ledger(config: Any) -> Any:
+    try:
+        from openjarvis.reliability.notify_ledger import NotificationLedger, ledger_path
+
+        return NotificationLedger(path=ledger_path(config))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _handle(
@@ -121,6 +148,20 @@ def get_status() -> Dict[str, Any]:
         "shipping": report["shipping"],
         "capabilities": runtime.registry.describe(),
     }
+
+
+@router.get("/health")
+def get_health() -> Dict[str, Any]:
+    """Wiz's own health — the watcher, the coding tool, the audit trail.
+
+    Deliberately a separate route from `/api/snapshot`'s reliability panel,
+    the same way `wiz/health.py` is a separate module from
+    `reliability/diagnostic.py`: a green answer here says nothing about
+    whether Wize is up, and a red one here can coexist with a perfectly
+    healthy site.
+    """
+    outcome = _handle("wiz.health")
+    return outcome.result if outcome.handled else {"available": False}
 
 
 @router.get("/features")
@@ -275,27 +316,24 @@ def approve_feature(
 
 @router.post("/features/{feature_id}/cancel")
 def cancel_feature(feature_id: str) -> Dict[str, Any]:
-    """Stop work on a request. The worktree is kept for inspection."""
-    from openjarvis.wiz.features.model import FeatureState
+    """Stop work on a request. The worktree is kept for inspection.
 
+    Delegates to :meth:`FeaturePipeline.cancel` rather than moving the state
+    machine here a second time — the same reason `feature.build` calls into the
+    pipeline instead of opening a worktree itself. The Telegram/voice path
+    reaches the identical method through `feature.cancel`, so a stop from the
+    dashboard and a stop from a phone are audited the same way.
+    """
     runtime = _runtime()
     if runtime.product is None:
         raise HTTPException(status_code=404, detail="feature work is not configured")
 
-    pipeline = runtime.product.pipeline
-    feature = pipeline.store.get(feature_id)
-    if feature is None:
+    try:
+        feature = runtime.product.pipeline.cancel(
+            feature_id, reason="cancelled by the operator (Control Center)"
+        )
+    except KeyError:
         raise HTTPException(status_code=404, detail=f"no request {feature_id}")
-    if feature.terminal:
-        return {"ok": True, "state": feature.state.value}
-
-    feature.transition(
-        FeatureState.CANCELLED, at=pipeline.clock(), reason="cancelled by the operator"
-    )
-    pipeline.store.save(feature)
-    if pipeline.queue is not None:
-        pipeline.queue.cancel(feature_id)
-        pipeline.queue.finish(feature_id)
     return {"ok": True, "state": feature.state.value}
 
 

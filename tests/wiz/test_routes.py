@@ -166,6 +166,15 @@ class TestReading:
         assert body["ok"]
         assert body["result"]["entries"]
 
+    def test_health_is_a_separate_report_from_status(self, client):
+        """§8: Wiz's own health, never a claim about Wize's."""
+        body = client.get("/api/wiz/health").json()
+        assert "checks" in body
+        assert "overall" in body
+        text = str(body).lower()
+        for word in ("incident", "probe", "outage", "website"):
+            assert word not in text
+
 
 class TestApproval:
     def test_approving_without_an_approval_store_is_refused(self, client):

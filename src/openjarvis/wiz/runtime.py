@@ -178,6 +178,10 @@ class WizRuntime:
         store_factory: Optional[Callable[[], Any]] = None,
         config: Any = None,
         product: Any = None,
+        watcher_status: Optional[Callable[[], Any]] = None,
+        ledger: Any = None,
+        voice_probe: Optional[Callable[[], Any]] = None,
+        scheduler: Any = None,
     ) -> None:
         self.policy = policy
         self.registry = registry
@@ -185,6 +189,14 @@ class WizRuntime:
         self.config = config
         self.product = product
         self._store_factory = store_factory
+        # Every one of these is optional, and is used only by ``wiz.health``
+        # (§8 — Wiz's own health, kept apart from the product's). ``None`` is
+        # an honest "not configured here" rather than a lie about what was
+        # checked; see :mod:`openjarvis.wiz.health`.
+        self._watcher_status = watcher_status
+        self._ledger = ledger
+        self._voice_probe = voice_probe
+        self._scheduler = scheduler
 
         from openjarvis.wiz.product import product_intent_rules
 
@@ -257,14 +269,35 @@ class WizRuntime:
         The distinction matters and the audit called it out: "the site is fine"
         and "I am fine" are different claims, and an assistant that conflates
         them will eventually report a healthy site it has lost the ability to
-        see.
+        see. See :mod:`openjarvis.wiz.health` for the full report this
+        summarises; nothing below reads an incident, a probe result, or the
+        site's own uptime.
         """
+        from openjarvis.wiz.health import build_wiz_health
+
+        channel = getattr(self.config, "channel", None)
+        telegram = getattr(channel, "telegram", None)
+
+        report = build_wiz_health(
+            journal=self.journal,
+            registry=self.registry,
+            watcher_status=self._watcher_status,
+            product=self.product,
+            ledger=self._ledger,
+            telegram_bot_token=str(getattr(telegram, "bot_token", "") or ""),
+            telegram_allowed_chat_ids=str(
+                getattr(telegram, "allowed_chat_ids", "") or ""
+            ),
+            voice_probe=self._voice_probe,
+            scheduler=self._scheduler,
+        )
         chain_ok: Optional[bool] = None
         chain_break: Optional[int] = None
         if self.journal is not None:
             chain_ok, chain_break = self.journal.verify()
 
         return {
+            # Kept for callers of the previous shape.
             "authority_policy": "loaded",
             "capabilities_declared": len(self.registry),
             "capabilities_implemented": len(self.wiz.verbs()),
@@ -274,6 +307,10 @@ class WizRuntime:
                 "first_break_at": chain_break,
             },
             "coding_engine": claude_cli_available().detail,
+            # The full report.
+            "overall": report.overall.value,
+            "checks": report.to_dict()["checks"],
+            "troubles": report.troubles(),
         }
 
     def reliability_status(self, request: Request) -> Dict[str, Any]:
@@ -408,6 +445,10 @@ def build_wiz(
     store_factory: Optional[Callable[[], Any]] = None,
     journal: Optional[WizJournal] = None,
     product: Any = None,
+    watcher_status: Optional[Callable[[], Any]] = None,
+    ledger: Any = None,
+    voice_probe: Optional[Callable[[], Any]] = None,
+    scheduler: Any = None,
 ) -> WizRuntime:
     """Build the Wiz the CLI and the dashboard both use.
 
@@ -473,6 +514,10 @@ def build_wiz(
         store_factory=store_factory,
         config=config,
         product=product,
+        watcher_status=watcher_status,
+        ledger=ledger,
+        voice_probe=voice_probe,
+        scheduler=scheduler,
     )
 
 

@@ -230,8 +230,43 @@ def _plain_authority(value: Any) -> str:
     return _PLAIN_AUTHORITY.get(str(value).upper(), str(value).lower())
 
 
+#: Wiz's own internal check names, in the words the owner uses for them.
+#: Anything genuinely broken (FAILED) is worth a phone sentence; anything
+#: merely unconfigured is not — an owner who never turned Sir Voice on does
+#: not need to be told it is off every time they ask how Wiz is doing.
+_PLAIN_TROUBLE = {
+    "audit_trail": "my record of decisions has been tampered with",
+    "watcher": "the watcher is not running",
+    "coding_engine": "I have no coding tool here, so I cannot build anything",
+    "task_engine": "the feature queue is broken",
+    "notification_ledger": "my memory of what I've told you is broken",
+    "scheduler": "my scheduled tasks have stopped running",
+    "sir_voice": "I cannot hear or speak right now",
+}
+
+
 def _wiz_health(result: Mapping[str, Any], persona: bool) -> str:
-    """Wiz's own health. Never a statement about the website."""
+    """Wiz's own health. Never a statement about the website.
+
+    Reads the full report from :mod:`openjarvis.wiz.health` when it is
+    present — every check, not a summary of three of them — and only ever
+    reports a check that is actually FAILED. ``NOT_CONFIGURED`` and
+    ``UNKNOWN`` are correct, informative states for a check the operator has
+    simply never turned on, and saying "I am not well" about them would make
+    the sentence worthless the first time it was wrong.
+    """
+    checks = list(result.get("checks") or [])
+    if checks:
+        broken = [
+            _PLAIN_TROUBLE.get(c.get("name", ""), c.get("name", "something"))
+            for c in checks
+            if str(c.get("state", "")).upper() == "FAILED"
+        ]
+        if broken:
+            return _sir(persona, f"I am not well: {_join(broken)}.")
+        return _sir(persona, "I am working normally.")
+
+    # No full report attached — the older, narrower shape.
     journal = dict(result.get("journal") or {})
     troubles: List[str] = []
     if journal.get("enabled") and journal.get("intact") is False:
@@ -239,11 +274,9 @@ def _wiz_health(result: Mapping[str, Any], persona: bool) -> str:
     engine = str(result.get("coding_engine") or "")
     if "not" in engine.lower() or "missing" in engine.lower():
         troubles.append("I have no coding tool here, so I cannot build anything")
-    if not int(result.get("capabilities_implemented", 0) or 0):
-        troubles.append("nothing is wired up yet")
 
     if troubles:
-        return _sir(persona, f"I am not fully well: {_join(troubles)}.")
+        return _sir(persona, f"I am not well: {_join(troubles)}.")
     return _sir(persona, "I am working normally.")
 
 

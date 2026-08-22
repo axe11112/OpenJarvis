@@ -90,8 +90,44 @@ def test_a_tampered_journal_is_reported_as_wiz_being_unwell():
             "coding_engine": "claude 1.2.3",
         },
     )
-    assert "not fully well" in text
+    assert "not well" in text
     assert "tampered" in text
+
+
+def test_the_full_report_only_speaks_about_failed_checks():
+    """Section 8: many checks are NOT_CONFIGURED on an ordinary machine.
+
+    Sir Voice being off, no scheduler, no watcher on this platform — none of
+    that is Wiz being unwell, and reporting it that way would make "I am not
+    well" mean nothing the first time an operator who never enabled voice
+    heard it.
+    """
+    text = render(
+        "wiz.health",
+        {
+            "checks": [
+                {"name": "audit_trail", "state": "HEALTHY"},
+                {"name": "sir_voice", "state": "NOT_CONFIGURED"},
+                {"name": "scheduler", "state": "NOT_CONFIGURED"},
+                {"name": "watcher", "state": "NOT_CONFIGURED"},
+            ]
+        },
+    )
+    assert "working normally" in text
+
+
+def test_the_full_report_names_a_real_failure():
+    text = render(
+        "wiz.health",
+        {
+            "checks": [
+                {"name": "watcher", "state": "FAILED"},
+                {"name": "sir_voice", "state": "NOT_CONFIGURED"},
+            ]
+        },
+    )
+    assert "not well" in text
+    assert "watcher is not running" in text
 
 
 def test_a_missing_coding_tool_is_named():

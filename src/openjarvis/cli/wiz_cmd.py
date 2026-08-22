@@ -41,13 +41,87 @@ def _console() -> Console:
 
 
 def _runtime() -> Any:
-    """Build the Wiz the dashboard also uses, product side included."""
+    """Build the Wiz the dashboard also uses, product side included.
+
+    Also wires in the collaborators `wiz.health` needs to report on Wiz's own
+    processes — the watcher, the notification ledger, Sir Voice — each
+    optional, and each attached only when it can actually be reached from this
+    process. A CLI invocation that fails to build one of them must still be
+    able to answer `jarvis wiz build`; health-check plumbing is not allowed to
+    be a reason the CLI itself does not start.
+    """
     from openjarvis.core.config import load_config
     from openjarvis.wiz.assemble import assemble
     from openjarvis.wiz.runtime import build_wiz
 
     config = load_config()
-    return build_wiz(config=config, product=assemble(config=config))
+    return build_wiz(
+        config=config,
+        product=assemble(config=config),
+        watcher_status=_watcher_status_probe(config),
+        ledger=_ledger(config),
+        voice_probe=_voice_probe(config),
+    )
+
+
+def _watcher_status_probe(config: Any) -> Any:
+    try:
+        from openjarvis.reliability.dashboard.supervisor import LaunchdSupervisor
+
+        supervisor = LaunchdSupervisor(config)
+    except Exception:  # noqa: BLE001 - health reporting must never block startup
+        return None
+    return supervisor.status
+
+
+def _ledger(config: Any) -> Any:
+    try:
+        from openjarvis.reliability.notify_ledger import NotificationLedger, ledger_path
+
+        return NotificationLedger(path=ledger_path(config))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _voice_probe(config: Any) -> Any:
+    """A callable snapshot of what Sir Voice can check from a bare CLI process.
+
+    Full voice assembly — sessions, calls, push, the phone's own registration —
+    lives in whichever process is actually serving calls (the reliability
+    dashboard command), and rebuilding all of it here just to answer a health
+    check would be the kind of always-on duplication §16 asks this project not
+    to add. So this builds only the two parts that are cheap, stateless and
+    genuinely answerable from any process: whether whisper.cpp and its model
+    are on disk, and whether ``say`` is available. Everything this cannot see
+    — the microphone, the phone, the tailnet — reports honestly as unknown
+    rather than being guessed at or omitted.
+    """
+    from openjarvis.reliability.voice.stt import DEFAULT_MODEL, WhisperTranscriber
+    from openjarvis.reliability.voice.tts import MacSpeech
+
+    home = _voice_home(config)
+    model_path = str(home / "voice" / "models" / f"ggml-{DEFAULT_MODEL}.bin")
+    transcriber = WhisperTranscriber(model_path=model_path)
+    speech = MacSpeech()
+    if not transcriber.available and not speech.available:
+        # Neither half is installed. Rather than reporting a hollow panel,
+        # this is the honest "not configured" a fresh machine deserves.
+        return None
+
+    def probe() -> Any:
+        from openjarvis.reliability.voice.health import VoiceHealth
+
+        return VoiceHealth(
+            transcriber=transcriber, speech=speech, normalizer=transcriber.normalizer
+        ).snapshot()
+
+    return probe
+
+
+def _voice_home(config: Any) -> Any:
+    from openjarvis.core.paths import get_config_dir
+
+    return get_config_dir()
 
 
 def _actor() -> Any:
@@ -368,6 +442,56 @@ def morning(force: bool) -> None:
     )
     if briefing.worth_sending or force:
         console.print(briefing.render())
+
+
+@wiz.command("doctor")
+@click.option(
+    "--json", "as_json", is_flag=True, default=False, help="Machine-readable."
+)
+def doctor(as_json: bool) -> None:
+    """Wiz's own health — never a statement about Wize's.
+
+    `jarvis reliability doctor` answers "is the website OK". This answers "is
+    Wiz itself OK" — the watcher process, the coding tool, the audit trail,
+    the notification ledger, Sir Voice, the scheduler. A green answer here says
+    nothing about production; a red one here can exist while the site is
+    perfectly healthy, and that is the point of keeping the two apart.
+    """
+    console = _console()
+    outcome = _handle(capability="wiz.health")
+    if not outcome.handled:
+        console.print(f"[red]{outcome.message}[/red]")
+        raise SystemExit(1)
+
+    result = outcome.result
+    if as_json:
+        console.print(json.dumps(result, indent=2, sort_keys=True))
+        return
+
+    style = {
+        "HEALTHY": "green",
+        "DEGRADED": "yellow",
+        "NOT_CONFIGURED": "dim",
+        "UNKNOWN": "dim",
+        "BLOCKED": "red",
+        "FAILED": "bold red",
+        "NOT_CHECKED": "dim",
+    }
+    table = Table(title="Wiz health (not Wize's)", header_style="dim")
+    table.add_column("check")
+    table.add_column("state")
+    table.add_column("detail", overflow="fold")
+    for check in result.get("checks", []):
+        state = check["state"]
+        table.add_row(
+            check["name"],
+            f"[{style.get(state, 'white')}]{state}[/]",
+            escape(check.get("summary") or check.get("detail") or ""),
+        )
+    console.print(table)
+    overall = result.get("overall", "NOT_CHECKED")
+    console.print("")
+    console.print(f"Overall: [{style.get(overall, 'white')}]{overall}[/]")
 
 
 @wiz.command("say")

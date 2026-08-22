@@ -514,3 +514,84 @@ the Control Center UI; Phase E is Telegram/voice intake and feature memory.
 Wiz's registered vocabulary is still five read-only verbs. Nothing in this work enabled any
 new production authority: repair-to-PR remains on, and deploy, push-to-main, merge and Supabase
 writes remain off.
+
+---
+
+## 12. Merged with the reliability/notification lineage, and two more phases — 2026-08-22
+
+Two sessions had built on separate branches since 17 August: this one (notification
+deduplication and outage correlation, `docs/JARVIS_RELIABILITY.md` §10) and the product
+lineage recorded in `docs/WIZ_PRODUCT_ENGINEERING.md` (Phases C–E: the feature pipeline,
+Claude Code engineering agent, preview/verification, Control Center routes, Telegram/voice
+intake). Merged clean — 72 files added, no conflicting hunks in the eight files both branches
+had touched (the CLI entry point, the server app, the browser probe, the voice trigger, four
+reliability fixtures).
+
+### 12.1 What was still missing after the merge
+
+Both halves existed and neither was reachable from a phone. The Telegram adapter
+(`wiz/intake.py::TelegramIntake`) and the notification listener
+(`reliability/owner_commands.py::OwnerCommandListener`) were both built, both tested, and
+never connected to each other or to a running process — an operator with a configured bot
+could be notified and could not talk back. Separately, `wiz.health` (§8) reported four
+numbers (capability counts, journal state, one coding-engine string) and called it "Wiz's own
+health"; none of the nine things §8 actually asks for — watcher, notification ledger, Sir
+Voice, scheduler among them — were checked.
+
+### 12.2 Phase 1 — one door
+
+`wiz/owner_channel.py::OwnerDoor` is the single authenticated entry point for everything the
+owner types or says on Telegram. It decides which half of Wiz a sentence belongs to: the
+narrow reliability instruction table when a phrase matches it *and* an outage is actually
+open, the full dispatcher otherwise. The tie-break on "fix it" is resolved by the world, not
+the wording — see the module docstring.
+
+`wiz/owner_speech.py` is the deterministic renderer that turns a handler's structured result
+into the two sentences that reach a phone — the same non-generative-copy discipline
+`reliability/notify.py` already uses, for the same reason: a health summary a model wrote is
+a summary nobody checked.
+
+Two honesty bugs the audit's own examples surfaced were fixed in the same pass: the product
+verbs were absent from the registry on an unconfigured machine, so "add a download button"
+came back "I did not recognise that" rather than naming the missing engineering target; and
+`FileNotFoundError("none")` reached the phone as its own `str()`, "I cannot do that here:
+none." — an exception message is not an explanation.
+
+`feature.cancel` (SAFE_ACTION, not CODE_WRITE) is the stop button: resolves "that one" when
+exactly one thing is running, asks when two are, needs no coding engine or workspace, and
+undoes nothing — cancelling is Wiz agreeing to take no further steps.
+
+### 12.3 Phase 2 — Wiz health, actually separate from Wize's
+
+`wiz/health.py` builds on `reliability.health.HealthState`/`CheckResult` — the same vocabulary
+`LiveDiagnostic` uses, not a second one — with nine checks: the audit trail, the capability
+registry, the coding engine, the watcher process (via an injected `LaunchdSupervisor.status`
+probe — a real bug was caught here: `WatcherStatus` is a `str`-mixed `Enum` and `str(member)`
+on this Python returns `"WatcherStatus.OFFLINE"` rather than `"OFFLINE"`, which made an
+unsupported-platform watcher report as `FAILED`), the feature task engine, the notification
+ledger, Telegram configuration, Sir Voice (folding in `VoiceHealth.snapshot()`'s own verdict
+rather than re-deriving it), and the scheduler. Every check is a structural test: none of them
+can read an incident, a probe result, or the site's own uptime — enforced by a test that
+inspects the module's own parameter names, not just by convention.
+
+Exposed as `jarvis wiz doctor`, `GET /api/wiz/health`, and folded into `wiz.health`'s existing
+answer so "how are you" on the phone reports it in English — and only ever names a check that
+is actually `FAILED`; `NOT_CONFIGURED` (Sir Voice never turned on, no scheduler) is correct and
+uninteresting, and saying "I am not well" about it would make the sentence worthless the first
+time it was wrong.
+
+### 12.4 Test results
+
+| Suite | Result |
+|---|---|
+| `tests/wiz` | **743 passed** |
+| `tests/reliability` + `tests/wiz` together | see the commit for the exact count |
+
+### 12.5 What is still missing
+
+Everything in `docs/WIZ_PRODUCT_ENGINEERING.md` §8 — a configured engineering target,
+Playwright, a first real preview run, `PR_WRITE` granted to the Control Center, feature merging
+switched on. Also missing: cross-incident pattern detection recorded as tasks rather than
+autonomous changes (§9 of the day's brief), typed memory with provenance and per-item
+forgetting (§7), and a unified autonomy metric across both the incident and feature halves
+(§13). See the session's final report for what was chosen next and why.
