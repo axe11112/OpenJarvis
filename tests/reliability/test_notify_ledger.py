@@ -58,7 +58,7 @@ def test_owner_state_collapses_internal_states():
     """Two internal states that ask the same thing of the owner are one state."""
     failed = owner_state(_incident(state=IncidentState.FAILED))
     human = owner_state(_incident(state=IncidentState.HUMAN_REQUIRED))
-    assert failed == human == "needs-you:HIGH"
+    assert failed == human == "needs-you:HIGH:"
 
 
 def test_second_look_at_an_unchanged_problem_is_not_news():
@@ -145,12 +145,22 @@ def test_a_restart_does_not_repeat_the_message(tmp_path):
     incident = _incident()
 
     first, notifier = _router(NotificationLedger(path=path))
-    assert first.human_required(incident, reason="attempts exhausted", attempts=3, max_attempts=3) is True
+    assert (
+        first.human_required(
+            incident, reason="repair is disabled", attempts=3, max_attempts=3
+        )
+        is True
+    )
     assert len(notifier.messages) == 1
 
     # The watcher restarts: new process, new router, new ledger object, same disk.
     second, notifier2 = _router(NotificationLedger(path=path))
-    assert second.human_required(incident, reason="attempts exhausted", attempts=3, max_attempts=3) is False
+    assert (
+        second.human_required(
+            incident, reason="repair is disabled", attempts=3, max_attempts=3
+        )
+        is False
+    )
     assert notifier2.messages == []
 
 
@@ -159,7 +169,9 @@ def test_repeated_watcher_cycles_send_one_message(tmp_path):
     router, notifier = _router(NotificationLedger(path=path))
     incident = _incident()
     for _ in range(10):
-        router.human_required(incident, reason="attempts exhausted", attempts=3, max_attempts=3)
+        router.human_required(
+            incident, reason="repair is disabled", attempts=3, max_attempts=3
+        )
     assert len(notifier.messages) == 1
 
 
@@ -174,17 +186,17 @@ def test_critical_then_human_required_is_one_escalation(tmp_path):
     path = tmp_path / "notified.json"
     router, notifier = _router(NotificationLedger(path=path))
     incident = _incident(severity=Severity.CRITICAL, state=IncidentState.INVESTIGATING)
-    assert router.alert(incident) is False  # held, in case it escalates
+    assert router.alert(incident) is False  # detection is never news
 
     incident.state = IncidentState.HUMAN_REQUIRED
     for _ in range(5):
         router.human_required(
-            incident, reason="attempts exhausted", attempts=3, max_attempts=3
+            incident, reason="repair is disabled", attempts=3, max_attempts=3
         )
 
     restarted, notifier2 = _router(NotificationLedger(path=path))
     restarted.human_required(
-        incident, reason="attempts exhausted", attempts=3, max_attempts=3
+        incident, reason="repair is disabled", attempts=3, max_attempts=3
     )
 
     assert len(notifier.messages) == 1
@@ -197,8 +209,12 @@ def test_a_fix_after_silence_still_reaches_the_owner(tmp_path):
     ledger = NotificationLedger(path=path)
     router, notifier = _router(ledger)
     incident = _incident()
-    router.human_required(incident, reason="attempts exhausted", attempts=3, max_attempts=3)
-    router.human_required(incident, reason="attempts exhausted", attempts=3, max_attempts=3)
+    router.human_required(
+        incident, reason="repair is disabled", attempts=3, max_attempts=3
+    )
+    router.human_required(
+        incident, reason="repair is disabled", attempts=3, max_attempts=3
+    )
     assert len(notifier.messages) == 1
 
     incident.state = IncidentState.RESOLVED
@@ -207,19 +223,36 @@ def test_a_fix_after_silence_still_reaches_the_owner(tmp_path):
 
     # ...and the fix clears the record, so the next break is news.
     incident.state = IncidentState.HUMAN_REQUIRED
-    assert router.human_required(incident, reason="broke again", attempts=3, max_attempts=3) is True
+    assert (
+        router.human_required(
+            incident,
+            reason="protected path: src/auth/session.ts",
+            attempts=3,
+            max_attempts=3,
+        )
+        is True
+    )
 
 
 def test_a_deferred_alert_that_is_never_sent_leaves_no_trace(tmp_path):
     """A held CRITICAL must not silence the escalation that supersedes it."""
     path = tmp_path / "notified.json"
-    router, notifier = _router(NotificationLedger(path=path), critical_grace_seconds=60)
+    router, notifier = _router(
+        NotificationLedger(path=path),
+        critical_grace_seconds=60,
+        alert_on_critical=True,
+    )
     incident = _incident(severity=Severity.CRITICAL, state=IncidentState.INVESTIGATING)
     assert router.alert(incident) is False  # held
     assert notifier.messages == []
 
     incident.state = IncidentState.HUMAN_REQUIRED
-    assert router.human_required(incident, reason="attempts exhausted", attempts=3, max_attempts=3) is True
+    assert (
+        router.human_required(
+            incident, reason="repair is disabled", attempts=3, max_attempts=3
+        )
+        is True
+    )
     assert len(notifier.messages) == 1
 
 
@@ -227,15 +260,26 @@ def test_a_broken_ledger_never_silences_the_owner(tmp_path):
     """When in doubt, speak. A dedup bug must not become a missed outage."""
 
     class _Broken:
-        def should_notify(self, incident, *, kind="problem"):
+        def should_notify(self, incident, *, kind="owner", ask=None):
             raise RuntimeError("disk on fire")
 
-        def record(self, incident, *, kind="problem"):
+        def was_told(self, incident, *, kind="owner"):
             raise RuntimeError("disk on fire")
 
-        def forget(self, incident, *, kind="problem"):
+        def record(self, incident, *, kind="owner", ask=None):
+            raise RuntimeError("disk on fire")
+
+        def record_fixed(self, incident, *, kind="owner"):
+            raise RuntimeError("disk on fire")
+
+        def forget(self, incident, *, kind="owner"):
             raise RuntimeError("disk on fire")
 
     router, notifier = _router(_Broken())
-    assert router.human_required(_incident(), reason="attempts exhausted", attempts=3, max_attempts=3) is True
+    assert (
+        router.human_required(
+            _incident(), reason="repair is disabled", attempts=3, max_attempts=3
+        )
+        is True
+    )
     assert len(notifier.messages) == 1

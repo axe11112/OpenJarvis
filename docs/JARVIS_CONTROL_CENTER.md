@@ -24,6 +24,8 @@ system:
 |---|---|
 | Overall status, surface cards | `LiveDiagnostic`, run with `open_incidents=False` |
 | Incidents, evidence, transitions, audit chain | `IncidentStore` — the same database `jarvis reliability watch` writes |
+| Correlated outages, and why probes were merged | `outages.json`, written by the watcher's `OutageRegistry` |
+| What the owner was told, and what is being asked of them | `notified.json`, and the `owner_ask` recorded on each incident |
 | Probe rows | the probe specs on disk, plus what the watcher left in the evidence directory |
 | Target identity | `resolve_target()` |
 | Safety interlocks | `config.reliability`, field by field |
@@ -37,6 +39,27 @@ on the command line.
 
 The **only** two actions it can take are asking launchd to start or restart the
 watcher service, covered in §4.
+
+### The outage panel
+
+Telegram is intentionally sparse — one line, one ask, and then silence — so
+every piece of detail it does not carry has to live somewhere. This is where.
+
+Each row is one underlying problem: the components and probes implicated, the
+incidents underneath it, the deployment it is attributed to, and the
+correlation notes explaining *why* those incidents were treated as one thing.
+
+Three fields are about the notification itself, and they exist because a system
+that quietly withholds escalations is indistinguishable from one that is broken:
+
+* **what the owner was last told**, and when;
+* **the exact ask** — what failed, the cause, the evidence, what was tried, and
+  the operator action required;
+* **why Sir is or is not contacting them** — including, when an escalation was
+  *withheld*, the reason no specific action could be named.
+
+A parked incident is therefore visible as a parked incident, with its reasoning
+attached, rather than as an absence.
 
 ## 2. Honesty rules carried over from the reliability core
 
@@ -204,7 +227,7 @@ Every route is `GET` unless marked otherwise.
 | Route | Returns |
 |---|---|
 | `/` | the page |
-| `/api/snapshot` | the whole read model |
+| `/api/snapshot` | the whole read model, including `outages[]` |
 | `/api/incidents/<id>` | one incident: evidence, history, transitions, repair attempts, audit |
 | `/api/watcher` | watcher process state |
 | `/api/watcher/logs?stream=stdout\|stderr` | redacted log tail |

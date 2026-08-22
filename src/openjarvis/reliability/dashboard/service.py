@@ -367,7 +367,29 @@ class DashboardService:
             watcher=watcher.to_dict(),
             notes=notes,
             autonomy=self._autonomy(),
+            outages=self._outages(),
+            ledger=self._ledger(),
         )
+
+    def _outages(self) -> List[Any]:
+        """Correlated outages, newest first. Never fatal to the page."""
+        from openjarvis.reliability.outage import OutageRegistry, outages_path
+
+        try:
+            return OutageRegistry(path=outages_path(self._config)).all_outages()[:50]
+        except Exception:  # noqa: BLE001
+            logger.exception("could not read the outage registry")
+            return []
+
+    def _ledger(self) -> Any:
+        """The notification ledger, read-only, for the "what was Sir told" panel."""
+        from openjarvis.reliability.notify_ledger import NotificationLedger, ledger_path
+
+        try:
+            return NotificationLedger(path=ledger_path(self._config))
+        except Exception:  # noqa: BLE001
+            logger.exception("could not read the notification ledger")
+            return None
 
     def _autonomy(self) -> Dict[str, Any]:
         """How much JARVIS is actually handling. Never fatal to the page."""

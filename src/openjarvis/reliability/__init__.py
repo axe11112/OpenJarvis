@@ -27,6 +27,10 @@ from openjarvis.reliability.flapping import FlappingDetector, FlappingVerdict
 from openjarvis.reliability.health import CheckResult, HealthState
 from openjarvis.reliability.monitor import ReliabilityMonitor
 from openjarvis.reliability.notify import NotificationRouter, Notifier
+from openjarvis.reliability.notify_ledger import NotificationLedger
+from openjarvis.reliability.outage import Outage, OutageRegistry, classify_family
+from openjarvis.reliability.owner_ask import OwnerAsk, build_owner_ask
+from openjarvis.reliability.owner_commands import OwnerCommands
 from openjarvis.reliability.policy import Decision, SafetyPolicy
 from openjarvis.reliability.repair import RepairLoop, RepairOutcome
 from openjarvis.reliability.report import IncidentReport, build_report
@@ -107,7 +111,14 @@ __all__ = [
     "IncidentStore",
     "IncidentTransition",
     "InvalidTransitionError",
+    "NotificationLedger",
     "NotificationRouter",
+    "Outage",
+    "OutageRegistry",
+    "OwnerAsk",
+    "OwnerCommands",
+    "build_owner_ask",
+    "classify_family",
     "Notifier",
     "ProbeResult",
     "RepairAttempt",

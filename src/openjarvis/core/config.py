@@ -1704,6 +1704,20 @@ class ReliabilityNotifyConfig:
     persona: bool = True  # JARVIS voice on user-facing messages
     min_severity: str = "MEDIUM"
     max_messages_per_hour: int = 20
+    #: Whether a CRITICAL *detection* may interrupt the owner on its own.
+    #:
+    #: Off, and the default matters more than the switch. Detection is not an
+    #: outcome: a probe failing, an incident opening and a severity rising are
+    #: all the system working. The owner hears the fix, or an escalation that
+    #: names something for them to do. Turning this on restores a "something
+    #: serious happened" message that arrives before JARVIS knows whether it
+    #: can handle the problem — which, in the deployment that asked for this
+    #: setting to exist, was two messages seconds apart about one incident.
+    alert_on_critical: bool = False
+    #: Whether owner commands arriving on the notification channel ("Fix it")
+    #: are acted on. Off: the allowlist is a channel setting, and enabling a
+    #: control path should be a deliberate act.
+    accept_owner_commands: bool = False
 
 
 @dataclass

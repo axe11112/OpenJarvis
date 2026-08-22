@@ -63,22 +63,54 @@ class EscalationTracker:
     policy: EscalationPolicy = field(default_factory=EscalationPolicy)
     notifier: Any = None
     clock: Callable[[], float] = time.monotonic
+    #: Groups incidents into the underlying problem. Reminders are tracked per
+    #: *outage*, so a deployment failure that opened five incidents produces one
+    #: reminder schedule rather than five — which is how a single bad morning
+    #: turned into fifteen messages.
+    outages: Any = None
     _first_seen: Dict[str, float] = field(default_factory=dict, repr=False)
     _sent: Dict[str, int] = field(default_factory=dict, repr=False)
+    #: incident id -> track key, so callers can still clear by incident id
+    #: without knowing which outage it was folded into.
+    _tracked_as: Dict[str, str] = field(default_factory=dict, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def track_key(self, incident: Incident) -> str:
+        """What this incident is tracked as: its outage, or its fingerprint."""
+        from openjarvis.reliability.notify_ledger import owner_identity
+
+        key = ""
+        if self.outages is not None:
+            try:
+                key = self.outages.assign(incident).key
+                incident.metadata["outage_key"] = key
+            except Exception:  # noqa: BLE001 - correlation is an optimisation
+                logger.exception("could not correlate %s for escalation", incident.id)
+        key = key or owner_identity(incident)
+        if incident.id:
+            self._tracked_as[incident.id] = key
+        return key
 
     def observe(self, incident: Incident) -> None:
         """Start the clock for an incident, if it qualifies."""
         if not self._qualifies(incident):
             return
         with self._lock:
-            self._first_seen.setdefault(incident.id, self.clock())
+            self._first_seen.setdefault(self.track_key(incident), self.clock())
 
     def clear(self, incident_id: str) -> None:
-        """Stop tracking an incident that has been resolved or handed over."""
+        """Stop tracking an incident that has been resolved or handed over.
+
+        Takes an incident id because that is what every caller has. What it
+        actually forgets is the *outage* that incident was tracked as — the
+        reminder schedule belongs to the problem, not to whichever probe
+        happened to open the first incident for it.
+        """
         with self._lock:
-            self._first_seen.pop(incident_id, None)
-            self._sent.pop(incident_id, None)
+            key = self._tracked_as.pop(incident_id, incident_id)
+            for candidate in {incident_id, key}:
+                self._first_seen.pop(candidate, None)
+                self._sent.pop(candidate, None)
 
     def sweep(self, incidents: List[Incident]) -> List[Incident]:
         """Send reminders for incidents that have gone stale.
@@ -89,21 +121,28 @@ class EscalationTracker:
         if not self.policy.enabled:
             return []
 
-        open_ids = {incident.id for incident in incidents}
+        qualifying = [i for i in incidents if self._qualifies(i)]
+        keys = {incident.id: self.track_key(incident) for incident in qualifying}
+        open_keys = set(keys.values())
         with self._lock:
             for stale in list(self._first_seen):
-                if stale not in open_ids:
+                if stale not in open_keys:
                     self._first_seen.pop(stale, None)
                     self._sent.pop(stale, None)
 
         escalated: List[Incident] = []
         now = self.clock()
-        for incident in incidents:
-            if not self._qualifies(incident):
+        seen_this_sweep: set[str] = set()
+        for incident in qualifying:
+            key = keys[incident.id]
+            if key in seen_this_sweep:
+                # A second incident in the same outage. Its evidence is already
+                # in the store and in the message; it is not a second reminder.
                 continue
+            seen_this_sweep.add(key)
             with self._lock:
-                first = self._first_seen.setdefault(incident.id, now)
-                sent = self._sent.get(incident.id, 0)
+                first = self._first_seen.setdefault(key, now)
+                sent = self._sent.get(key, 0)
                 if sent >= max(0, self.policy.max_reminders):
                     continue
                 # Reminders are spaced by the same interval, so the second one
@@ -112,7 +151,7 @@ class EscalationTracker:
                 due_at = first + self.policy.after_seconds * (sent + 1)
                 if now < due_at:
                     continue
-                self._sent[incident.id] = sent + 1
+                self._sent[key] = sent + 1
                 attempt_number = sent + 1
 
             if self._send(incident, attempt_number):

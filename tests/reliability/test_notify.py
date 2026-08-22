@@ -386,7 +386,9 @@ class TestIncidentHelpers:
         return NotificationRouter(notifier=notifier, **kwargs), notifier
 
     def test_a_critical_incident_alerts(self):
-        router, notifier = self._router(critical_grace_seconds=0)
+        router, notifier = self._router(
+            critical_grace_seconds=0, alert_on_critical=True
+        )
         assert router.alert(_incident(severity=Severity.CRITICAL))
         _assert_owner_readable(notifier.sent[0])
 
@@ -405,7 +407,7 @@ class TestIncidentHelpers:
         router.notify("filler", severity=Severity.CRITICAL)
         assert router.human_required(
             _incident(severity=Severity.LOW),
-            reason="attempts exhausted",
+            reason="repair is disabled",
             attempts=3,
             max_attempts=3,
         )
@@ -418,7 +420,9 @@ class TestIncidentHelpers:
 
     @pytest.mark.parametrize("persona", [True, False])
     def test_persona_flag_is_honoured(self, persona):
-        router, notifier = self._router(persona=persona, critical_grace_seconds=0)
+        router, notifier = self._router(
+            persona=persona, critical_grace_seconds=0, alert_on_critical=True
+        )
         router.alert(_incident(severity=Severity.CRITICAL))
         assert ("Sir," in notifier.sent[0]) is persona
 
@@ -471,6 +475,9 @@ class TestCriticalAndEscalationAreOneEvent:
                 dedup_window_seconds=0,
                 clock=_FakeClock(),
                 scheduler=_ManualTimer,
+                # This class is about the deferral machinery, which only runs
+                # when an operator has deliberately turned detection alerts on.
+                alert_on_critical=kwargs.pop("alert_on_critical", True),
                 **kwargs,
             ),
             notifier,
@@ -484,7 +491,7 @@ class TestCriticalAndEscalationAreOneEvent:
         assert notifier.sent == [], "the alert waits to see what happens next"
 
         router.human_required(
-            incident, reason="attempts exhausted", attempts=3, max_attempts=3
+            incident, reason="repair is disabled", attempts=3, max_attempts=3
         )
         # The held timer must have been cancelled, not merely ignored.
         assert all(t.cancelled for t in _ManualTimer.created)
@@ -524,12 +531,19 @@ class TestCriticalAndEscalationAreOneEvent:
         """Superseding is per incident. Two genuinely separate problems are two
         messages, and collapsing them would hide one."""
         router, notifier = self._router()
-        first = _incident(severity=Severity.CRITICAL, id="INC-00001")
-        second = _incident(severity=Severity.CRITICAL, id="INC-00002")
+        first = _incident(
+            severity=Severity.CRITICAL, id="INC-00001", fingerprint="fp-login"
+        )
+        second = _incident(
+            severity=Severity.CRITICAL,
+            id="INC-00002",
+            fingerprint="fp-billing",
+            component="billing",
+        )
 
         router.alert(first)
         router.human_required(
-            second, reason="attempts exhausted", attempts=3, max_attempts=3
+            second, reason="repair is disabled", attempts=3, max_attempts=3
         )
         for timer in _ManualTimer.created:
             timer.fire()

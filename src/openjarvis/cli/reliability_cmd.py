@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import logging
 import shutil
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import click
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
+
+logger = logging.getLogger(__name__)
 
 _SEVERITY_STYLE = {
     "CRITICAL": "bold red",
@@ -163,14 +165,42 @@ def _build_sources(config: Any) -> list:
     return sources
 
 
+#: One router per configuration, for the life of the process.
+#:
+#: Not an optimisation. ``_build_notifier`` is called from six places — the
+#: watcher, the repair loop, the merger, the post-merge verifier and two CLI
+#: commands — and each call used to construct its own ledger, which loads the
+#: file once at startup and keeps its answer in memory. The repair loop would
+#: record that the owner had been told; the detector's copy, holding a snapshot
+#: taken before that write, would decide the same problem was news and say it
+#: again. Sharing one router is what makes "tell them once" true inside a single
+#: process, the way the ledger file makes it true across restarts.
+_NOTIFIER_CACHE: Dict[int, Any] = {}
+
+
 def _build_notifier(config: Any) -> Any:
-    """Build the notification router, falling back to console output."""
+    """Build the notification router, falling back to console output.
+
+    Memoized per config object: every part of the pipeline shares one router,
+    one ledger and one outage registry. See :data:`_NOTIFIER_CACHE`.
+    """
+    cached = _NOTIFIER_CACHE.get(id(config))
+    if cached is not None:
+        return cached
+    router = _make_notifier(config)
+    _NOTIFIER_CACHE[id(config)] = router
+    return router
+
+
+def _make_notifier(config: Any) -> Any:
+    """Construct a fresh router. Use :func:`_build_notifier` instead."""
     from openjarvis.reliability.notify import (
         ConsoleNotifier,
         NotificationRouter,
         TelegramNotifier,
     )
     from openjarvis.reliability.notify_ledger import NotificationLedger, ledger_path
+    from openjarvis.reliability.outage import OutageRegistry, outages_path
     from openjarvis.reliability.types import Severity
 
     rc = config.reliability
@@ -191,7 +221,73 @@ def _build_notifier(config: Any) -> Any:
         persona=rc.notify.persona,
         # On disk, so a restart is not a reason to say it all again.
         ledger=NotificationLedger(path=ledger_path(config)),
+        # Also on disk, so a restart is not a reason to re-split one broken
+        # deployment into one message per failing probe.
+        outages=OutageRegistry(path=outages_path(config)),
+        alert_on_critical=bool(getattr(rc.notify, "alert_on_critical", False)),
     )
+
+
+def _build_owner_commands(config: Any, store: Any, supervisor: Any) -> Any:
+    """Build the owner-command listener, or ``None`` when it is switched off.
+
+    ``None`` rather than a disabled listener, for the same reason the merger
+    returns ``None``: a disabled thing that still runs is a thing that can
+    still surprise somebody. Off means nothing is listening on the channel at
+    all.
+    """
+    rc = config.reliability
+    if not (rc.notify.enabled and getattr(rc.notify, "accept_owner_commands", False)):
+        return None
+    if rc.notify.channel != "telegram":
+        return None
+
+    from openjarvis.reliability.owner_commands import (
+        OwnerCommandListener,
+        OwnerCommands,
+    )
+
+    router = _build_notifier(config)
+    transport = getattr(router, "notifier", None)
+    commands = OwnerCommands(
+        allowed_chat_ids=config.channel.telegram.allowed_chat_ids,
+        outages=getattr(router, "outages", None),
+        store=store,
+        gate=getattr(supervisor, "gate", None),
+        persona=rc.notify.persona,
+        audit=lambda result: _audit_owner_command(store, result),
+    )
+    return OwnerCommandListener(commands=commands, notifier=transport)
+
+
+def _audit_owner_command(store: Any, result: Any) -> None:
+    """Record every owner command, including the ones that were refused.
+
+    An unauthorised attempt is the entry most worth having, and it is the one a
+    handler that only logged successes would throw away.
+
+    The audit chain is keyed on incidents, so a command that names an outage is
+    chained against the first incident in it and one that names nothing is
+    logged. Neither path may raise: a failure to record must not stop JARVIS
+    replying to its owner, and must not stop it refusing a stranger.
+    """
+    summary = (
+        f"owner command: intent={result.intent or 'none'} "
+        f"authorized={result.authorized} executed={result.executed} "
+        f"outage={result.outage_key or 'none'}"
+    )
+    incident_id = next(iter(result.resumed), "")
+    if not incident_id or not str(incident_id).startswith("INC-"):
+        logger.info("%s (not chained: no incident named)", summary)
+        return
+    try:
+        incident = store.get(str(incident_id))
+        if incident is not None:
+            store.record_audit(incident, actor="owner", reason=summary)
+            return
+    except Exception:  # noqa: BLE001 - auditing must not break the reply
+        logger.debug("could not audit an owner command", exc_info=True)
+    logger.info("%s", summary)
 
 
 def _build_policy(config: Any) -> Any:
@@ -667,6 +763,7 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
     console.print(escape(startup_banner(config)))
 
     store = _get_store(config)
+    owner_commands = None
     try:
         monitor, supervisor = _build_supervised_monitor(config, store)
         if not monitor.checks:
@@ -680,6 +777,13 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
             f"JARVIS monitoring {escape(rc.site.base_url)} "
             f"({len(monitor.checks)} check(s))."
         )
+
+        owner_commands = _build_owner_commands(config, store, supervisor)
+        if owner_commands is not None and owner_commands.start():
+            console.print(
+                "Listening for owner replies on Telegram "
+                '(only "Fix it" and a status question are understood).'
+            )
 
         # Crash recovery: park anything that was mid-repair when we last
         # stopped. Nothing is resumed automatically.
@@ -710,6 +814,8 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
             f"repairs deferred: {stats['repairs_deferred']}"
         )
     finally:
+        if owner_commands is not None:
+            owner_commands.stop()
         store.close()
 
 
@@ -1476,6 +1582,12 @@ def _safety_snapshot(config: Any) -> dict:
             "ON" if rc.supabase.allow_production_writes else "OFF"
         ),
         "SQL write guard": "active",
+        "Owner alerts on detection": (
+            "ON" if getattr(rc.notify, "alert_on_critical", False) else "OFF"
+        ),
+        "Owner commands accepted": (
+            "ON" if getattr(rc.notify, "accept_owner_commands", False) else "OFF"
+        ),
     }
 
 
@@ -1596,6 +1708,91 @@ def _notify_diagnostic(notifier: Any, report: Any, config: Any) -> None:
         f"Production deployment: {safety['Deploy mode']}",
     ]
     notifier.notify("\n".join(lines), severity=Severity.MEDIUM)
+
+
+@reliability.command("replay-notifications")
+@click.option("--db", "db_path", default="", help="Incident database to replay.")
+@click.option(
+    "--limit", default=500, show_default=True, help="How many incidents to read."
+)
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
+@click.option(
+    "--show", is_flag=True, help="Print every message each policy would send."
+)
+def reliability_replay_notifications(
+    db_path: str, limit: int, as_json: bool, show: bool
+) -> None:
+    """Count what the owner would have been told, old rules versus new.
+
+    Reads the incident database, replays the recorded history through both
+    notification policies, and reports both counts. Nothing is sent: the
+    transport is a recorder, and the store is only read.
+
+    This is the acceptance test for a change to the notification rules. A
+    policy that claims to reduce noise should be able to say by how much, over
+    incidents that actually happened.
+    """
+    import json as json_module
+
+    from openjarvis.reliability.replay import load_incidents, replay
+
+    console = Console()
+    config = _load_config()
+    path = db_path or config.reliability.db_path
+
+    try:
+        incidents = load_incidents(path, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(f"could not read {path}: {exc}") from exc
+
+    if not incidents:
+        console.print(f"[yellow]No incidents in {escape(str(path))}.[/yellow]")
+        return
+
+    outcome = replay(incidents)
+    before, after = outcome["before"], outcome["after"]
+
+    if as_json:
+        click.echo(
+            json_module.dumps(
+                {
+                    "database": str(path),
+                    "incidents": len(incidents),
+                    "before": before.to_dict(),
+                    "after": after.to_dict(),
+                },
+                indent=2,
+            )
+        )
+        return
+
+    saved = before.count - after.count
+    percent = (saved / before.count * 100.0) if before.count else 0.0
+    table = Table(title=f"Owner messages over {len(incidents)} incident(s)")
+    table.add_column("Policy")
+    table.add_column("Messages", justify="right")
+    table.add_row("before (per-fingerprint, no ask gate)", str(before.count))
+    table.add_row("after (per-outage, actionable asks only)", str(after.count))
+    console.print(table)
+    console.print(
+        f"{after.outages} correlated outage(s) from {len(incidents)} incident(s)."
+    )
+    console.print(f"[bold]{saved} fewer message(s)[/bold] ({percent:.0f}% quieter).")
+    console.print(
+        "[dim]The 'before' count is a lower bound: the store records "
+        "incidents, not deliveries.[/dim]"
+    )
+
+    if show:
+        for result in (before, after):
+            console.print("")
+            console.print(f"[bold]{escape(result.label)}[/bold]")
+            for entry in result.messages:
+                first = str(entry.get("message", "")).splitlines()[:1]
+                console.print(
+                    f"  • {escape(str(entry.get('incident', '')))} "
+                    f"{escape(first[0] if first else '')}"
+                )
 
 
 @reliability.command("notify-test")

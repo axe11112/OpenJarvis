@@ -342,6 +342,23 @@ class RepairGate:
                 if key:
                     self._cooldown_until[key] = (until, why)
 
+    def clear_cooldown(self, *keys: str) -> List[str]:
+        """Drop the cooldown on specific incidents or fingerprints.
+
+        What "Fix it" is allowed to do, and the whole of it. A cooldown is
+        operational pacing — do not immediately retry something that just
+        failed — not a safety control, so an owner saying "carry on" may end
+        one. Nothing here touches the emergency stop, the concurrency limit,
+        the attempt ceiling, or any verification gate: those refuse for reasons
+        that a message from a phone does not answer.
+        """
+        cleared: List[str] = []
+        with self._lock:
+            for key in keys:
+                if key and self._cooldown_until.pop(key, None) is not None:
+                    cleared.append(key)
+        return cleared
+
     @property
     def active(self) -> List[str]:
         """Incidents currently being repaired."""

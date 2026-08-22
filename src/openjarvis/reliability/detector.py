@@ -233,6 +233,10 @@ class Detector:
                 "expected": spec.expectation_summary(),
                 "actual": result.error,
                 "failure_kind": result.failure_kind,
+                # Recorded so correlation can tell "the site did not answer"
+                # from "the site answered and said no". A 5xx groups with other
+                # probes failing at the same moment; a 401 does not.
+                "http_status": result.http_status,
                 "final_url": result.final_url,
                 "declared_severity": spec.severity.value,
                 "severity_rule": classification.to_dict(),

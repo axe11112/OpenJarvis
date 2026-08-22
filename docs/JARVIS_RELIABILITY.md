@@ -253,16 +253,21 @@ fresh evidence — an explicit human decision, taken with
 
 ## 10. Notifications
 
-The owner hears from JARVIS in exactly three situations:
+Telegram is not a monitoring console. The owner hears from JARVIS in exactly
+two situations, and for one underlying problem they hear at most one of them:
 
-1. **It is fixed.** One message, at the end, saying what broke and what is
-   waiting for them.
-2. **Something serious happened** — a CRITICAL fault, a rollback.
-3. **JARVIS stopped and needs a human** — with the handover attached.
+1. **It is fixed** — and only if they were told it was broken. A problem they
+   never heard about, that recovered on its own, produces nothing at all.
+2. **JARVIS needs a specific thing from them** — a decision, an approval, a
+   credential rotated, a deployment rolled back. Not "I could not fix it",
+   which is a status. The message carries the exact operator action, and when
+   no action can be named nothing is sent and the incident parks visibly in
+   Control Center instead.
 
 Everything else is logged and shown in the Control Center: incidents opening,
-repairs starting, previews building, merges landing, production verification
-running. Those are steps. The owner is told outcomes.
+severity rising, another probe joining an outage, repairs starting, previews
+building, merges landing, production verification running. Those are steps. The
+owner is told outcomes.
 
 That is a policy, not a tuning knob, and it inverts the obvious design. The
 tempting version narrates — problem found, investigating, repairing, verifying,
@@ -274,6 +279,67 @@ Copy is deterministic: assembled from the component, the outcome, the recorded
 root cause and a PR number. No model writes a notification. Messages pass the
 outbound redaction guard and are rate-capped.
 
+### One problem, however many probes noticed it
+
+An incident is what a *probe* saw. An outage is what *went wrong*. Conflating
+them is how one failing deployment produced ten messages in a morning: the
+homepage probe opened an incident, login opened another, sign-up a third, and
+each carried its own fingerprint, its own ledger entry and its own escalation.
+
+`openjarvis/reliability/outage.py` introduces the second object. Every incident
+is assigned an owner-facing **outage identity**, and deduplication, escalation
+and success messages all key on that rather than on the incident or its
+fingerprint. Five failing probes produce one message; the five incidents
+survive intact underneath it, with their own evidence, in the store and on the
+Control Center.
+
+Correlation is conservative, because getting it wrong hides a real problem
+inside one the owner has already dismissed. Three rules:
+
+| Rule | Effect |
+| --- | --- |
+| **Families never merge** | A failing database, an auth *security* failure, an external provider outage and a failing website are four different problems whatever their timing |
+| **Only availability groups across components** | "The site did not answer" is a claim about the site. A wrong assertion on a page that loaded is a claim about that page, and groups only with itself — unless a *shared failing deployment* is established for both, which is evidence rather than proximity |
+| **Time is a constraint, not a signal** | Coincidence alone never groups anything; failing every other rule is never rescued by overlapping |
+
+An unrecognised component becomes its own family. An extra message is the right
+answer to "I do not know what this is".
+
+The registry persists beside the incident database (`outages.json`), so the
+outage an incident belongs to survives a restart, a sleeping laptop, and the new
+incident ids a flapping check produces every few minutes.
+
+### An escalation has to ask for something
+
+`openjarvis/reliability/owner_ask.py` assembles a structured `OwnerAsk` before
+any escalation is sent: what failed, the established cause, the evidence, what
+was tried, why JARVIS cannot safely continue, and one field the rest of the
+system treats as a gate — **the exact operator action required**.
+
+If that field is empty there is no escalation. Not a vaguer one, none. The
+problem stays open, the investigation continues, and Control Center shows it
+parked with the reason no action could be named.
+
+| Recorded reason | What the owner is asked |
+| --- | --- |
+| post-merge verification failed | Revert the PR or roll production back, then tell me to continue |
+| protected path | Apply the change yourself, or allow-list the path |
+| a secret in the change | Rotate the credential, then tell me to continue |
+| scope exceeded | Approve the larger change in Control Center |
+| repair disabled | Reply "Fix it", or fix it yourself |
+| a flapping check | *nothing* — the check is unreliable, which is a monitoring problem |
+| an interrupted repair | *nothing* — parked for review |
+| latency only / observer degraded | *nothing* — not corroborated as a production outage |
+| attempts exhausted | A rollback decision, **only** when there is a decision to make |
+
+That last row is the line this change must not cross. An exhausted repair on a
+MEDIUM contract failure parks in silence. An exhausted repair while users cannot
+reach the site is a decision only the owner can make, and refusing to ask it
+would be hiding an outage rather than quietening one. So the ask is named when
+a previous working deployment is recorded, and named without the SHA when the
+outage is genuinely taking the site away from users. A failure whose kind was
+never recorded counts as user-facing: "unknown" is not "harmless".
+
 ### Saying it once
 
 The in-process dedup window and hourly cap are memory, and the watcher restarts
@@ -281,29 +347,92 @@ whenever the machine sleeps, the code updates, or launchd decides to. The owner
 does not experience a restart as a fresh start; they experience it as being told
 the same thing again.
 
-So the record of what has been said is persisted, next to the incident database,
-keyed by **fingerprint** and by **what the incident means to the owner** rather
-than by its internal state:
+So the record of what has been said is persisted next to the incident database,
+keyed by the **underlying problem** and by **what it currently asks of the
+owner**:
 
 | Owner-facing state | Internal states that collapse into it |
 | --- | --- |
 | `fixed` | `RESOLVED` |
-| `needs-you:<SEV>` | `HUMAN_REQUIRED`, `FAILED`, `RECOVERY_REQUIRED`, `ROLLED_BACK` |
+| `needs-you:<SEV>:<ask>` | `HUMAN_REQUIRED`, `FAILED`, `RECOVERY_REQUIRED`, `ROLLED_BACK` |
 | `working:<SEV>` | everything else |
 
-Two internal states that ask the same thing of the owner produce one message.
-Only four things speak again: it is fixed, JARVIS has stopped when it was
-working, the severity rose, or it broke again after a fix. Everything else is
-silence.
+`<ask>` is a digest of the operator action, and of nothing else — not the
+attempt count, not the internal reason, and deliberately not the list of
+affected components. A fourth probe joining an outage the owner has already been
+asked about is not a new thing to do.
 
-Keying on the fingerprint rather than the incident id matters: a flapping check
-opens a fresh incident every time it fails, and keyed on id every recurrence
-looks new.
+Only three things speak again: it is fixed, JARVIS has stopped when it was
+working, or the *action required* changed. A severity that rises without
+changing what the owner must do is a state machine talking about itself.
 
-A held CRITICAL alert is recorded only at the moment it is actually sent — a
-cancelled one must leave no trace, or it would silence the escalation that
-replaced it. And a ledger that cannot be read costs a duplicate, never a missed
-outage: when in doubt, speak.
+Problem and success share one slot, so "it needs you" and "it is fixed" are two
+positions of one conversation about one outage rather than two subscriptions
+that do not refer to each other. A success is recorded rather than forgotten:
+the repair loop, the post-merge verifier and the detector all have a claim on
+"it works again", and without a record the owner reads those as three fixes for
+one problem.
+
+Two failure modes are handled deliberately in opposite directions. A ledger that
+cannot be read costs a duplicate, never a missed outage — when in doubt, speak.
+A *recovery* with no ledger to consult sends nothing — without a record of
+having woken somebody there is no conversation to end.
+
+The router is also built once per process. It used to be constructed separately
+by the watcher, the repair loop, the merger, the post-merge verifier and two CLI
+commands; each held its own in-memory snapshot of the ledger, so one component
+recording "the owner has been told" did not stop another sending it again.
+
+### Detection is never news
+
+A CRITICAL detection does not interrupt the owner. `alert_on_critical` exists
+and defaults to off, and the default matters more than the switch: an incident
+opening is the system working, and a message that arrives before JARVIS knows
+whether it can handle the problem is followed thirty seconds later by one that
+does know. That pair — "something serious happened", then "I need your help" —
+was half of the ten messages one morning produced.
+
+A rollback is the one detection-shaped event still sent unconditionally:
+production changed underneath the owner, JARVIS did it, and there is no other
+way for them to find out when it matters.
+
+### Replaying the history
+
+```bash
+jarvis reliability replay-notifications          # both counts, from the real store
+jarvis reliability replay-notifications --show   # ...and every message
+```
+
+Reads the incident database, replays the recorded history through the old rules
+and the new ones, and reports both counts. Nothing is sent: the transport is a
+recorder and the store is only read. Over the five incidents of the morning that
+prompted this work, ten messages become one.
+
+The "before" number is a **lower bound**. The store records incidents, not
+deliveries, so an incident that flapped between states during a cycle the store
+never observed produced messages the replay cannot see.
+
+### Replying to Sir
+
+An escalation that ends "reply *Fix it* to let me continue" has to mean
+something. `openjarvis/reliability/owner_commands.py` accepts exactly two
+things — "Fix it" and a status question — from a chat id on the existing
+`allowed_chat_ids` allowlist, with matching done by a closed phrase table and no
+model in the path.
+
+An empty allowlist authorises nobody. That is the opposite of how the outbound
+channel treats an empty list, and the asymmetry is the point: "send to nobody"
+loses a message, "accept from anybody" hands over a control. A negated
+instruction ("don't fix it") is never interpreted at all.
+
+"Fix it" clears the **repair cooldown** for the incidents in the current outage,
+acknowledges once, and goes quiet. That is the whole of it. It does not clear
+the emergency stop, raise the attempt ceiling, approve a merge, relax a
+verification gate or touch production — those refuse for reasons a text message
+does not answer. With two independent problems open it asks one question rather
+than guessing which one "it" meant.
+
+Off by default: `[reliability.notify] accept_owner_commands`.
 
 ### A failed build is not an alert forever
 
@@ -433,6 +562,14 @@ enabled = false
 min_severity = "MEDIUM"
 critical_escalation_minutes = 5
 providers = ["telegram"]
+
+[reliability.notify]
+enabled = false
+channel = "telegram"
+min_severity = "MEDIUM"
+max_messages_per_hour = 20
+alert_on_critical = false      # a detection is not an outcome — see §10
+accept_owner_commands = false  # "Fix it" from the owner's chat
 
 [reliability.repair]
 enabled = false            # the master switch — see JARVIS_REPAIR_LOOP.md §12

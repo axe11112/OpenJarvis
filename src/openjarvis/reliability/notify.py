@@ -16,18 +16,29 @@ opened, merged. Each message is true and the sequence is worthless — an owner
 who receives six messages per incident learns to swipe them away, and the one
 that needed them arrives in a stream they have trained themselves to ignore.
 
-So the owner hears from JARVIS in exactly three situations:
+So the owner hears from JARVIS in exactly two situations, and for one
+underlying problem they hear at most one of them:
 
-1. **It is fixed.** One message, at the end, saying what broke and what is
-   waiting for them. Which message depends on the operating mode: a pull
-   request is the outcome when merging is off, a live fix when it is on.
-2. **Something serious happened** — a CRITICAL fault, a rollback.
-3. **JARVIS stopped and needs a human** — attempts exhausted, a safety refusal,
-   or a merge that went live and did not come good.
+1. **It is fixed** — and only when they were told it was broken in the first
+   place. A problem they never heard about, that recovered on its own, produces
+   nothing at all.
+2. **JARVIS needs a specific thing from them** — a decision, an approval, a
+   rotation, a rollback. Not "I could not fix it", which is a status; the
+   message carries the exact operator action, and if
+   :mod:`~openjarvis.reliability.owner_ask` cannot name one, nothing is sent
+   and the incident parks visibly in Control Center instead.
 
 Everything else is logged and visible in the dashboard: incidents opening,
-repairs starting, previews building, merges landing, production verification
-running. Those are steps. The owner is told outcomes.
+severity rising, repairs starting, previews building, merges landing,
+production verification running, another probe joining an outage. Those are
+steps. The owner is told outcomes.
+
+**One problem, one message.** Deduplication keys on the correlated *outage*
+from :mod:`~openjarvis.reliability.outage`, not on the incident and not on its
+fingerprint. A deployment that takes down the homepage, login and sign-up opens
+three incidents — all three survive, with their own evidence, in the store and
+the dashboard — and produces one owner-facing message naming all three
+subjects. A new incident id for the same underlying problem produces none.
 
 The copy itself is deterministic — assembled from the component, the outcome,
 the recorded root cause and a pull request number. No model writes a
@@ -50,6 +61,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from openjarvis.reliability.owner_ask import OwnerAsk, build_owner_ask
 from openjarvis.reliability.types import (
     Incident,
     RepairAttempt,
@@ -64,9 +76,12 @@ __all__ = [
     "NotificationRouter",
     "MultiNotifier",
     "Notifier",
+    "RecordingNotifier",
     "TelegramNotifier",
     "plain_subject",
     "render_alert",
+    "render_ask",
+    "render_fixed",
     "render_human_required",
     "render_post_merge_failed",
     "render_production_verified",
@@ -283,6 +298,54 @@ def render_human_required(
     return "\n".join(lines)
 
 
+def render_ask(ask: OwnerAsk, *, persona: bool = True) -> str:
+    """The one message that asks the owner for something.
+
+    Four lines at most, and the fourth is the only one that matters: the exact
+    thing the operator has to do. Everything else — the evidence, the attempts,
+    the internal reason, the full handover — is in Control Center, where there
+    is a screen and no one is half asleep.
+
+    Never called with an ask that has no action:
+    :meth:`NotificationRouter.human_required` refuses first. The rendering is
+    written as if that guarantee holds because it does, and a message that
+    reached a phone saying "I need your help" with nothing after it would be
+    the exact failure this module exists to prevent.
+    """
+    lines = [_sir(persona, "I need your help."), f"{ask.what_failed}."]
+    if ask.cause:
+        lines[-1] = f"{ask.what_failed} because {ask.cause}."
+    lines.append("I stopped making changes.")
+    lines.append(ask.action)
+    if ask.reference:
+        lines += ["", ask.reference]
+    return "\n".join(lines)
+
+
+def render_fixed(
+    incident: Incident, *, subjects: Sequence[str] = (), persona: bool = True
+) -> str:
+    """The one message a resolved outage sends.
+
+    Deliberately short, and deliberately the same words whichever part of the
+    pipeline established it: a repair that verified, a merge that reached
+    production, or the problem simply going away after the owner was already
+    woken. Three different internal facts, one thing the owner cares about.
+    """
+    lines = [_sir(persona, "it's fixed.")]
+    names = [str(s).strip() for s in subjects if str(s).strip()]
+    if len(names) > 1:
+        rendered = ", ".join(n[:1].lower() + n[1:] for n in names[:-1])
+        last = names[-1]
+        lines.append(
+            f"{rendered.capitalize()} and {last[:1].lower() + last[1:]} are "
+            "working normally again."
+        )
+    else:
+        lines.append("Everything is working normally again.")
+    return "\n".join(lines)
+
+
 def _handover_cause(incident: Incident) -> str:
     """One clause of cause from the recorded handover, when it established one.
 
@@ -399,6 +462,34 @@ class ConsoleNotifier(Notifier):
         self.sent.append(message)
         logger.info("JARVIS notification [%s]:\n%s", severity.value, message)
         return True
+
+
+class RecordingNotifier(Notifier):
+    """Keeps every message instead of delivering it.
+
+    Exists so the notification policy can be exercised against real recorded
+    incident history without anything reaching a phone. ``jarvis reliability
+    replay-notifications`` runs the whole router over the incident database
+    through one of these, which is the only honest way to answer "how many
+    messages would the new rules have sent?" — and the only safe way, because
+    the alternative is finding out by sending them.
+    """
+
+    notifier_id = "recording"
+
+    def __init__(self, *, notifier_id: str = "recording") -> None:
+        self.notifier_id = notifier_id
+        self.messages: List[Dict[str, Any]] = []
+
+    def send(self, message: str, *, severity: Severity = Severity.MEDIUM) -> bool:
+        """Record the message. Always succeeds, never delivers."""
+        self.messages.append({"message": message, "severity": severity.value})
+        return True
+
+    @property
+    def count(self) -> int:
+        """How many messages would have reached the owner."""
+        return len(self.messages)
 
 
 class TelegramNotifier(Notifier):
@@ -531,6 +622,20 @@ class NotificationRouter:
     #: Remembers what the owner has already been told, across restarts. Without
     #: it, every watcher restart re-announces every open problem.
     ledger: Any = None
+    #: Groups incidents into the underlying problem they are evidence of. Every
+    #: dedup decision keys on the outage this returns; without it the router
+    #: falls back to the fingerprint, which is one message per probe.
+    outages: Any = None
+    #: Whether a CRITICAL detection may interrupt the owner on its own.
+    #:
+    #: Off. Detection is not an outcome — a probe failing, an incident opening
+    #: and a severity rising are all the system working, and the owner hears
+    #: either the fix or the actionable escalation. The deferral machinery below
+    #: is kept and still correct for an operator who turns this on knowing what
+    #: it costs; :meth:`rolled_back` is the one detection-shaped event that is
+    #: still sent unconditionally, because a live change having been undone is
+    #: a fact about production the owner cannot get any other way.
+    alert_on_critical: bool = False
 
     _sent_times: List[float] = field(default_factory=list, repr=False)
     _recent: Dict[str, float] = field(default_factory=dict, repr=False)
@@ -590,23 +695,38 @@ class NotificationRouter:
     # -- incident-shaped helpers ------------------------------------------
 
     def alert(self, incident: Incident) -> bool:
-        """An incident has opened. Silent unless it is genuinely serious.
+        """An incident has opened. Silent.
 
-        A probe failing once, an incident opening, a repair starting: these are
-        the system working, and JARVIS exists precisely so the owner does not
-        have to watch them. Only CRITICAL interrupts — everything JARVIS is
-        allowed to handle automatically is handled silently, and the owner hears
-        either the fix or the escalation, never the commentary in between.
+        A probe failing, an incident opening, a severity rising: these are the
+        system working, and JARVIS exists precisely so the owner does not have
+        to watch them. Detection is not an outcome. The owner hears either the
+        fix or an escalation that names something for them to do, never the
+        commentary in between — and never a message that arrives *before*
+        JARVIS knows which of those two it is going to be.
 
-        Even a CRITICAL is held briefly rather than sent at once. A CRITICAL
-        that JARVIS may not repair escalates to ``HUMAN_REQUIRED`` within the
-        same tick, and the owner would get two messages seconds apart about one
-        event: "something serious happened", then "I need your help". The second
-        is strictly more useful — it says what to do — so the first waits out a
-        short grace period and is cancelled if the escalation arrives. A
-        CRITICAL that nothing supersedes is sent when the grace expires, so a
-        standalone one still gets through.
+        That last point is why :attr:`alert_on_critical` defaults to off rather
+        than to a short grace period. A CRITICAL that JARVIS may not repair
+        escalates to ``HUMAN_REQUIRED`` seconds later, and the owner used to get
+        both: "something serious happened", then "I need your help". Holding the
+        first briefly made the pair rarer without making it impossible — a
+        repair that takes four minutes to exhaust itself outruns any grace
+        window worth having.
+
+        The deferral machinery below is kept and still correct, for an operator
+        who turns detection alerts back on knowing what they cost. When enabled,
+        a CRITICAL is held for :attr:`critical_grace_seconds`, cancelled if an
+        escalation for the same *outage* supersedes it, and sent otherwise — so
+        a standalone CRITICAL that nothing follows still gets through.
         """
+        if not self.alert_on_critical:
+            logger.info(
+                "incident %s (%s) handled silently; detection is not an "
+                "outcome and no notification was sent",
+                incident.id,
+                incident.severity.value,
+            )
+            return False
+
         if incident.severity is not Severity.CRITICAL:
             logger.info(
                 "incident %s (%s) handled silently; no notification sent",
@@ -615,6 +735,7 @@ class NotificationRouter:
             )
             return False
 
+        self._outage(incident)
         if not self._is_news(incident):
             return False
 
@@ -626,35 +747,99 @@ class NotificationRouter:
         # Not recorded yet: a held alert has not been said. Recording here would
         # make an escalation that supersedes it look like a repeat and silence
         # the only message the owner actually needs.
-        self._defer_alert(incident.id, message, incident)
+        #
+        # Held per *outage*, not per incident: when a deployment failure opens
+        # three incidents and one of them escalates, the escalation has to be
+        # able to cancel a hold raised by either of the other two.
+        self._defer_alert(self._identity(incident), message, incident)
         return False
 
     # -- what the owner already knows -------------------------------------
 
-    def _is_news(self, incident: Incident) -> bool:
+    def _is_news(self, incident: Incident, *, ask: Optional[OwnerAsk] = None) -> bool:
         """Whether telling the owner would tell them anything."""
         if self.ledger is None:
             return True
         try:
-            return bool(self.ledger.should_notify(incident))
+            return bool(self.ledger.should_notify(incident, ask=ask))
         except Exception:  # noqa: BLE001 - a broken ledger must not silence us
             logger.exception("could not consult the notification ledger")
             return True
 
-    def _remember(self, incident: Incident) -> None:
+    def _remember(self, incident: Incident, *, ask: Optional[OwnerAsk] = None) -> None:
         if self.ledger is None:
             return
         try:
-            self.ledger.record(incident)
+            self.ledger.record(incident, ask=ask)
         except Exception:  # noqa: BLE001
             logger.exception("could not record the notification")
+
+    def _was_told(self, incident: Incident, *, when_unknown: bool = True) -> bool:
+        """Whether the owner is currently carrying an unresolved escalation.
+
+        The gate on every success message. An outage that never reached them
+        does not get a "it's fixed" — that sentence only means something as the
+        end of a conversation they were part of, and sending it to somebody who
+        heard nothing about the problem is how "everything is working normally"
+        becomes the noisiest message of the day.
+
+        ``when_unknown`` is what to assume with no ledger, and the two callers
+        answer it differently on purpose. A repair JARVIS *performed* reports
+        itself when there is no memory to consult — losing a genuine success is
+        worse than repeating one. A fault that recovered on its own does not:
+        without a record of having woken somebody there is no conversation to
+        end, and announcing every transient blip that cleared itself is the
+        exact noise this module exists to remove.
+        """
+        if self.ledger is None:
+            return when_unknown
+        try:
+            return bool(self.ledger.was_told(incident))
+        except Exception:  # noqa: BLE001
+            logger.exception("could not consult the notification ledger")
+            return when_unknown
+
+    # -- one problem, however many probes ---------------------------------
+
+    def _outage(self, incident: Incident) -> Any:
+        """The correlated outage for *incident*, and its key on the incident.
+
+        Assigning writes ``metadata["outage_key"]`` back onto the incident, so
+        everything downstream — the ledger, the Control Center, the audit
+        entry — agrees about which problem this is without re-deriving it.
+        """
+        if self.outages is None:
+            return None
+        try:
+            outage = self.outages.assign(incident)
+        except Exception:  # noqa: BLE001 - correlation is an optimisation
+            logger.exception("could not correlate %s into an outage", incident.id)
+            return None
+        try:
+            incident.metadata["outage_key"] = outage.key
+        except Exception:  # noqa: BLE001
+            pass
+        return outage
+
+    def _identity(self, incident: Incident) -> str:
+        """The dedup identity: the outage when there is one, else fingerprint."""
+        from openjarvis.reliability.notify_ledger import owner_identity
+
+        return owner_identity(incident)
+
+    def _subjects(self, incident: Incident, outage: Any) -> List[str]:
+        """Every component the owner would name, for a grouped message."""
+        from openjarvis.reliability.owner_ask import owner_subjects
+
+        return owner_subjects(incident, outage)
 
     # -- deferral ---------------------------------------------------------
 
     def _defer_alert(
-        self, incident_id: str, message: str, incident: Optional[Incident] = None
+        self, identity: str, message: str, incident: Optional[Incident] = None
     ) -> None:
         """Hold a CRITICAL alert, so an escalation can supersede it."""
+        incident_id = identity
         with self._alert_lock:
             existing = self._deferred.pop(incident_id, None)
             if existing is not None:
@@ -685,8 +870,15 @@ class NotificationRouter:
             self._remember(incident)
         self.notify(message, severity=Severity.CRITICAL)
 
-    def _supersede(self, incident_id: str) -> bool:
-        """Drop a held alert because a better message is going out instead."""
+    def _supersede(self, identity: str) -> bool:
+        """Drop a held alert because a better message is going out instead.
+
+        Keyed on the outage identity, so an escalation raised by *any* incident
+        in a group cancels a hold raised by any other. Three probes failing on
+        one deployment must not produce "something serious happened" from the
+        homepage alongside "I need your help" from login.
+        """
+        incident_id = identity
         with self._alert_lock:
             timer = self._deferred.pop(incident_id, None)
         if timer is None:
@@ -725,41 +917,101 @@ class NotificationRouter:
         attempt: Optional[RepairAttempt] = None,
         verification: Optional[VerificationResult] = None,
     ) -> bool:
-        """The success message, in pull-request mode. Always sent.
+        """The success message, in pull-request mode.
+
+        Sent only when the owner was told there was a problem. A fault they
+        never heard about, fixed before it needed them, is not good news — it is
+        an interruption about something they were deliberately spared, and it
+        is the reason "most incidents are handled silently" has to mean
+        *silently at both ends*.
 
         HIGH regardless of the incident's own severity: this is the outcome the
         owner stayed quiet for, and the severity that got them here was about
         the fault, not about the news that it is over.
         """
-        self._supersede(incident.id)
-        if self.ledger is not None:
-            try:
-                # A fix closes the account. If this ever breaks again, that is
-                # news, so the problem record goes rather than lingering and
-                # silencing the next genuine failure.
-                self.ledger.forget(incident)
-            except Exception:  # noqa: BLE001
-                logger.exception("could not clear the notification ledger")
-        return self.notify(
-            render_resolved(
+        return self._succeed(
+            incident,
+            build=lambda outage: render_resolved(
                 incident,
                 attempt=attempt,
                 verification=verification,
                 persona=self.persona,
             ),
-            severity=Severity.HIGH,
         )
+
+    def _succeed(
+        self,
+        incident: Incident,
+        *,
+        build: Callable[[Any], str],
+        when_unknown: bool = True,
+    ) -> bool:
+        """One success message per outage, and only to somebody who was told.
+
+        Every route to "it works again" — a verified repair, a merge that
+        reached production, the problem clearing on its own after the owner was
+        already woken — comes through here, so the three of them can never
+        become three messages about one recovery.
+        """
+        outage = self._outage(incident)
+        identity = self._identity(incident)
+        self._supersede(identity)
+
+        if not self._was_told(incident, when_unknown=when_unknown):
+            logger.info(
+                "%s resolved; the owner was never told it broke, so nothing is sent",
+                incident.id,
+            )
+            self._close_outage(outage)
+            return False
+
+        message = build(outage)
+        sent = self.notify(message, severity=Severity.HIGH)
+        if sent and self.ledger is not None:
+            try:
+                # Recorded, not forgotten: a second component of the same
+                # outage reaching RESOLVED must not send a second "it's fixed".
+                self.ledger.record_fixed(incident)
+            except Exception:  # noqa: BLE001
+                logger.exception("could not record the success in the ledger")
+        self._close_outage(outage)
+        return sent
+
+    def _close_outage(self, outage: Any) -> None:
+        if outage is None or self.outages is None:
+            return
+        try:
+            self.outages.resolve(outage.key)
+        except Exception:  # noqa: BLE001
+            logger.exception("could not close outage %s", getattr(outage, "key", ""))
 
     def recovered(self, incident: Incident, *, recovery_type: Any = None) -> bool:
-        """Silent. A fault that stopped on its own needed nobody.
+        """Silent — unless the owner is still holding an open escalation.
 
-        Neither a fix JARVIS made nor a problem anybody must act on — reporting
-        it is the definition of noise.
+        A fault that stopped on its own needed nobody, and reporting it is the
+        definition of noise. But if JARVIS already woke somebody about this
+        outage, they are waiting on it, and leaving them waiting because the
+        recovery happened to be external rather than repaired is a distinction
+        that matters to the metrics and to nobody else.
+
+        So: no owner escalation outstanding, nothing sent. One outstanding, the
+        single success message, and the ledger closes the account.
         """
-        logger.info(
-            "incident %s recovered without a repair (not notified)", incident.id
+        if not self._was_told(incident, when_unknown=False):
+            logger.info(
+                "incident %s recovered without a repair (not notified)", incident.id
+            )
+            self._close_outage(self._outage(incident))
+            return False
+        return self._succeed(
+            incident,
+            when_unknown=False,
+            build=lambda outage: render_fixed(
+                incident,
+                subjects=self._subjects(incident, outage),
+                persona=self.persona,
+            ),
         )
-        return False
 
     def human_required(
         self, incident: Incident, *, reason: str, attempts: int, max_attempts: int
@@ -772,26 +1024,80 @@ class NotificationRouter:
         Supersedes any CRITICAL alert still being held for this incident. Both
         describe the same event; this one also says what to do about it.
 
-        Also consults the ledger, so an incident that sits in ``HUMAN_REQUIRED``
-        across a dozen watcher cycles and two restarts is announced once.
+        Two gates stand in front of it, and both exist because of messages a
+        real owner received and could do nothing with.
+
+        **There must be a specific ask.** The escalation assembles an
+        :class:`~openjarvis.reliability.owner_ask.OwnerAsk` first, and if that
+        cannot name an operator action, nothing is sent. "The website needs
+        you" and "I could not fix it safely" are statuses, not requests; they
+        belong in Control Center, which is where the incident is parked with the
+        reason it could not be handed over. JARVIS keeps investigating.
+
+        **It must not already have been said.** The ledger keys on the
+        correlated outage and on a digest of the ask itself, so an outage that
+        sits in ``HUMAN_REQUIRED`` across a dozen watcher cycles, two restarts
+        and three fresh incident ids is announced once — and announced again
+        only when what is being asked of the owner actually changes.
         """
-        self._supersede(incident.id)
+        outage = self._outage(incident)
+        identity = self._identity(incident)
+        ask = build_owner_ask(
+            incident,
+            reason=reason,
+            outage=outage,
+            attempts=attempts,
+            max_attempts=max_attempts,
+        )
+        self._record_ask(incident, ask)
+
+        if not ask.actionable:
+            logger.info(
+                "incident %s: not escalating to the owner — %s. Parked in "
+                "Control Center.",
+                incident.id,
+                ask.parked_reason or "no operator action could be named",
+            )
+            # A held CRITICAL is *not* superseded here: there is no better
+            # message coming, so whatever the alert policy decided still
+            # stands.
+            return False
+
+        self._supersede(identity)
+        if not self._is_news(incident, ask=ask):
+            return False
+        self._remember(incident, ask=ask)
+        return self.notify(
+            render_ask(ask, persona=self.persona), severity=Severity.CRITICAL
+        )
+
+    def _record_ask(self, incident: Incident, ask: OwnerAsk) -> None:
+        """Store the ask on the incident, so Control Center can show it.
+
+        Written whether or not it is sent — an escalation that was *withheld*
+        is exactly the thing an operator looking at a parked incident needs to
+        see, along with the reason no action could be named.
+        """
+        try:
+            incident.metadata["owner_ask"] = ask.to_dict()
+        except Exception:  # noqa: BLE001
+            logger.exception("could not record the owner ask for %s", incident.id)
+
+    def rolled_back(self, incident: Incident, *, reason: str) -> bool:
+        """Notify that a live deployment was undone.
+
+        The one detection-shaped event still sent unconditionally. Production
+        changed underneath the owner, JARVIS did it, and there is no other way
+        for them to find out at the moment it matters. Still deduplicated on
+        the outage, so undoing one deployment that three probes were failing on
+        is one message.
+        """
+        self._outage(incident)
+        identity = self._identity(incident)
+        self._supersede(identity)
         if not self._is_news(incident):
             return False
         self._remember(incident)
-        return self.notify(
-            render_human_required(
-                incident,
-                reason=reason,
-                attempts=attempts,
-                max_attempts=max_attempts,
-                persona=self.persona,
-            ),
-            severity=Severity.CRITICAL,
-        )
-
-    def rolled_back(self, incident: Incident, *, reason: str) -> bool:
-        """Notify that a deployment was rolled back."""
         return self.notify(
             render_rolled_back(incident, reason=reason, persona=self.persona),
             severity=Severity.CRITICAL,
@@ -855,12 +1161,18 @@ class NotificationRouter:
     def production_verified(
         self, incident: Incident, *, record: Any, result: Any
     ) -> bool:
-        """The success message, in live mode. Always sent."""
-        return self.notify(
-            render_production_verified(
-                incident, record=record, result=result, persona=self.persona
+        """The success message, in live mode.
+
+        Same gate as every other route to "it works again": one per outage, and
+        only to an owner who was told it was broken.
+        """
+        return self._succeed(
+            incident,
+            build=lambda outage: render_fixed(
+                incident,
+                subjects=self._subjects(incident, outage),
+                persona=self.persona,
             ),
-            severity=Severity.HIGH,
         )
 
     def post_merge_failed(
@@ -872,18 +1184,21 @@ class NotificationRouter:
         design, and this is the message that exists for that exemption: the
         change is live, unreviewed, and unproven.
 
-        Supersedes a held alert for the same incident, for the same reason the
-        escalation does.
+        Supersedes a held alert for the same outage, for the same reason the
+        escalation does. Routed through the same ask machinery as every other
+        escalation, so the message names the rollback the owner has to make
+        rather than reporting that verification failed.
         """
-        self._supersede(incident.id)
-        if not self._is_news(incident):
-            return False
-        self._remember(incident)
-        return self.notify(
-            render_post_merge_failed(
-                incident, record=record, result=result, persona=self.persona
-            ),
-            severity=Severity.CRITICAL,
+        rule = str(getattr(result, "rule", "") or "")
+        pr_number = int(getattr(record, "pr_number", 0) or 0)
+        reason = f"post-merge: production did not verify ({rule or 'unknown rule'})"
+        if pr_number:
+            try:
+                incident.metadata.setdefault("pr_number", pr_number)
+            except Exception:  # noqa: BLE001
+                pass
+        return self.human_required(
+            incident, reason=reason, attempts=incident.attempts_used, max_attempts=0
         )
 
     # -- internals --------------------------------------------------------

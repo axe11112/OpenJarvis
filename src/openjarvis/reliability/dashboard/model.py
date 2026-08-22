@@ -286,6 +286,157 @@ class IncidentView:
 
 
 @dataclass(slots=True)
+class OutageView:
+    """One underlying problem, and everything the screen needs about it.
+
+    This is where the detail goes that Telegram deliberately does not carry.
+    An owner who gets one line on a phone — "login and sign-up are unavailable,
+    roll the deployment back or take it over" — comes here for the rest: which
+    probes are failing, which incidents they opened, what was tried, what the
+    exact ask is, and, when JARVIS decided *not* to write, why not.
+
+    That last field is the one worth being loud about. A system that quietly
+    withholds escalations is indistinguishable from one that is broken, unless
+    it says out loud what it withheld and on what grounds.
+    """
+
+    key: str
+    family: str
+    severity: str
+    environment: str
+    deployment: str
+    opened_at: str
+    last_seen_at: str
+    resolved: bool
+    components: List[str] = field(default_factory=list)
+    probes: List[str] = field(default_factory=list)
+    incident_ids: List[str] = field(default_factory=list)
+    #: Why these incidents are one problem, in the order they joined.
+    correlation_notes: List[str] = field(default_factory=list)
+    #: What the owner was last told, and when. Empty means: nothing, ever.
+    notification: Dict[str, Any] = field(default_factory=dict)
+    #: The structured ask, sent or withheld.
+    owner_ask: Dict[str, Any] = field(default_factory=dict)
+    #: One sentence: is Sir contacting the owner about this, and why not.
+    owner_contact: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize."""
+        return {
+            "key": self.key,
+            "family": self.family,
+            "severity": self.severity,
+            "environment": self.environment,
+            "deployment": self.deployment,
+            "opened_at": self.opened_at,
+            "last_seen_at": self.last_seen_at,
+            "resolved": self.resolved,
+            "components": list(self.components),
+            "probes": list(self.probes),
+            "incident_ids": list(self.incident_ids),
+            "correlation_notes": list(self.correlation_notes),
+            "notification": dict(self.notification),
+            "owner_ask": dict(self.owner_ask),
+            "owner_contact": self.owner_contact,
+        }
+
+
+def outage_views(
+    outages: List[Any],
+    incidents: List[Incident],
+    *,
+    ledger: Any = None,
+) -> List[OutageView]:
+    """Assemble the outage panel from the registry, the store and the ledger.
+
+    Read-only and side-effect free: it never assigns an incident to an outage,
+    because a screen refreshing must not change what the watcher believes.
+    """
+    by_id = {i.id: i for i in incidents}
+    views: List[OutageView] = []
+    for outage in outages:
+        members = [by_id[i] for i in outage.incident_ids if i in by_id]
+        ask = _latest_ask(members)
+        told = _last_told(members, ledger)
+        views.append(
+            OutageView(
+                key=outage.key,
+                family=outage.family,
+                severity=outage.severity.value,
+                environment=outage.environment,
+                deployment=redact(outage.deployment)[:64],
+                opened_at=outage.opened_at,
+                last_seen_at=outage.last_seen_at,
+                resolved=outage.resolved,
+                components=list(outage.components),
+                probes=list(outage.probes),
+                incident_ids=list(outage.incident_ids),
+                correlation_notes=[redact(n)[:300] for n in outage.notes][-12:],
+                notification=told,
+                owner_ask=ask,
+                owner_contact=_owner_contact(outage, ask, told),
+            )
+        )
+    return views
+
+
+def _latest_ask(members: List[Incident]) -> Dict[str, Any]:
+    """The most recently assembled owner ask across the outage's incidents."""
+    best: Dict[str, Any] = {}
+    for incident in members:
+        recorded = (incident.metadata or {}).get("owner_ask")
+        if isinstance(recorded, dict):
+            best = recorded
+    if not best:
+        return {}
+    redacted = dict(best)
+    for key in ("what_failed", "cause", "action", "why_blocked", "parked_reason"):
+        redacted[key] = redact(str(best.get(key) or ""))[:600]
+    redacted["evidence"] = [redact(str(e))[:300] for e in best.get("evidence") or []]
+    redacted["tried"] = [redact(str(t))[:300] for t in best.get("tried") or []]
+    return redacted
+
+
+def _last_told(members: List[Incident], ledger: Any) -> Dict[str, Any]:
+    """What the owner was last told about this outage, from the ledger."""
+    if ledger is None:
+        return {}
+    for incident in members:
+        try:
+            entry = ledger.last(incident)
+        except Exception:  # noqa: BLE001 - the panel must render regardless
+            return {}
+        if entry:
+            return {
+                "owner_state": str(entry.get("owner_state") or ""),
+                "at": str(entry.get("at") or ""),
+                "action": redact(str(entry.get("action") or ""))[:600],
+            }
+    return {}
+
+
+def _owner_contact(outage: Any, ask: Dict[str, Any], told: Dict[str, Any]) -> str:
+    """One sentence explaining Sir's silence, or his message."""
+    state = str(told.get("owner_state") or "")
+    if state == "fixed":
+        return "Told the owner it is fixed. Nothing further will be sent."
+    if state.startswith("needs-you"):
+        return (
+            "The owner has been asked for something and has not been asked "
+            "again. Nothing more is sent unless the ask itself changes."
+        )
+    if ask and not ask.get("actionable"):
+        return (
+            "Not contacting the owner: "
+            + str(ask.get("parked_reason") or "no operator action could be named")
+            + ". Parked here instead."
+        )
+    if outage.resolved:
+        return "Recovered without the owner ever being told. Nothing was sent."
+    return "Not contacting the owner: this is still being handled."
+
+
+@dataclass(slots=True)
 class Snapshot:
     """Everything the screen shows, at one instant."""
 
@@ -301,6 +452,9 @@ class Snapshot:
     cards: List[CardView] = field(default_factory=list)
     probes: List[ProbeView] = field(default_factory=list)
     incidents: List[IncidentView] = field(default_factory=list)
+    #: Correlated outages: which incidents are one problem, and what the owner
+    #: was or was not told about each.
+    outages: List[OutageView] = field(default_factory=list)
     safety: SafetyPanel = field(default_factory=SafetyPanel)
     blind_spots: List[str] = field(default_factory=list)
     open_incident_count: int = 0
@@ -335,6 +489,7 @@ class Snapshot:
             "cards": [c.to_dict() for c in self.cards],
             "probes": [p.to_dict() for p in self.probes],
             "incidents": [i.to_dict() for i in self.incidents],
+            "outages": [o.to_dict() for o in self.outages],
             "safety": self.safety.to_dict(),
             "blind_spots": list(self.blind_spots),
             "autonomy": dict(self.autonomy),
@@ -984,6 +1139,8 @@ def build_snapshot(
     generated_at: str = "",
     notes: Optional[List[str]] = None,
     autonomy: Optional[Dict[str, Any]] = None,
+    outages: Optional[List[Any]] = None,
+    ledger: Any = None,
 ) -> Snapshot:
     """Assemble the whole read model from state that was already gathered.
 
@@ -1045,6 +1202,7 @@ def build_snapshot(
         cards=cards,
         probes=probes,
         incidents=views,
+        outages=outage_views(list(outages or []), incidents, ledger=ledger),
         safety=panel,
         blind_spots=blind_spots,
         open_incident_count=sum(1 for v in views if v.is_open),

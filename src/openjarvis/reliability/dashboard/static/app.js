@@ -221,6 +221,68 @@
     }
   }
 
+  function renderOutages(s) {
+    var host = el("outages");
+    if (!host) { return; }
+    clear(host);
+    var list = s.outages || [];
+    var open = list.filter(function (o) { return !o.resolved; });
+    var count = el("outageCount");
+    if (count) {
+      count.textContent = open.length + " open · " + list.length + " on record";
+    }
+    if (!list.length) {
+      host.appendChild(node("div", "empty",
+        "No correlated outages on record."));
+      return;
+    }
+
+    list.slice(0, 20).forEach(function (o) {
+      var row = node("div", "outage" + (o.resolved ? " resolved" : ""));
+      row.appendChild(node("span", "sev " + o.severity, o.severity));
+
+      var title = node("div", "otitle");
+      title.appendChild(node("b", null,
+        (o.components || []).join(", ") || o.family));
+      title.appendChild(node("span", null,
+        o.key + " · " + o.family
+        + (o.deployment ? " · deployment " + o.deployment : "")
+        + " · opened " + ago(o.opened_at)));
+      row.appendChild(title);
+
+      var meta = node("div", "ometa");
+      meta.appendChild(node("span", null,
+        (o.incident_ids || []).length + " incident(s): "
+        + (o.incident_ids || []).join(", ")));
+      if ((o.probes || []).length) {
+        meta.appendChild(node("span", null,
+          "probes: " + o.probes.join(", ")));
+      }
+      row.appendChild(meta);
+
+      // Why Sir is, or is not, writing. The point of the panel.
+      row.appendChild(node("div", "ocontact", o.owner_contact || ""));
+
+      var ask = o.owner_ask || {};
+      if (ask.action) {
+        row.appendChild(node("div", "oask", "Asked of you: " + ask.action));
+      }
+      if (ask.cause) {
+        row.appendChild(node("div", "ocause", "Cause: " + ask.cause));
+      }
+      (ask.evidence || []).slice(0, 6).forEach(function (line) {
+        row.appendChild(node("div", "oevidence", line));
+      });
+      (ask.tried || []).slice(0, 6).forEach(function (line) {
+        row.appendChild(node("div", "otried", line));
+      });
+      (o.correlation_notes || []).forEach(function (line) {
+        row.appendChild(node("div", "onote", line));
+      });
+      host.appendChild(row);
+    });
+  }
+
   function renderIncidents(s) {
     var host = el("incidents");
     clear(host);
@@ -558,6 +620,7 @@
     renderWatcher(s);
     renderCards(s);
     renderAutonomy(s);
+    renderOutages(s);
     renderIncidents(s);
     renderProbes(s);
     renderSafety(s);
