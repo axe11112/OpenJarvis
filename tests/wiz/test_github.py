@@ -49,5 +49,7 @@ def test_github_pr_not_mergeable():
 
 def test_github_integration_initialization():
     """Test GitHub integration init."""
-    integration = GitHubIntegration()
-    assert integration.github_token is None
+    integration = GitHubIntegration(owner="axe11112", repo="OpenJarvis")
+    assert integration.owner == "axe11112"
+    assert integration.repo == "OpenJarvis"
+    assert integration.tool_executor is None  # No executor configured

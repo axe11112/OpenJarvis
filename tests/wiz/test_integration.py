@@ -65,8 +65,8 @@ def test_complete_low_risk_feature_pipeline():
     assert merge_result.status.value == "pass"
 
     # Stage 9: PR creation (would be done by GitHub integration)
-    github = GitHubIntegration()
-    # Would create real PR here
+    github = GitHubIntegration(owner="test-owner", repo="test-repo")
+    # Would create real PR here via github.create_pull_request()
 
     # Stage 10: Notifications
     notifications = NotificationManager()
