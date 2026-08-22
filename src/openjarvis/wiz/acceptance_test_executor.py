@@ -141,14 +141,14 @@ class PlaywrightTestExecutor(TestExecutor):
             passed=False,
         )
 
-        if not self._playwright_available:
-            result.status = TestStatus.SKIPPED
-            result.message = "Playwright not available"
-            return result
-
         if not url:
             result.status = TestStatus.ERROR
             result.error_message = "No URL provided for UI test"
+            return result
+
+        if not self._playwright_available:
+            result.status = TestStatus.SKIPPED
+            result.message = "Playwright not available"
             return result
 
         try:
