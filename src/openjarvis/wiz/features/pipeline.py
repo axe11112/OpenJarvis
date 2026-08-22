@@ -210,6 +210,48 @@ class FeaturePipeline:
                 break
         return feature
 
+    def cancel(self, feature_id: str, *, reason: str = "") -> FeatureRequest:
+        """Stop work on a request, on the operator's instruction.
+
+        Always available, and deliberately the simplest verb in the pipeline.
+        Stopping is the one instruction that can never make Wiz more powerful
+        than it already was, so it needs no approval, no risk check and no
+        authority beyond being the operator — and an operator who wants work to
+        stop should not discover that the stop button is the part that needed
+        configuring.
+
+        What it does *not* do is undo anything. A worktree that exists stays on
+        disk, a pull request that was opened stays open, and a change that
+        reached production stays there. Cancelling is Wiz agreeing to take no
+        further steps; unwinding a step already taken is a separate decision,
+        with different risks, that belongs to a person.
+
+        Raises ``KeyError`` for an unknown id, and returns an already-terminal
+        feature unchanged — asking twice is not an error, it is an operator who
+        did not see the first answer.
+        """
+        feature = self._load(feature_id)
+        if feature.terminal:
+            return feature
+        feature.transition(
+            FeatureState.CANCELLED,
+            at=self.clock(),
+            reason=(reason or "the operator asked me to stop")[:300],
+        )
+        self.store.save(feature)
+        self._record(
+            feature, "feature.cancelled", reason or "operator asked me to stop"
+        )
+        # The queue slot goes back immediately: a cancelled feature must not
+        # hold the one concurrency slot that reliability might need.
+        self._release(feature)
+        if self.queue is not None:
+            try:
+                self.queue.cancel(feature.id)
+            except Exception:  # noqa: BLE001 - a queue that cannot forget it
+                logger.exception("could not remove %s from the queue", feature.id)
+        return feature
+
     def advance(self, feature: FeatureRequest) -> StepResult:
         """Perform exactly one transition."""
         if feature.terminal:

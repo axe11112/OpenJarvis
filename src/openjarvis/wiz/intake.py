@@ -76,6 +76,13 @@ class IntakeResult:
     capability: str = ""
     feature_id: str = ""
 
+    #: The handler's raw return value, for a caller that wants to render its
+    #: own sentence. Carried rather than summarised here: the read verbs return
+    #: facts and no words, and inventing the words is a job for the layer that
+    #: knows who is being spoken to, not for the layer that decides whether the
+    #: sender is who they say they are.
+    structured: Any = None
+
     #: Set when the text was shaped like an attempt to redirect the assistant.
     #: Recorded, not acted on.
     suspicious: bool = False
@@ -175,11 +182,13 @@ class TelegramIntake:
                 accepted=False,
                 reply=outcome.message,
                 capability=outcome.capability,
+                structured=outcome.result,
                 suspicious=suspicious,
             )
         result = outcome.result if isinstance(outcome.result, dict) else {}
         return IntakeResult(
             accepted=True,
+            structured=outcome.result,
             # §25: "Sir, I'll work on it." and then quiet until there is
             # something worth saying. The handler already produces that
             # sentence; this does not invent a second one.

@@ -78,6 +78,14 @@ COMMANDS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
             "proceed",
             "sort it out",
             "you have my approval to continue",
+            # Said when the operator does not know, or does not care, what
+            # exactly is broken. It means the same thing as "Fix it" and used
+            # to fall through to the product side as a request to build
+            # something called "whatever is wrong with production".
+            "fix whatever is wrong",
+            "fix production",
+            "fix the site",
+            "fix the website",
         ),
     ),
     (

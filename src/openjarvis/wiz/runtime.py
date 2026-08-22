@@ -120,9 +120,21 @@ def incident_probe_for(
     def probe() -> Availability:
         try:
             store = store_factory()
-        except Exception as exc:
+        except FileNotFoundError:
+            # The ordinary case, and the one an exception message is worst at
+            # explaining: there simply is no database yet. Its ``str()`` is
+            # whatever the raiser happened to pass — sometimes a path,
+            # sometimes a word — and it reached the operator's phone verbatim
+            # as "I cannot do that here: none."
             return Availability.missing(
-                str(exc) or "the incident store cannot be opened"
+                "there is no incident database yet, so I have nothing to report on"
+            )
+        except Exception as exc:
+            detail = str(exc).strip()
+            return Availability.missing(
+                f"the incident store cannot be opened ({detail})"
+                if detail
+                else "the incident store cannot be opened"
             )
         WizRuntime._close(store)
         return Availability.ready("the incident store is reachable")
@@ -174,11 +186,16 @@ class WizRuntime:
         self.product = product
         self._store_factory = store_factory
 
-        rules = list(default_rules())
-        if product is not None:
-            from openjarvis.wiz.product import product_intent_rules
+        from openjarvis.wiz.product import product_intent_rules
 
-            rules.extend(product_intent_rules())
+        # The product rules are loaded whether or not the product side is
+        # assembled, for the same reason its capabilities are declared: an
+        # operator who says "add a download button" to an unconfigured machine
+        # has been understood, and the useful answer names the missing target
+        # rather than pretending the sentence was gibberish. The capability's
+        # availability probe is what refuses; the classifier's job is only to
+        # work out what was meant.
+        rules = list(default_rules()) + list(product_intent_rules())
 
         self.wiz = Wiz(
             registry=registry,
@@ -417,6 +434,8 @@ def build_wiz(
                 raise FileNotFoundError("no incident database")
             return IncidentStore(path)
 
+    from openjarvis.wiz.product import product_capabilities
+
     specs = default_capabilities(
         config, incident_probe=incident_probe_for(store_factory)
     )
@@ -428,14 +447,24 @@ def build_wiz(
         if pipeline is not None and getattr(pipeline, "journal", None) is None:
             pipeline.journal = resolved_journal
 
-        from openjarvis.wiz.product import product_capabilities
-
-        specs.extend(
-            product_capabilities(
-                pipeline_available=lambda: _product_available(product),
-                memory_available=lambda: _memory_available(product),
-            )
+    # Declared whether or not the product side is assembled, and *unavailable*
+    # when it is not.
+    #
+    # The alternative — leaving the verbs out entirely — was what shipped first,
+    # and it made "add a download button" on an unconfigured machine come back
+    # as "I did not recognise that as something I know how to do". That sentence
+    # is wrong in the way that matters: Wiz understood the request perfectly and
+    # the actual problem was a missing engineering target. Declaring the verb
+    # and failing its availability probe is what turns that into "I cannot do
+    # that here: no engineering target is configured", which is both true and
+    # actionable. §5: never claim a capability that is not configured — and
+    # never disown one that is merely unconfigured.
+    specs.extend(
+        product_capabilities(
+            pipeline_available=lambda: _product_available(product),
+            memory_available=lambda: _memory_available(product),
         )
+    )
 
     return WizRuntime(
         policy=resolved_policy,
@@ -450,11 +479,13 @@ def build_wiz(
 def _product_available(product: Any) -> Availability:
     """Whether Wiz can actually build something right now.
 
-    Three separate things have to be true, and the answer names which one is
+    Four separate things have to be true, and the answer names which one is
     missing rather than saying "unavailable": an operator whose ``claude`` CLI
     has logged out deserves to be told that, not to be told Wiz cannot build
     features.
     """
+    if product is None:
+        return Availability.missing("no engineering target is configured")
     pipeline = getattr(product, "pipeline", None)
     if pipeline is None:
         return Availability.missing("no engineering target is configured")
@@ -481,7 +512,7 @@ def _product_available(product: Any) -> Availability:
 
 
 def _memory_available(product: Any) -> Availability:
-    if getattr(product, "pipeline", None) is None:
+    if product is None or getattr(product, "pipeline", None) is None:
         return Availability.missing("no engineering target is configured")
     return Availability.ready()
 

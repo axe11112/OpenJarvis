@@ -253,14 +253,27 @@ class TestAuthoritySplit:
 
 
 class TestHonestyAboutWhatIsConfigured:
-    def test_without_a_product_side_the_feature_verbs_do_not_exist(self, tmp_path):
+    def test_without_a_product_side_the_feature_verbs_are_declared_unavailable(
+        self, tmp_path
+    ):
+        """Understood, and refused for the real reason.
+
+        The verbs used to be left out of the registry entirely on a machine
+        with no engineering target, which made "add a download button" come
+        back as "I did not recognise that as something I know how to do". Wiz
+        understood it perfectly; the missing thing was a configured target, and
+        that is what the refusal has to say — otherwise the operator goes
+        looking for a better sentence instead of a settings file.
+        """
         runtime = build_wiz(
             home=tmp_path,
             policy=AuthorityPolicy(grants={Channel.CLI: frozenset({Authority.READ})}),
             journal=WizJournal(tmp_path / "j.jsonl"),
             store_factory=lambda: (_ for _ in ()).throw(FileNotFoundError("none")),
         )
-        assert "feature.request" not in runtime.registry.names()
+        assert "feature.request" in runtime.registry.names()
+        assert not runtime.registry.get("feature.request").availability().configured
+
         outcome = runtime.wiz.handle(
             Request(
                 text="Add a download button",
@@ -268,6 +281,8 @@ class TestHonestyAboutWhatIsConfigured:
             )
         )
         assert not outcome.handled
+        assert outcome.capability == "feature.request"
+        assert "no engineering target is configured" in outcome.message
 
     def test_a_target_with_no_test_command_cannot_build(self, tmp_path, product):
         from openjarvis.wiz.features.profile import EngineeringProfile

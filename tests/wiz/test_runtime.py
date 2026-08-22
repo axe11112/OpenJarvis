@@ -143,7 +143,14 @@ class TestHonesty:
         names = {c["name"] for c in result["configured"]} | {
             c["name"] for c in result["unavailable"]
         }
-        assert names == {s.name for s in default_capabilities()}
+        # Every read verb, plus the product verbs — which are declared even
+        # without an engineering target, and reported in the "unavailable"
+        # half when there is none. A capability the operator expected and does
+        # not see is a puzzle; one listed as unavailable is an answer.
+        assert names >= {s.name for s in default_capabilities()}
+        assert "feature.request" in names
+        unavailable = {c["name"] for c in result["unavailable"]}
+        assert "feature.request" in unavailable
 
 
 class TestSelfDiagnosis:

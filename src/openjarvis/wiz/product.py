@@ -28,6 +28,7 @@ it. Two gates, at different granularities, and a feature has to pass both.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -62,27 +63,75 @@ def product_intent_rules() -> List[IntentRule]:
             # first classifies the brief's example as unrecognised — which is
             # how a channel ends up feeling broken while every test passes.
             r"^\s*(sir|hey wiz|ok wiz|wiz)?[,:\s]*(please\s+)?"
-            r"(build|make|add|create|implement|write)\b|"
-            r"\b(can you (build|make|add|create)|i want|i'd like|"
-            r"i would like|we need)\b",
+            # "Improve the onboarding" and "investigate why sign-up is failing"
+            # are requests for work in exactly the way "add a download button"
+            # is. Restricting the opener to the constructive verbs meant the
+            # operator's own examples — improve, fix, investigate — arrived as
+            # unrecognised sentences, which reads as Wiz not understanding
+            # English rather than as a missing pattern.
+            r"(build|make|add|create|implement|write|improve|fix|change|update|"
+            r"refactor|redesign|rewrite|enhance|clean up|speed up|"
+            r"investigate|look into|diagnose|work out why|figure out why)\b|"
+            r"\b(can you (build|make|add|create|improve|fix)|i want|i'd like|"
+            r"i would like|we need|"
+            # How an operator reports a symptom rather than naming a change.
+            r"(users|people|customers|nobody|no one) (are|is|can'?t|cannot|"
+            r"keep|have) )\b",
             weight=12,
         ),
         intent_rule(
             "feature.list",
             r"\b(what are you (building|working on)|what'?s in progress|"
-            r"feature (list|queue)|list (the )?features|what is being built)\b",
+            r"feature (list|queue)|list (the )?features|what is being built|"
+            # "What is Claude working on?" is the same question with the
+            # implementation named. An operator who knows a coding agent does
+            # the work asks about the agent, and being unable to answer that
+            # makes Wiz look like it does not know what it is doing.
+            r"what('?s| is| are) claude (working on|doing|up to)|"
+            r"what are you up to)\b",
             weight=14,
         ),
         intent_rule(
             "product.recent",
-            r"\b(what did (we|you) (build|ship|do)|what happened (yesterday|today)|"
-            r"what shipped)\b",
+            r"\b(what did (we|you) (build|ship|do)|"
+            r"what happened (yesterday|today|last night|overnight|this week)|"
+            r"what shipped|show me what changed|what'?s changed)\b",
             weight=14,
         ),
         intent_rule(
+            # "Why did conversions drop?" is not a question Wiz can answer from
+            # analytics it does not have. It *is* a question it can answer from
+            # what it has recorded — decisions, deployments, incidents — and
+            # "here is everything I know about conversions, which may be
+            # nothing" is a better answer than not understanding the sentence.
             "product.search",
-            r"^\s*(search|find|look up)\b|\bwhy did (we|you)\b",
+            r"^\s*(search|find|look up)\b|\bwhy (did|do|does|is|are|has|have)\b",
             weight=13,
+        ),
+        intent_rule(
+            # "Why hasn't this shipped?" and "how is FEAT-00042 going" are the
+            # same question, and the second phrasing is the one an operator
+            # uses once they know the id. Weighted above ``feature.list``
+            # because a sentence naming a specific request is asking about that
+            # request, not for the whole queue.
+            "feature.status",
+            r"\bFEAT-\d+\b|"
+            r"\b(why (hasn'?t|has not|isn'?t|is (it|that) not) "
+            r"(it |that |this )?(ship\w*|merg\w*|done|finished|out)|"
+            r"what'?s? (happening|going on) with|"
+            r"how is (it|that|this) going|where (is|are) (it|we) (up to|with))\b",
+            weight=15,
+        ),
+        intent_rule(
+            # Stopping is always available and always at least as safe as
+            # carrying on, so the phrasing is generous on purpose — an operator
+            # who wants work to stop should not have to find the right words.
+            "feature.cancel",
+            r"\b(stop|cancel|abandon|drop|forget) (that|the|this|it|work|task|"
+            r"request|feature|building|FEAT-\d+)|"
+            r"\b(stop|cancel) (working on|building)\b|"
+            r"^\s*(stop|cancel) it\b",
+            weight=20,
         ),
     ]
 
@@ -111,6 +160,17 @@ def product_capabilities(
             # by the pipeline, from the request and then from the real diff.
             risk=Risk.MEDIUM,
             probe=pipeline_available,
+        ),
+        CapabilitySpec(
+            name="feature.cancel",
+            summary="stop work on a request",
+            # SAFE_ACTION, not CODE_WRITE. Stopping is strictly less powerful
+            # than what is already running, and putting it behind the authority
+            # that starts work would mean the channel that could begin
+            # something might not be able to end it.
+            authority=Authority.SAFE_ACTION,
+            risk=Risk.LOW,
+            probe=memory_available,
         ),
         CapabilitySpec(
             name="feature.list",
@@ -166,6 +226,7 @@ class ProductVerbs:
             "feature.build": self.build_feature,
             "feature.list": self.list_features,
             "feature.status": self.feature_status,
+            "feature.cancel": self.cancel_feature,
             "product.recent": self.recent,
             "product.search": self.search,
         }
@@ -261,6 +322,57 @@ class ProductVerbs:
             return {"available": False, "detail": f"I have no request {feature_id!r}"}
         return {"available": True, "feature": feature.to_dict()}
 
+    def cancel_feature(self, request: Request) -> Dict[str, Any]:
+        """Stop work on a request.
+
+        Resolving *which* request is the interesting part. An operator saying
+        "stop that" from a phone rarely quotes an id, and guessing wrong means
+        cancelling work they wanted. So: an explicit id wins; otherwise exactly
+        one thing must be running, and if two are, Wiz asks rather than picks.
+        """
+        if self.pipeline is None:
+            return {"cancelled": False, "detail": "feature work is not configured here"}
+
+        feature_id = str(request.arguments.get("feature_id", "")).strip()
+        if not feature_id:
+            named = _FEATURE_ID.search(str(request.text or ""))
+            feature_id = named.group(0).upper() if named else ""
+
+        if not feature_id:
+            running = [
+                f for f in self.pipeline.store.active(limit=20) if not f.terminal
+            ]
+            if not running:
+                return {
+                    "cancelled": False,
+                    "say": "Sir, nothing is running at the moment.",
+                }
+            if len(running) > 1:
+                names = ", ".join(f"{f.id} ({f.title})" for f in running[:4])
+                return {
+                    "cancelled": False,
+                    "ambiguous": True,
+                    "candidates": [f.id for f in running],
+                    "say": f"Sir, which one — {names}?",
+                }
+            feature_id = running[0].id
+
+        try:
+            feature = self.pipeline.cancel(
+                feature_id, reason=f"stopped by {request.actor.channel.value}"
+            )
+        except KeyError:
+            return {"cancelled": False, "say": f"Sir, I have no request {feature_id}."}
+
+        if self.memory is not None:
+            self.memory.remember_feature(feature)
+        return {
+            "cancelled": True,
+            "id": feature.id,
+            "state": feature.state.value,
+            "say": f"Sir, I've stopped {feature.id}. Nothing was undone.",
+        }
+
     def recent(self, request: Request) -> Dict[str, Any]:
         if self.memory is None:
             return {"available": False, "detail": "I am not keeping a record yet"}
@@ -300,6 +412,9 @@ class ProductVerbs:
 #: recorded request reads like a requirement rather than like a chat message —
 #: it becomes the goal Claude is given, and "Sir, could you please add a
 #: download button" is a worse brief than "add a download button".
+#: A feature id quoted anywhere in a sentence.
+_FEATURE_ID = re.compile(r"\bFEAT-\d+\b", re.IGNORECASE)
+
 _LEAD_INS = (
     "sir,",
     "hey wiz,",

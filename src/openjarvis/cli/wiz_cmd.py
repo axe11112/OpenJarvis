@@ -20,6 +20,7 @@ from typing import Any
 
 import click
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
@@ -367,3 +368,128 @@ def morning(force: bool) -> None:
     )
     if briefing.worth_sending or force:
         console.print(briefing.render())
+
+
+@wiz.command("say")
+@click.argument("message", nargs=-1, required=True)
+@click.option(
+    "--chat-id",
+    default="",
+    help="Answer as though this chat id had sent it. Defaults to the first "
+    "configured owner chat, so the allowlist is exercised rather than bypassed.",
+)
+def say_to_wiz(message: tuple, chat_id: str) -> None:
+    """Ask Wiz something the way the phone would, and print the reply.
+
+    The same door, the same allowlist, the same dispatcher and the same
+    rendering that a Telegram message goes through — with the network taken
+    out. What this prints is what Sir would send.
+
+    Useful for the thing that is otherwise hard to check: whether an English
+    sentence reaches the verb the operator expected. A sentence that classifies
+    as nothing prints the refusal, which is the honest answer and the one worth
+    seeing before it is a silence on a phone.
+    """
+    console = _console()
+    text = " ".join(message).strip()
+
+    from openjarvis.core.config import load_config
+    from openjarvis.wiz.owner_channel import build_owner_door
+
+    config = load_config()
+    allowed = (config.channel.telegram.allowed_chat_ids or "").split(",")
+    who = chat_id or (allowed[0].strip() if allowed else "")
+
+    door = build_owner_door(config, runtime=_runtime(), commands=None, outages=None)
+    if door is None:
+        console.print(
+            "[yellow]Owner commands are switched off.[/yellow]\n"
+            "[dim]Set [reliability.notify] enabled and accept_owner_commands to "
+            "turn the door on.[/dim]"
+        )
+        raise SystemExit(1)
+
+    reply = door.receive(chat_id=who, text=text)
+    if not reply.text:
+        console.print(
+            "[dim](nothing would be sent — "
+            f"{'unlisted chat' if not reply.authorized else 'no reply needed'})[/dim]"
+        )
+        return
+    console.print(escape(reply.text))
+    console.print(
+        f"\n[dim]{escape(reply.route)}"
+        + (f" · {escape(reply.capability)}" if reply.capability else "")
+        + "[/dim]"
+    )
+
+
+@wiz.command("listen")
+def listen() -> None:
+    """Answer the owner on Telegram until interrupted.
+
+    One door for both halves: "Fix it" reaches the reliability side when
+    something is actually failing, and everything else reaches the dispatcher.
+
+    Run this **or** the reliability watcher's own narrow listener, not both:
+    Telegram refuses a second long-poll on one bot token, so the second one to
+    start simply will not receive anything.
+    """
+    console = _console()
+
+    from openjarvis.core.config import load_config
+    from openjarvis.reliability.notify_ledger import ledger_path  # noqa: F401
+    from openjarvis.reliability.outage import OutageRegistry, outages_path
+    from openjarvis.reliability.owner_commands import OwnerCommands
+    from openjarvis.wiz.owner_channel import TelegramOwnerDoor, build_owner_door
+
+    config = load_config()
+    rc = config.reliability
+
+    if not (rc.notify.enabled and rc.notify.accept_owner_commands):
+        console.print(
+            "[yellow]Owner commands are switched off.[/yellow]\n"
+            "[dim]Set [reliability.notify] enabled and accept_owner_commands "
+            "first. An inbound control path should exist because you turned it "
+            "on.[/dim]"
+        )
+        raise SystemExit(1)
+
+    outages = OutageRegistry(path=outages_path(config))
+    commands = OwnerCommands(
+        allowed_chat_ids=config.channel.telegram.allowed_chat_ids,
+        outages=outages,
+        persona=rc.notify.persona,
+        # No gate here: `jarvis wiz listen` is not the watcher and holds no
+        # repair slot. "Fix it" from this process records the acknowledgement
+        # and the watcher picks the work up on its own cadence.
+        gate=None,
+    )
+    door = build_owner_door(
+        config, runtime=_runtime(), commands=commands, outages=outages
+    )
+    if door is None:  # pragma: no cover - guarded above
+        raise SystemExit(1)
+
+    from openjarvis.reliability.notify import TelegramNotifier
+
+    chat_ids = (config.channel.telegram.allowed_chat_ids or "").split(",")
+    transport = TelegramNotifier(
+        chat_id=chat_ids[0].strip() if chat_ids else "",
+        bot_token=config.channel.telegram.bot_token,
+        allowed_chat_ids=config.channel.telegram.allowed_chat_ids,
+    )
+    listener = TelegramOwnerDoor(door=door, notifier=transport)
+    if not listener.start():
+        console.print("[red]Could not start listening.[/red]")
+        raise SystemExit(2)
+
+    console.print("Listening for you on Telegram. Ctrl-C to stop.")
+    try:
+        import threading
+
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        console.print("\nStopped.")
+    finally:
+        listener.stop()

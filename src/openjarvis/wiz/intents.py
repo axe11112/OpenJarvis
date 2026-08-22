@@ -93,7 +93,12 @@ def default_rules() -> List[IntentRule]:
         _rule(
             "reliability.status",
             r"\b(is (the )?(site|website|production|wize) (ok|up|down|healthy)|"
-            r"production status|site status|how is (the )?(site|website|production))\b",
+            r"production status|site status|"
+            # "How is Wize?" is the first thing an operator asks and the
+            # product's own name was missing from this alternative, so the
+            # single most likely sentence was the one that did not classify.
+            r"how('?s| is) (the )?(site|website|production|wize|everything)|"
+            r"(is|are) (we|things) (ok|okay|alright|up))\b",
             weight=8,
         ),
         _rule(

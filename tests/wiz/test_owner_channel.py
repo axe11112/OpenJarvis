@@ -1,0 +1,368 @@
+"""One door, and what happens to each sentence that arrives at it.
+
+The cases here are the operator's own examples — "How is Wize?", "Fix it",
+"Improve the onboarding", "What is Claude working on?", "Stop that task" — plus
+the two that decide whether the routing is sound rather than merely plausible:
+what "fix it" means when nothing is failing, and what a stranger gets.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from openjarvis.core.config import JarvisConfig
+from openjarvis.reliability.outage import OutageRegistry
+from openjarvis.reliability.owner_commands import OwnerCommands
+from openjarvis.reliability.types import Correlation, Incident, Severity
+from openjarvis.wiz.authority import Authority, AuthorityPolicy, Channel
+from openjarvis.wiz.intake import TelegramIntake
+from openjarvis.wiz.journal import WizJournal
+from openjarvis.wiz.owner_channel import OwnerDoor, TelegramOwnerDoor, build_owner_door
+from openjarvis.wiz.runtime import build_wiz
+
+OWNER = "555"
+STRANGER = "999"
+
+
+class Gate:
+    def __init__(self):
+        self.cleared = []
+
+    def clear_cooldown(self, *keys):
+        self.cleared.extend(k for k in keys if k)
+        return list(keys)
+
+
+@pytest.fixture
+def outages():
+    return OutageRegistry()
+
+
+@pytest.fixture
+def incidents(tmp_path):
+    """A real incident store, because the read verbs consult one.
+
+    Injected rather than defaulted: a probe and a handler that disagree about
+    which database they are looking at can both be right in one process, and
+    the way that shows up is a test passing only on a machine that happens to
+    have a live database at the default path.
+    """
+    from openjarvis.reliability.store import IncidentStore
+
+    path = tmp_path / "incidents.db"
+    IncidentStore(path).close()
+    return lambda: IncidentStore(path)
+
+
+@pytest.fixture
+def runtime(tmp_path, incidents):
+    return build_wiz(
+        home=tmp_path,
+        policy=AuthorityPolicy(
+            grants={
+                Channel.TELEGRAM: frozenset({Authority.READ, Authority.SAFE_ACTION})
+            }
+        ),
+        journal=WizJournal(tmp_path / "journal.jsonl"),
+        config=JarvisConfig(),
+        store_factory=incidents,
+    )
+
+
+@pytest.fixture
+def door(runtime, outages):
+    return OwnerDoor(
+        commands=OwnerCommands(allowed_chat_ids=OWNER, outages=outages, gate=Gate()),
+        intake=TelegramIntake(wiz=runtime.wiz, owner_chat_ids=[OWNER]),
+        allowed_chat_ids=OWNER,
+        outages=outages,
+    )
+
+
+def open_an_outage(outages, component="website"):
+    incident = Incident(
+        fingerprint=f"fp_{component}",
+        severity=Severity.CRITICAL,
+        component=component,
+        title=f"{component} is unreachable",
+        id="INC-00001",
+        probe_id="homepage",
+        correlation=Correlation(deployment_id="9f31c04"),
+        metadata={"failure_kind": "navigation"},
+    )
+    outages.assign(incident)
+    return incident
+
+
+# ---------------------------------------------------------------------------
+# Who is allowed to speak
+# ---------------------------------------------------------------------------
+
+
+def test_a_stranger_is_answered_with_silence(door):
+    reply = door.receive(chat_id=STRANGER, text="Fix it")
+    assert reply.authorized is False
+    assert reply.text == ""
+
+
+def test_an_empty_allowlist_authorises_nobody(runtime, outages):
+    door = OwnerDoor(
+        intake=TelegramIntake(wiz=runtime.wiz, owner_chat_ids=[]),
+        allowed_chat_ids="",
+        outages=outages,
+    )
+    assert door.receive(chat_id=OWNER, text="how are you").authorized is False
+
+
+def test_an_empty_message_is_not_answered(door):
+    assert door.receive(chat_id=OWNER, text="   ").text == ""
+
+
+# ---------------------------------------------------------------------------
+# Which half answers
+# ---------------------------------------------------------------------------
+
+
+def test_fix_it_reaches_reliability_when_something_is_failing(door, outages):
+    open_an_outage(outages)
+    reply = door.receive(chat_id=OWNER, text="Fix it")
+    assert reply.route == "reliability"
+    assert reply.text == "Sir, I'm working on it."
+
+
+def test_fix_it_is_a_request_for_work_when_nothing_is_failing(door):
+    """The tie-break that makes the routing sound rather than plausible.
+
+    Both halves have a claim on "fix". Answering "nothing is failing at the
+    moment" to somebody asking for a broken form to be fixed is true and
+    useless; the world decides, not the wording.
+    """
+    reply = door.receive(chat_id=OWNER, text="Fix the sign-up form")
+    assert reply.route == "wiz"
+    assert reply.capability == "feature.request"
+
+
+def test_fix_whatever_is_wrong_reaches_reliability_during_an_outage(door, outages):
+    open_an_outage(outages)
+    assert (
+        door.receive(chat_id=OWNER, text="Fix whatever is wrong with production").route
+        == "reliability"
+    )
+
+
+def test_a_status_question_always_reaches_the_half_that_knows(door):
+    """Only the reliability half knows whether anything is wrong."""
+    assert door.receive(chat_id=OWNER, text="what's happening?").route == "reliability"
+
+
+# ---------------------------------------------------------------------------
+# The operator's own sentences
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sentence,capability",
+    [
+        ("How is Wize?", "reliability.status"),
+        ("what can you do", "wiz.capabilities"),
+        ("how are you", "wiz.health"),
+        ("what are you allowed to do", "wiz.authority"),
+        ("Add a better recovery dashboard", "feature.request"),
+        ("Improve the onboarding", "feature.request"),
+        ("Build this feature: dark mode", "feature.request"),
+        (
+            "Users are having trouble signing up — investigate and fix it",
+            "feature.request",
+        ),
+        ("What is Claude working on?", "feature.list"),
+        ("Why hasn't this shipped?", "feature.status"),
+        ("Stop that task", "feature.cancel"),
+        ("What happened last night?", "product.recent"),
+        ("Show me what changed", "product.recent"),
+        ("Why did conversions drop?", "product.search"),
+    ],
+)
+def test_every_sentence_the_operator_gave_reaches_a_verb(door, sentence, capability):
+    reply = door.receive(chat_id=OWNER, text=sentence)
+    assert reply.capability == capability, sentence
+    assert reply.text, "the owner must never be answered with silence"
+
+
+def test_an_unrecognised_sentence_offers_the_list_rather_than_guessing(door):
+    reply = door.receive(chat_id=OWNER, text="the weather is nice today")
+    assert reply.capability == ""
+    assert "what I can do" in reply.text
+
+
+# ---------------------------------------------------------------------------
+# Honesty
+# ---------------------------------------------------------------------------
+
+
+def test_an_unconfigured_verb_names_the_missing_thing(door):
+    """Understood, and refused for the real reason."""
+    reply = door.receive(chat_id=OWNER, text="Add a download button")
+    assert reply.handled is False
+    assert "no engineering target is configured" in reply.text
+
+
+def test_a_missing_incident_database_is_explained_not_quoted(tmp_path, outages):
+    """The refusal used to be "I cannot do that here: none."
+
+    ``FileNotFoundError("none")`` reached the operator's phone as its own
+    ``str()``. An exception message is written for a developer reading a
+    traceback; it is not an explanation, and it must not be used as one.
+    """
+    runtime = build_wiz(
+        home=tmp_path,
+        policy=AuthorityPolicy(grants={Channel.TELEGRAM: frozenset({Authority.READ})}),
+        journal=WizJournal(tmp_path / "j.jsonl"),
+        config=JarvisConfig(),
+        store_factory=lambda: (_ for _ in ()).throw(FileNotFoundError("none")),
+    )
+    door = OwnerDoor(
+        intake=TelegramIntake(wiz=runtime.wiz, owner_chat_ids=[OWNER]),
+        allowed_chat_ids=OWNER,
+        outages=outages,
+    )
+    reply = door.receive(chat_id=OWNER, text="How is Wize?")
+    assert "none." not in reply.text
+    assert "no incident database" in reply.text
+
+
+def test_a_read_verb_answers_in_english_rather_than_facts(door):
+    reply = door.receive(chat_id=OWNER, text="How is Wize?")
+    assert reply.text.startswith("Sir,")
+    assert "{" not in reply.text and "available" not in reply.text
+
+
+def test_no_internal_vocabulary_reaches_the_owner(door, outages):
+    open_an_outage(outages)
+    for sentence in ("How is Wize?", "how are you", "what can you do", "Fix it"):
+        text = door.receive(chat_id=OWNER, text=sentence).text.lower()
+        for jargon in (
+            "capability",
+            "fingerprint",
+            "human_required",
+            "outage_key",
+            "authority.",
+            "traceback",
+        ):
+            assert jargon not in text, (sentence, jargon)
+
+
+# ---------------------------------------------------------------------------
+# The door must not be able to break Wiz
+# ---------------------------------------------------------------------------
+
+
+def test_a_handler_that_explodes_is_answered_not_raised(door):
+    class Exploding:
+        def receive(self, **_):
+            raise RuntimeError("boom")
+
+    door.intake = Exploding()
+    reply = door.receive(chat_id=OWNER, text="how are you")
+    assert reply.route == "refused"
+    assert reply.text
+
+
+def test_an_unreadable_outage_registry_does_not_stop_the_door(door):
+    class Broken:
+        def open_outages(self):
+            raise RuntimeError("disk on fire")
+
+    door.outages = Broken()
+    # "Fix it" with no readable outage state falls through to the dispatcher
+    # rather than failing: an unanswerable message is worse than a misrouted one.
+    assert door.receive(chat_id=OWNER, text="Fix it").route == "wiz"
+
+
+# ---------------------------------------------------------------------------
+# Assembly
+# ---------------------------------------------------------------------------
+
+
+def test_the_door_is_off_unless_it_was_turned_on():
+    config = JarvisConfig()
+    assert build_owner_door(config) is None
+
+
+def test_the_door_is_built_when_owner_commands_are_enabled(runtime):
+    config = JarvisConfig()
+    config.reliability.notify.enabled = True
+    config.reliability.notify.accept_owner_commands = True
+    config.channel.telegram.allowed_chat_ids = OWNER
+    door = build_owner_door(config, runtime=runtime)
+    assert door is not None
+    assert door.intake is not None
+
+
+# ---------------------------------------------------------------------------
+# The transport
+# ---------------------------------------------------------------------------
+
+
+class Channel_:
+    def __init__(self):
+        self.sent = []
+        self.handler = None
+
+    def on_message(self, handler):
+        self.handler = handler
+
+    def connect(self):
+        return None
+
+    def disconnect(self):
+        return None
+
+    def send(self, chat_id, text):
+        self.sent.append((chat_id, text))
+
+
+class Transport:
+    def __init__(self, channel):
+        self.channel = channel
+
+
+def test_the_listener_replies_through_the_same_channel(door):
+    channel = Channel_()
+    listener = TelegramOwnerDoor(door=door, notifier=Transport(channel))
+    assert listener.start() is True
+
+    channel.handler(
+        type(
+            "M",
+            (),
+            {"conversation_id": OWNER, "sender": OWNER, "content": "how are you"},
+        )()
+    )
+    assert channel.sent and channel.sent[0][0] == OWNER
+    assert channel.sent[0][1].startswith("Sir,")
+
+
+def test_a_stranger_gets_no_reply_on_the_wire(door):
+    channel = Channel_()
+    listener = TelegramOwnerDoor(door=door, notifier=Transport(channel))
+    listener.start()
+    channel.handler(
+        type(
+            "M",
+            (),
+            {"conversation_id": STRANGER, "sender": STRANGER, "content": "Fix it"},
+        )()
+    )
+    assert channel.sent == []
+
+
+def test_a_malformed_message_never_escapes_into_the_polling_thread(door):
+    channel = Channel_()
+    listener = TelegramOwnerDoor(door=door, notifier=Transport(channel))
+    listener.start()
+    channel.handler(object())  # must not raise
+
+
+def test_a_transport_that_cannot_receive_is_reported_not_crashed(door):
+    listener = TelegramOwnerDoor(door=door, notifier=object())
+    assert listener.start() is False
