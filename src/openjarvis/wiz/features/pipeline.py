@@ -49,6 +49,7 @@ from openjarvis.wiz.features.acceptance import (
     Criterion,
     contract_for,
     criteria_from_mapping,
+    extract_proposed_criteria,
 )
 from openjarvis.wiz.features.engineer import (
     ClaudeCodeEngineeringAgent,
@@ -480,6 +481,11 @@ class FeaturePipeline:
 
         feature.plan = session.claim
         feature.affected_components = list(session.changed_files)
+        # Additive only — see contract_for()'s docstring on why the plan
+        # never writes the contract, only ever adds to it.
+        proposed = extract_proposed_criteria(session.claim)
+        if proposed:
+            feature.metadata["proposed_criteria"] = proposed
         self._transition(feature, FeatureState.PLANNING, "produced a plan")
         return StepResult(feature, message="Planning...")
 

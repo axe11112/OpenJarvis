@@ -41,6 +41,7 @@ but only ever additively, and every proposal must still name a checkable kind.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -66,6 +67,7 @@ __all__ = [
     "MOBILE",
     "contract_for",
     "criteria_from_mapping",
+    "extract_proposed_criteria",
 ]
 
 
@@ -661,3 +663,76 @@ def criteria_from_mapping(raw: Iterable[Any]) -> List[Criterion]:
         except (ValueError, TypeError) as exc:
             logger.warning("ignoring an unusable proposed criterion: %s", exc)
     return parsed
+
+
+#: Kinds a planning session may propose. Deliberately narrower than KINDS:
+#: GATE is owned by the target's engineering profile, not by a model's
+#: opinion of what a gate should be named; PERFORMANCE needs a baseline
+#: nobody but a real measurement can supply, and a budget the model invented
+#: to satisfy its own schema would look like evidence without being any;
+#: MANUAL is unchecked by construction, so proposing one contributes nothing
+#: that :attr:`AcceptanceContract.browser_criteria` or any other check will
+#: ever look at.
+_PROPOSABLE_KINDS = frozenset(
+    {CONTENT, INTERACTION, VIEWPORT, CONSOLE, NETWORK, ENDPOINT, UNAUTHORIZED}
+)
+
+#: The fence the planning prompt asks Claude to use — see
+#: :meth:`ClaudeCodeEngineeringAgent._planning_prompt`
+#: in :mod:`openjarvis.wiz.features.engineer`.
+#: A dedicated tag rather than a bare ```json``` block, so a plan that
+#: happens to include an unrelated JSON example elsewhere is not mistaken
+#: for a criteria proposal.
+_CRITERIA_FENCE = re.compile(
+    r"```acceptance-criteria\s*\n(.*?)```", re.DOTALL | re.IGNORECASE
+)
+
+
+def extract_proposed_criteria(plan_text: str) -> List[Dict[str, Any]]:
+    """Pull a planning session's proposed criteria out of its prose.
+
+    Looks for a single fenced ```acceptance-criteria``` block containing a
+    JSON array of criterion tables. Returns ``[]`` for a plan with no such
+    block, malformed JSON, or JSON that is not an array — a plan that forgot
+    the format, or got it wrong, still has its deterministic contract from
+    :func:`contract_for`; this only ever adds to that, never replaces it, and
+    a session that cannot be asked (a test double, a plan skipped entirely)
+    behaves identically to one that proposed nothing.
+
+    Deliberately returns raw dicts rather than :class:`Criterion` objects:
+    validation happens once, in :func:`criteria_from_mapping`, so a criterion
+    that fails validation is dropped there with the same warning regardless
+    of whether it came from here or from any other caller.
+    """
+    if not plan_text:
+        return []
+    match = _CRITERIA_FENCE.search(plan_text)
+    if not match:
+        return []
+    try:
+        parsed = json.loads(match.group(1))
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning("could not parse proposed acceptance criteria: %s", exc)
+        return []
+    if not isinstance(parsed, list):
+        logger.warning(
+            "proposed acceptance criteria must be a JSON array; got %s",
+            type(parsed).__name__,
+        )
+        return []
+
+    accepted: List[Dict[str, Any]] = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind", "")).upper()
+        if kind not in _PROPOSABLE_KINDS:
+            logger.warning(
+                "ignoring a proposed criterion of kind %r; a planning session "
+                "may propose %s",
+                kind,
+                ", ".join(sorted(_PROPOSABLE_KINDS)),
+            )
+            continue
+        accepted.append(item)
+    return accepted

@@ -285,7 +285,27 @@ class ClaudeCodeEngineeringAgent:
             "- database, migration or schema implications, if any\n"
             "- anything that makes this riskier than it looks\n\n"
             "Investigate before answering. If the request is ambiguous in a way "
-            "that changes what should be built, say so instead of choosing."
+            "that changes what should be built, say so instead of choosing.\n\n"
+            "# Acceptance criteria (optional, additive)\n"
+            "A generic contract is derived from the request automatically — it "
+            "cannot know what you now know from reading the repository. If you "
+            "can name something more specific worth checking (real button "
+            "text, a route only visible after investigating, a specific "
+            "interaction and what should happen after it, an API endpoint and "
+            "the status it should return), append ONE fenced block:\n\n"
+            "```acceptance-criteria\n"
+            "[\n"
+            '  {"kind": "CONTENT", "route": "/path", "text": "exact text", '
+            '"description": "what this proves"},\n'
+            '  {"kind": "INTERACTION", "route": "/path", "selector": '
+            '"button[name=save]", "then_text": "Saved", "description": '
+            '"what this proves"}\n'
+            "]\n"
+            "```\n\n"
+            "Valid kinds: CONTENT, INTERACTION, VIEWPORT, CONSOLE, NETWORK, "
+            "ENDPOINT, UNAUTHORIZED. This is additive only — it can make the "
+            "bar higher, never lower one already set. Omit the block entirely "
+            "rather than propose something vague; nothing here is required."
         )
 
     @staticmethod

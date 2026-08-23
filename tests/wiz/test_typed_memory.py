@@ -302,7 +302,7 @@ class TestSupersession:
             id="decision:v1",
             category=MemoryCategory.DECISION,
             content="Use PostgreSQL",
-            source=MemorySource.DECISION,
+            source=MemorySource.OPERATOR,
         )
         temp_db.remember(old)
 
@@ -310,7 +310,7 @@ class TestSupersession:
             id="decision:v2",
             category=MemoryCategory.DECISION,
             content="Use SQLite",
-            source=MemorySource.DECISION,
+            source=MemorySource.OPERATOR,
         )
         temp_db.supersede("decision:v1", new)
 
@@ -595,7 +595,7 @@ class TestUtilities:
                 id="d:1",
                 category=MemoryCategory.DECISION,
                 content="Decision",
-                source=MemorySource.DECISION,
+                source=MemorySource.OPERATOR,
             )
         )
 

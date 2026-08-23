@@ -18,6 +18,7 @@ from openjarvis.wiz.features.acceptance import (
     Criterion,
     contract_for,
     criteria_from_mapping,
+    extract_proposed_criteria,
 )
 
 
@@ -312,6 +313,85 @@ class TestSerialisation:
         )
         assert len(parsed) == 1
         assert parsed[0].text == "Hi"
+
+
+class TestProposedCriteriaExtraction:
+    """extract_proposed_criteria: pulling a plan session's proposal out of its prose."""
+
+    def test_a_valid_block_is_extracted(self):
+        plan = (
+            "I would add a Download button next to the summary heading.\n\n"
+            "```acceptance-criteria\n"
+            "[\n"
+            '  {"kind": "CONTENT", "route": "/coach/summary", "text": '
+            '"Download report", "description": "the button appears"}\n'
+            "]\n"
+            "```\n"
+        )
+        proposed = extract_proposed_criteria(plan)
+        assert len(proposed) == 1
+        assert proposed[0]["text"] == "Download report"
+
+    def test_no_block_is_not_an_error(self):
+        assert extract_proposed_criteria("A plan with no criteria block at all.") == []
+
+    def test_empty_plan_is_not_an_error(self):
+        assert extract_proposed_criteria("") == []
+
+    def test_malformed_json_is_dropped_not_fatal(self):
+        plan = "```acceptance-criteria\n[{not valid json\n```"
+        assert extract_proposed_criteria(plan) == []
+
+    def test_a_non_array_is_dropped(self):
+        plan = '```acceptance-criteria\n{"kind": "CONTENT"}\n```'
+        assert extract_proposed_criteria(plan) == []
+
+    def test_gate_and_performance_are_not_proposable(self):
+        # GATE belongs to the engineering profile, not a model's opinion of
+        # what a gate should be named; PERFORMANCE needs a real baseline.
+        plan = (
+            "```acceptance-criteria\n"
+            "[\n"
+            '  {"kind": "GATE", "name": "lint", "description": "lint passes"},\n'
+            '  {"kind": "PERFORMANCE", "name": "p95", "budget": 100, '
+            '"description": "fast enough"},\n'
+            '  {"kind": "CONTENT", "route": "/x", "text": "Y", '
+            '"description": "real one"}\n'
+            "]\n"
+            "```"
+        )
+        proposed = extract_proposed_criteria(plan)
+        assert len(proposed) == 1
+        assert proposed[0]["kind"] == "CONTENT"
+
+    def test_an_unrelated_json_block_elsewhere_is_not_mistaken_for_one(self):
+        plan = (
+            'The config looks like:\n```json\n{"retries": 3}\n```\n'
+            "No acceptance criteria block here."
+        )
+        assert extract_proposed_criteria(plan) == []
+
+    def test_extraction_feeds_criteria_from_mapping_and_is_additive(self):
+        # The whole point: what the plan proposed ends up in the actual
+        # contract alongside the deterministic criteria, never replacing them.
+        plan = (
+            "```acceptance-criteria\n"
+            "[\n"
+            '  {"kind": "INTERACTION", "route": "/coach/summary", '
+            '"selector": "button[name=download]", "then_text": "Saved", '
+            '"description": "clicking it saves"}\n'
+            "]\n"
+            "```"
+        )
+        extra = criteria_from_mapping(extract_proposed_criteria(plan))
+        contract = contract_for(
+            feature_id="FEAT-9",
+            request='Add a "Download report" button to /coach/summary',
+            extra=extra,
+        )
+        kinds = {c.kind for c in contract.criteria}
+        assert "INTERACTION" in kinds
+        assert "CONTENT" in kinds  # the deterministic criterion is still there
 
 
 class TestWhatThePilotFound:

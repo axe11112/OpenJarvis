@@ -335,6 +335,51 @@ class TestHappyPath:
         assert any(m.startswith("Sir,") for m in messages)
 
 
+class TestPlanProposedCriteria:
+    """The planning session's proposed criteria reach the real contract."""
+
+    CRITERIA_BLOCK = (
+        "I would add a Download button next to the summary heading.\n\n"
+        "```acceptance-criteria\n"
+        "[\n"
+        '  {"kind": "INTERACTION", "route": "/coach/summary", "selector": '
+        '"button[name=download]", "then_text": "Downloaded", "description": '
+        '"clicking it downloads"}\n'
+        "]\n"
+        "```\n"
+    )
+
+    def test_a_proposed_criterion_reaches_the_real_contract(self, tmp_path, clock):
+        engineer = ScriptedEngineer(plan_claim=self.CRITERIA_BLOCK)
+        pipeline = build_pipeline(tmp_path, clock, engineer=engineer)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY, result.history[-1]
+
+        assert result.metadata["proposed_criteria"][0]["kind"] == "INTERACTION"
+        contract_kinds = {c["kind"] for c in result.metadata["contract"]["criteria"]}
+        assert "INTERACTION" in contract_kinds
+        # Additive, not instead of: the deterministic criterion is still there.
+        assert "CONTENT" in contract_kinds
+
+    def test_a_plan_with_no_block_proposes_nothing(self, tmp_path, clock):
+        pipeline = build_pipeline(tmp_path, clock)  # default plan_claim, no block
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY, result.history[-1]
+        assert "proposed_criteria" not in result.metadata
+
+    def test_a_malformed_block_does_not_stop_the_feature(self, tmp_path, clock):
+        engineer = ScriptedEngineer(
+            plan_claim="```acceptance-criteria\n[{not valid json\n```"
+        )
+        pipeline = build_pipeline(tmp_path, clock, engineer=engineer)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY, result.history[-1]
+        assert "proposed_criteria" not in result.metadata
+
+
 class TestClaudeCodeIsTheOnlyAuthor:
     def test_every_build_goes_through_the_claude_adapter(self, tmp_path, clock):
         engineer = ScriptedEngineer()
