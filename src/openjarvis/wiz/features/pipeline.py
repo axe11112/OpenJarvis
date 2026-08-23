@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from openjarvis.reliability.briefing import has_critical_secret
 from openjarvis.wiz.approvals import ApprovalError, ApprovalStore
 from openjarvis.wiz.authority import Actor, Authority, AuthorityPolicy
 from openjarvis.wiz.capabilities import Risk
@@ -692,6 +693,25 @@ class FeaturePipeline:
             # operator need the second. Sending the summary to Claude is how a
             # second attempt ends up being told "tests: failed" and guessing.
             evidence = _gate_feedback(result)
+            self.store.save(feature)
+            return self._retry_or_stop(feature, attempt, evidence)
+
+        # A gate the engineering profile has no way to configure: none of
+        # lint, typecheck, test or build is a secret scanner, and a repository
+        # without one configured as a custom lint step would otherwise commit
+        # and push whatever the diff contains. Checked here — on the diff,
+        # before it is committed — rather than only redacted later when it is
+        # rendered into a pull request or a notification; those catch a
+        # secret from reaching an operator's screen, this catches one from
+        # reaching git history at all.
+        if has_critical_secret(self.workspace.diff(worktree)):
+            evidence = (
+                "the diff contains what looks like a real credential (an API "
+                "key, token, or password assigned directly rather than read "
+                "from configuration); I have not committed it. Use an "
+                "environment variable or the project's existing secret "
+                "handling instead of a literal value."
+            )
             self.store.save(feature)
             return self._retry_or_stop(feature, attempt, evidence)
 

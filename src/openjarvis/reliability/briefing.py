@@ -40,6 +40,7 @@ __all__ = [
     "BriefingRefusedError",
     "build_briefing",
     "fence",
+    "has_critical_secret",
     "redact_secrets",
     "scan_for_injection",
 ]
@@ -344,6 +345,19 @@ def _has_critical_secret(text: str) -> bool:
         ):
             return True
     return False
+
+
+def has_critical_secret(text: str) -> bool:
+    """Public entry point to the same scan the briefing runs on the way in.
+
+    Every failure path — the security package missing, the compiled scanner
+    unavailable and no pattern-table fallback either — returns ``True``. The
+    question this answers is not "did the scanner find a secret" but "can
+    this text be shown to be free of one"; a scanner that could not run has
+    not answered that, and treating "could not check" as "clean" is how a
+    credential reaches somewhere it must not.
+    """
+    return _has_critical_secret(text)
 
 
 def _render_evidence(incident: Incident) -> tuple[str, List[str]]:

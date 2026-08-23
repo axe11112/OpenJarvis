@@ -42,7 +42,7 @@ class FakeWorktree:
 class FakeWorkspace:
     """A worktree factory that records what it was asked for."""
 
-    def __init__(self, tmp_path, changed_files=None):
+    def __init__(self, tmp_path, changed_files=None, diff_text="+ nothing sensitive"):
         self.tmp_path = tmp_path
         self.created = []
         self.changed = list(
@@ -51,6 +51,7 @@ class FakeWorkspace:
         self.commits = []
         self.pushes = []
         self.commit_sha = "feedface" + "0" * 32
+        self.diff_text = diff_text
 
     def create(self, feature_id, *, title="", base_ref="HEAD"):
         path = self.tmp_path / f"wt-{feature_id}"
@@ -65,6 +66,9 @@ class FakeWorkspace:
 
     def changed_files(self, worktree):
         return list(self.changed)
+
+    def diff(self, worktree, *, max_chars=20000):
+        return self.diff_text
 
     def line_counts(self, worktree):
         return (12, 3)
@@ -1282,6 +1286,48 @@ class TestTheEvidenceAGateProduces:
         from openjarvis.wiz.features.shipping import pull_request_body
 
         assert "tests: passed" in pull_request_body(result)
+
+
+class TestNoSecretIsCommitted:
+    """No gate the engineering profile configures is a secret scanner."""
+
+    def test_a_diff_with_a_real_looking_token_is_not_committed(self, tmp_path, clock):
+        workspace = FakeWorkspace(
+            tmp_path, diff_text='+ const token = "ghp_' + "a" * 36 + '";'
+        )
+        pipeline = build_pipeline(tmp_path, clock, workspace=workspace, max_attempts=1)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert not workspace.commits, "a diff carrying a credential was committed"
+        assert not workspace.pushes
+
+    def test_the_next_attempt_is_told_why_not_shown_the_secret(self, tmp_path, clock):
+        engineer = ScriptedEngineer()
+        secret = "ghp_" + "a" * 36
+        workspace = FakeWorkspace(tmp_path, diff_text=f'+ const token = "{secret}";')
+        pipeline = build_pipeline(
+            tmp_path, clock, engineer=engineer, workspace=workspace
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        # Second attempt happens because FakeWorkspace keeps returning the
+        # same tainted diff — the point here is what Claude was told, not
+        # whether the retry succeeds.
+        assert len(engineer.build_calls) >= 2
+        second_prompt = engineer.build_calls[1][0].render()
+        assert "credential" in second_prompt.lower()
+        assert secret not in second_prompt
+
+    def test_an_ordinary_diff_is_committed_normally(self, tmp_path, clock):
+        # The default fixture already carries an innocuous diff; this just
+        # makes the contrast with the two tests above explicit.
+        workspace = FakeWorkspace(tmp_path)
+        pipeline = build_pipeline(tmp_path, clock, workspace=workspace)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert workspace.commits
 
 
 class TestRecoveringFromAMess:
