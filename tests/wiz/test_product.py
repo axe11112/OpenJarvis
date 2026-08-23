@@ -82,6 +82,26 @@ class FakePipeline:
             self.store.save(feature)
         return feature
 
+    def ship(self, feature_id, *, operator_approved=False):
+        """Matches ``FeaturePipeline.ship``'s contract, for the routes tests."""
+        self.shipped = getattr(self, "shipped", [])
+        self.shipped.append((feature_id, operator_approved))
+        feature = self.store.get(feature_id)
+        if feature is None:
+            raise KeyError(feature_id)
+        if feature.state is FeatureState.READY:
+            for target in (
+                FeatureState.MERGING,
+                FeatureState.DEPLOYING,
+                FeatureState.PRODUCTION_VERIFYING,
+                FeatureState.COMPLETE,
+            ):
+                feature.transition(
+                    target, at="2026-08-19T10:05:00+00:00", reason="shipped"
+                )
+            self.store.save(feature)
+        return feature
+
 
 @pytest.fixture
 def product(tmp_path):

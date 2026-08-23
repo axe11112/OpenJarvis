@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
@@ -9,7 +12,13 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from openjarvis.server import wiz_routes  # noqa: E402
-from openjarvis.wiz.authority import Authority, AuthorityPolicy, Channel  # noqa: E402
+from openjarvis.wiz.authority import (  # noqa: E402
+    Actor,
+    Authority,
+    AuthorityPolicy,
+    Channel,
+)
+from openjarvis.wiz.features.model import FeatureState  # noqa: E402
 from openjarvis.wiz.journal import WizJournal  # noqa: E402
 from openjarvis.wiz.memory import ProductMemory  # noqa: E402
 from openjarvis.wiz.product import ProductVerbs  # noqa: E402
@@ -197,6 +206,80 @@ class TestCancelling:
         client.post("/api/wiz/features", json={"text": "Add a download button"})
         client.post("/api/wiz/features/FEAT-00001/cancel")
         assert client.post("/api/wiz/features/FEAT-00001/cancel").json()["ok"]
+
+
+class TestShipping:
+    """/ship: without this route, nothing on any channel could ever call it —
+    `run` (via /build) never reaches past READY on its own."""
+
+    def test_the_default_control_center_grant_cannot_ship(self, client):
+        # The fixture's policy grants CODE_WRITE, not PRODUCTION_CHANGE — the
+        # same gap a freshly-configured operator would have until they
+        # deliberately grant it.
+        client.post("/api/wiz/features", json={"text": "Add a download button"})
+        body = client.post("/api/wiz/features/FEAT-00001/ship").json()
+        assert body["started"] is False
+        assert "not allowed" in body["message"]
+        assert getattr(client.pipeline, "shipped", []) == []
+
+    def test_granted_production_change_can_ship(self, tmp_path, monkeypatch):
+        pipeline = FakePipeline()
+        pipeline.approvals = None
+        pipeline.queue = None
+        feature = pipeline.submit(
+            "Add a download button",
+            actor=Actor(
+                actor_id="operator", channel=Channel.CONTROL_CENTER, authenticated=True
+            ),
+        )
+        feature.state = FeatureState.READY
+        pipeline.store.save(feature)
+
+        product = ProductVerbs(pipeline=pipeline, memory=None, runner=lambda i: None)
+        runtime = build_wiz(
+            home=tmp_path,
+            policy=AuthorityPolicy(
+                grants={
+                    Channel.CONTROL_CENTER: frozenset(
+                        {
+                            Authority.READ,
+                            Authority.CODE_WRITE,
+                            Authority.PRODUCTION_CHANGE,
+                        }
+                    )
+                }
+            ),
+            journal=WizJournal(tmp_path / "j.jsonl"),
+            store_factory=lambda: (_ for _ in ()).throw(FileNotFoundError("none")),
+            product=product,
+        )
+        wiz_routes.reset_state()
+        monkeypatch.setattr(wiz_routes, "_runtime", lambda: runtime)
+        app = FastAPI()
+        app.include_router(wiz_routes.router)
+        test_client = TestClient(app)
+
+        response = test_client.post(f"/api/wiz/features/{feature.id}/ship")
+        assert response.json()["started"] is True
+
+        for _ in range(50):  # the fake ship() is synchronous and fast
+            if pipeline.store.get(feature.id).state.value == "COMPLETE":
+                break
+            time.sleep(0.01)
+        assert pipeline.store.get(feature.id).state.value == "COMPLETE"
+        assert pipeline.shipped == [(feature.id, False)]
+        wiz_routes.reset_state()
+
+    def test_a_second_click_while_shipping_does_not_start_a_second_thread(self, client):
+        client.post("/api/wiz/features", json={"text": "Add a download button"})
+        with wiz_routes._RUNTIME_LOCK:
+            wiz_routes._RUNNING["FEAT-00001"] = threading.Thread(
+                target=lambda: time.sleep(1)
+            )
+            wiz_routes._RUNNING["FEAT-00001"].start()
+        body = client.post("/api/wiz/features/FEAT-00001/ship").json()
+        assert body["started"] is False
+        assert "already working" in body["message"]
 
 
 class TestThePage:

@@ -259,6 +259,60 @@ def build_feature(feature_id: str) -> Dict[str, Any]:
     return _start(feature_id)
 
 
+@router.post("/features/{feature_id}/ship")
+def ship_feature(
+    feature_id: str, payload: Optional[Dict[str, Any]] = Body(None)
+) -> Dict[str, Any]:
+    """Merge a READY feature and prove it in production, or say why not.
+
+    The one route on this authority: ``run`` (via ``/build``) never reaches
+    past ``READY`` on its own — see ``FeaturePipeline.ship``'s own docstring
+    — so without this endpoint nothing on any channel could ever call it.
+    ``Authority.PRODUCTION_CHANGE`` is checked here for the same reason
+    ``_start`` checks ``CODE_WRITE`` before ``/build``: a refusal belongs in
+    the response the operator clicked for, not discovered later by polling.
+    ``ship`` re-checks the same authority itself before it merges anything,
+    so this is belt, not the only suspenders.
+    """
+    runtime = _runtime()
+    if runtime.product is None:
+        return {"started": False, "message": "feature work is not configured here"}
+
+    with _RUNTIME_LOCK:
+        existing = _RUNNING.get(feature_id)
+        if existing is not None and existing.is_alive():
+            return {"started": False, "message": "I am already working on that"}
+
+    from openjarvis.wiz.authority import Authority, Channel
+    from openjarvis.wiz.runtime import operator
+
+    decision = runtime.policy.decide(
+        operator(Channel.CONTROL_CENTER),
+        Authority.PRODUCTION_CHANGE,
+        capability="feature.ship",
+    )
+    if not decision.allowed:
+        return {"started": False, "message": f"I am not allowed to: {decision.reason}"}
+
+    pipeline = runtime.product.pipeline
+    operator_approved = bool((payload or {}).get("operator_approved", False))
+
+    def drive() -> None:
+        try:
+            pipeline.ship(feature_id, operator_approved=operator_approved)
+        except Exception:  # pragma: no cover - the thread must not die silently
+            logger.exception("shipping %s failed in the background", feature_id)
+        finally:
+            with _RUNTIME_LOCK:
+                _RUNNING.pop(feature_id, None)
+
+    thread = threading.Thread(target=drive, name=f"wiz-ship-{feature_id}", daemon=True)
+    with _RUNTIME_LOCK:
+        _RUNNING[feature_id] = thread
+    thread.start()
+    return {"started": True, "message": "shipping it"}
+
+
 @router.post("/features/{feature_id}/approve")
 def approve_feature(
     feature_id: str, payload: Optional[Dict[str, Any]] = Body(None)
