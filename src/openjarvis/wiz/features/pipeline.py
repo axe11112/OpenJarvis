@@ -37,6 +37,7 @@ bounded number of attempts. Only when they run out does a person get involved.
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -160,6 +161,10 @@ class FeaturePipeline:
 
     def __post_init__(self) -> None:
         self._worktrees: Dict[str, Any] = {}
+        # Guards the whole of ship(): merge, production observation and
+        # production verification are one critical section, process-wide.
+        # See ship()'s own docstring for why one lock is the right shape.
+        self._ship_lock = threading.Lock()
 
     # -- intake ------------------------------------------------------------
 
@@ -284,7 +289,29 @@ class FeaturePipeline:
         approved a HIGH-risk feature, a scoped-down token — makes the feature
         itself worse off; the same call can simply be made again once whatever
         blocked it has changed.
+
+        Serialised on ``self._ship_lock``: merging one feature and observing
+        its production deployment is a critical section a second call — for
+        this feature or any other — must never interleave with. Two features
+        both reaching READY and both being shipped at the same moment is not
+        hypothetical; without this, the second call's production observation
+        could race the first's and attribute the wrong deployment to the
+        wrong feature. The lock is a plain ``threading.Lock``, in-memory and
+        process-wide, the same shape every other single-flight guard in this
+        codebase uses (:class:`~openjarvis.wiz.features.queue.DevelopmentQueue`,
+        :class:`~openjarvis.wiz.features.store.FeatureStore`); it does not
+        need to survive a crash to be crash-safe, because a crash also ends
+        the process holding it — the next process starts unlocked, and a
+        feature left mid-ship is exactly the ``MERGING``/``DEPLOYING`` restart
+        case :meth:`_load` and the state machine already have to answer.
         """
+        with self._ship_lock:
+            return self._ship_locked(feature_id, operator_approved=operator_approved)
+
+    def _ship_locked(
+        self, feature_id: str, *, operator_approved: bool = False
+    ) -> FeatureRequest:
+        """The body of :meth:`ship`, for a caller already holding the lock."""
         feature = self._load(feature_id)
         if feature.state is not FeatureState.READY:
             self._record(

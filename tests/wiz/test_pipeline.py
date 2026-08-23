@@ -1069,6 +1069,96 @@ class TestShip:
         pipeline.ship(feature.id)
         assert len(github.merge_calls) == 1
 
+    def test_two_features_shipping_at_once_never_overlap(self, tmp_path, clock):
+        # Feature A reaches READY, feature B reaches READY, and both are
+        # ship()ped from separate threads at the same moment. Without
+        # self._ship_lock this races: two production verifications could
+        # interleave and there would be nothing stopping one feature's
+        # postship.verify() from running concurrently with another's merge.
+        import threading
+        import time
+
+        class TrackingPostShip:
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.active = 0
+                self.max_active = 0
+                self.calls = []
+
+            def verify(self, feature, *, merge_commit_sha):
+                from openjarvis.wiz.features.postship import PostShipResult
+
+                with self.lock:
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                # Widen the race window deliberately: a real production
+                # observation takes real time, and this is where two
+                # verifications would overlap if the lock did not serialise
+                # ship() as a whole.
+                time.sleep(0.05)
+                with self.lock:
+                    self.calls.append((feature.id, merge_commit_sha))
+                    self.active -= 1
+                return PostShipResult(verified=True, reason="production agrees")
+
+        class MultiFeatureGitHub(self.FakeGitHub):
+            def __init__(self):
+                super().__init__()
+                self._next_pr = 100
+
+            def create_pull_request(self, **kwargs):
+                self._next_pr += 1
+                self.pr_calls.append(kwargs)
+                return {
+                    "html_url": f"https://github.com/a/b/pull/{self._next_pr}",
+                    "number": self._next_pr,
+                }
+
+            def get_pull_request(self, number):
+                return {
+                    "number": number,
+                    "head_sha": TestShip.HEAD_SHA,
+                    "base_sha": TestShip.BASE_SHA,
+                    "state": "open",
+                    "mergeable": True,
+                }
+
+            def merge_pull_request(self, **kwargs):
+                self.merge_calls.append(kwargs)
+                return {"merged": True, "sha": f"sha-for-pr-{kwargs['number']}"}
+
+        github = MultiFeatureGitHub()
+        postship = TrackingPostShip()
+        pipeline = build_pipeline(tmp_path, clock)
+        pipeline.shipper = self._shipper(github)
+        pipeline.postship = postship
+
+        feature_a = pipeline.run(pipeline.submit(REQUEST, actor=operator_actor()).id)
+        feature_b = pipeline.run(pipeline.submit(REQUEST, actor=operator_actor()).id)
+        assert feature_a.state is FeatureState.READY
+        assert feature_b.state is FeatureState.READY
+        assert feature_a.id != feature_b.id
+
+        results = {}
+
+        def ship(feature_id):
+            results[feature_id] = pipeline.ship(feature_id)
+
+        t1 = threading.Thread(target=ship, args=(feature_a.id,))
+        t2 = threading.Thread(target=ship, args=(feature_b.id,))
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        assert postship.max_active == 1, "two features verified production concurrently"
+        assert len(postship.calls) == 2
+        assert results[feature_a.id].state is FeatureState.COMPLETE
+        assert results[feature_b.id].state is FeatureState.COMPLETE
+        # Each feature's production observation was bound to its own merge
+        # SHA — neither verified the other's deployment.
+        assert postship.calls[0][1] != postship.calls[1][1]
+
 
 class TestTheReviewIsAdvisory:
     class DisapprovingReviewer:
