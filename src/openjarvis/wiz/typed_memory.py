@@ -227,6 +227,18 @@ END;
 
         If memory.id exists, it updates. Otherwise, generates a stable UUID.
         """
+        with self._lock:
+            self._remember_locked(memory)
+
+    def _remember_locked(self, memory: TypedMemory) -> None:
+        """The body of :meth:`remember`, for a caller that already holds the
+        lock — ``correct`` and ``supersede`` need their own update and this
+        insert to commit as one unit, and ``self._lock`` is a plain
+        ``threading.Lock``, not reentrant: calling :meth:`remember` from
+        inside their own ``with self._lock`` would deadlock forever rather
+        than raise, which is the failure mode worth avoiding a second call
+        path for.
+        """
         if not memory.id:
             memory.id = f"{memory.category.value}:{uuid.uuid4().hex[:8]}"
 
@@ -235,31 +247,30 @@ END;
             memory.created_at = now
         memory.updated_at = now
 
-        with self._lock:
-            self._conn.execute(
-                """
+        self._conn.execute(
+            """
 INSERT OR REPLACE INTO typed_memory
 (id, category, content, source, source_id, created_at, updated_at,
  confidence, supersedes, superseded_by, active, expires_at, provenance)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """,
-                (
-                    memory.id,
-                    memory.category.value,
-                    memory.content,
-                    memory.source.value,
-                    memory.source_id,
-                    memory.created_at,
-                    memory.updated_at,
-                    memory.confidence,
-                    memory.supersedes,
-                    memory.superseded_by,
-                    1 if memory.active else 0,
-                    memory.expires_at,
-                    json.dumps(memory.provenance, sort_keys=True),
-                ),
-            )
-            self._conn.commit()
+            (
+                memory.id,
+                memory.category.value,
+                memory.content,
+                memory.source.value,
+                memory.source_id,
+                memory.created_at,
+                memory.updated_at,
+                memory.confidence,
+                memory.supersedes,
+                memory.superseded_by,
+                1 if memory.active else 0,
+                memory.expires_at,
+                json.dumps(memory.provenance, sort_keys=True),
+            ),
+        )
+        self._conn.commit()
 
     def remember_fact(
         self,
@@ -335,7 +346,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "UPDATE typed_memory SET superseded_by = ?, updated_at = ? WHERE id = ?",
                 (new_id, now, old_id),
             )
-            self.remember(new_memory)
+            self._remember_locked(new_memory)
 
         return new_id
 
@@ -354,7 +365,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "UPDATE typed_memory SET superseded_by = ?, updated_at = ? WHERE id = ?",
                 (new_memory.id, now, old_id),
             )
-            self.remember(new_memory)
+            self._remember_locked(new_memory)
 
     # -- Reading ---------------------------------------------------------------
 
