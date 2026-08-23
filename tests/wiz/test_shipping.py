@@ -253,15 +253,23 @@ class TestAuthorityHasTheLastWord:
 
 class TestPullRequests:
     class FakeGitHub:
-        def __init__(self, fail=False):
+        def __init__(self, fail=False, existing_open_prs=None):
             self.calls = []
+            self.list_calls = 0
             self.fail = fail
+            self._existing = existing_open_prs
 
         def create_pull_request(self, **kwargs):
             self.calls.append(kwargs)
             if self.fail:
                 raise RuntimeError("403 Forbidden")
             return {"html_url": "https://github.com/a/b/pull/7", "number": 7}
+
+        def list_pull_requests(self, *, state="open"):
+            self.list_calls += 1
+            if self._existing is None:
+                raise RuntimeError("cannot list pull requests either")
+            return self._existing
 
     def test_a_pull_request_is_opened_when_permitted(self):
         github = self.FakeGitHub()
@@ -303,6 +311,81 @@ class TestPullRequests:
         # There is no method that could. The absence is the guarantee.
         assert not hasattr(FeatureShipper, "push_to_main")
         assert not hasattr(FeatureShipper, "commit_to_base")
+
+    def test_calling_it_twice_does_not_open_a_second_pull_request(self):
+        # A restart, a retried step, an operator clicking twice — whatever
+        # calls this a second time for a feature that already has a PR must
+        # not create another one.
+        github = self.FakeGitHub()
+        shipper = FeatureShipper(
+            policy=FeatureShippingPolicy(),
+            github=github,
+            authority=AuthorityPolicy(
+                grants={Channel.CONTROL_CENTER: frozenset({Authority.PR_WRITE})}
+            ),
+        )
+        feature = ready_feature()
+        first = shipper.open_pull_request(feature)
+        second = shipper.open_pull_request(feature)
+        assert first["created"] and first["number"] == 7
+        assert not second["created"]
+        assert second["number"] == 7
+        assert len(github.calls) == 1
+
+    def test_a_crash_between_creation_and_recording_reconciles_not_duplicates(self):
+        # The narrower crash window: GitHub already made the PR, but this
+        # process never got to record the number (killed, or this is a
+        # second process that does not share memory with the first). GitHub
+        # itself refuses a second PR from the same head branch; that failure
+        # is exactly what should trigger reconciliation, not be the last word.
+        github = self.FakeGitHub(
+            fail=True,
+            existing_open_prs=[
+                {
+                    "number": 7,
+                    "head": "wiz/feature/FEAT-00042",
+                    "base": "main",
+                    "url": "https://github.com/a/b/pull/7",
+                }
+            ],
+        )
+        shipper = FeatureShipper(
+            policy=FeatureShippingPolicy(),
+            github=github,
+            authority=AuthorityPolicy(
+                grants={Channel.CONTROL_CENTER: frozenset({Authority.PR_WRITE})}
+            ),
+        )
+        feature = ready_feature()
+        result = shipper.open_pull_request(feature)
+        assert result["reconciled"] is True
+        assert result["number"] == 7
+        assert feature.pr_number == 7
+        assert feature.pr_url == "https://github.com/a/b/pull/7"
+
+    def test_reconciliation_only_adopts_a_pr_from_this_branch(self):
+        github = self.FakeGitHub(
+            fail=True,
+            existing_open_prs=[
+                {
+                    "number": 99,
+                    "head": "wiz/feature/some-other-feature",
+                    "base": "main",
+                    "url": "https://github.com/a/b/pull/99",
+                }
+            ],
+        )
+        shipper = FeatureShipper(policy=FeatureShippingPolicy(), github=github)
+        result = shipper.open_pull_request(ready_feature())
+        assert not result.get("reconciled")
+        assert not result["created"]
+
+    def test_no_reconciliation_candidate_reports_the_original_failure(self):
+        github = self.FakeGitHub(fail=True)  # list_pull_requests also unavailable
+        shipper = FeatureShipper(policy=FeatureShippingPolicy(), github=github)
+        result = shipper.open_pull_request(ready_feature())
+        assert not result["created"]
+        assert "403" in result["reason"]
 
 
 class TestMerging:

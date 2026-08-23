@@ -355,7 +355,27 @@ class FeatureShipper:
     base_branch: str = "main"
 
     def open_pull_request(self, feature: FeatureRequest) -> Dict[str, Any]:
-        """Open the feature's pull request, if that is permitted."""
+        """Open the feature's pull request, if that is permitted.
+
+        Idempotent, because the caller cannot promise this runs exactly once.
+        Called a second time for a feature that already has a recorded PR, it
+        is a no-op — the common case, and the cheap one to make safe. The
+        narrower case is a crash between GitHub answering "created" and this
+        process recording the number: on retry, ``create_pull_request`` fails
+        (GitHub refuses two open pull requests from the same head branch into
+        the same base), and rather than reporting that failure as the last
+        word, :meth:`_find_existing_pull_request` looks for the PR that
+        failure implies already exists and adopts its number. A restart is
+        then a delay, not a duplicate and not a stall.
+        """
+        if feature.pr_number:
+            return {
+                "created": False,
+                "reason": "already has a pull request",
+                "number": feature.pr_number,
+                "url": feature.pr_url,
+            }
+
         if not self.policy.create_pull_request:
             return {"created": False, "reason": "opening pull requests is switched off"}
 
@@ -382,6 +402,17 @@ class FeatureShipper:
                 base=self.base_branch,
             )
         except Exception as exc:
+            reconciled = self._find_existing_pull_request(feature)
+            if reconciled is not None:
+                feature.pr_url = str(reconciled.get("url", ""))
+                feature.pr_number = int(reconciled.get("number", 0) or 0)
+                self._record(feature, "feature.pull_request_reconciled", feature.pr_url)
+                return {
+                    "created": False,
+                    "reconciled": True,
+                    "url": feature.pr_url,
+                    "number": feature.pr_number,
+                }
             logger.warning("could not open a pull request for %s: %s", feature.id, exc)
             return {"created": False, "reason": str(exc)}
 
@@ -391,6 +422,30 @@ class FeatureShipper:
         feature.pr_number = number
         self._record(feature, "feature.pull_request_opened", url)
         return {"created": True, "url": url, "number": number}
+
+    def _find_existing_pull_request(
+        self, feature: FeatureRequest
+    ) -> Optional[Dict[str, Any]]:
+        """Look for an already-open PR from this feature's branch.
+
+        Best-effort: called only after ``create_pull_request`` has already
+        failed, so any exception here is reported as "could not find it
+        either" rather than raised — the original failure is still the one
+        that matters if this also comes up empty.
+        """
+        try:
+            open_prs = self.github.list_pull_requests(state="open")
+        except Exception as exc:
+            logger.warning(
+                "could not check for an existing pull request for %s: %s",
+                feature.id,
+                exc,
+            )
+            return None
+        for pr in open_prs:
+            if pr.get("head") == feature.branch:
+                return pr
+        return None
 
     def evaluate(self, feature: FeatureRequest, **kwargs: Any) -> ShipDecision:
         return evaluate_shipping(
