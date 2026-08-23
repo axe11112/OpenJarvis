@@ -525,3 +525,62 @@ class TestTheDescription:
         feature = ready_feature()
         feature.metadata["review"] = {"ran": True, "text": "Looks fine to me."}
         assert "advisory" in pull_request_body(feature).lower()
+
+
+class TestNoSecretReachesThePullRequest:
+    """redact_secrets() is documented for exactly this surface — is it used?
+
+    The review session is a read-only Claude session that has just
+    investigated the repository; its free-text summary is the one field in
+    the PR body that is genuinely open-ended model prose, and the one most
+    likely to repeat something it saw.
+    """
+
+    def test_a_github_token_shape_is_redacted(self):
+        feature = ready_feature()
+        feature.metadata["review"] = {
+            "ran": True,
+            "text": "I found the API is authenticated with ghp_"
+            + "a" * 36
+            + " in the client.",
+        }
+        body = pull_request_body(feature)
+        assert "ghp_" + "a" * 36 not in body
+
+    def test_a_named_secret_assignment_is_redacted(self):
+        feature = ready_feature()
+        feature.metadata["review"] = {
+            "ran": True,
+            "text": "The test output showed VERCEL_READONLY_TOKEN=abcd1234efgh5678 "
+            "being logged.",
+        }
+        body = pull_request_body(feature)
+        assert "abcd1234efgh5678" not in body
+
+    def test_an_authorization_header_is_redacted(self):
+        feature = ready_feature()
+        feature.metadata["review"] = {
+            "ran": True,
+            "text": 'The request sets Authorization: "Bearer sk-liveSECRETVALUE123" '
+            "on every call.",
+        }
+        body = pull_request_body(feature)
+        assert "sk-liveSECRETVALUE123" not in body
+
+    def test_a_session_cookie_is_redacted(self):
+        feature = ready_feature()
+        feature.metadata["review"] = {
+            "ran": True,
+            "text": "cookie=session_abcXYZ789longvalue was present in the fixture.",
+        }
+        body = pull_request_body(feature)
+        assert "session_abcXYZ789longvalue" not in body
+
+    def test_ordinary_review_text_is_unaffected(self):
+        feature = ready_feature()
+        feature.metadata["review"] = {
+            "ran": True,
+            "text": "The change looks correct and follows the existing pattern.",
+        }
+        body = pull_request_body(feature)
+        assert "The change looks correct" in body

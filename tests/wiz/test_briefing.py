@@ -100,6 +100,25 @@ class TestApprovalsComeFirst:
         briefing = compose(store=store, now="2026-08-19")
         assert "could not get the chart working" in briefing.needs_you[0]
 
+    def test_a_stopped_reason_carrying_a_secret_is_redacted(self, store):
+        # Some stop reasons are raw exception text from a GitHub or Vercel
+        # client failure. This is an owner notification — the same surface
+        # redact_secrets() is documented to protect.
+        request = feature(store, title="Add a chart", state=FeatureState.HUMAN_REQUIRED)
+        request.history.append(
+            {
+                "at": "t",
+                "from": "READY",
+                "to": "HUMAN_REQUIRED",
+                "reason": "could not read the pull request: ghp_"
+                + "a" * 36
+                + " was rejected",
+            }
+        )
+        store.save(request)
+        briefing = compose(store=store, now="2026-08-19")
+        assert "ghp_" + "a" * 36 not in briefing.needs_you[0]
+
 
 class TestWhatHappened:
     def test_yesterdays_finished_work_is_reported(self, store):

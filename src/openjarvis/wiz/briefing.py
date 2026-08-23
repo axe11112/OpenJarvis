@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from openjarvis.reliability.briefing import redact_secrets
 from openjarvis.wiz.features.model import FeatureState
 
 logger = logging.getLogger(__name__)
@@ -213,7 +214,11 @@ def _needs_you(store: Any) -> List[str]:
     for feature in blocked:
         reason = ""
         if feature.history:
-            reason = str(feature.history[-1].get("reason", "")).strip()
+            # Redacted before truncation: some history reasons carry a raw
+            # exception string (a GitHub or Vercel client failure), and this
+            # is an owner notification — the same surface redact_secrets()'s
+            # own docstring names explicitly.
+            reason = redact_secrets(str(feature.history[-1].get("reason", ""))).strip()
         if feature.risk == "HIGH":
             reasons = feature.metadata.get("risk_reasons") or []
             why = reasons[0] if reasons else "it is a high-risk change"
