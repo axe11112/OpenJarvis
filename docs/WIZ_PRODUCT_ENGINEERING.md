@@ -388,3 +388,98 @@ SHA — needs that machine, that token, and a real LOW-risk feature request. If
 it turns out the token lacks the grant, that is not a bug in this session's
 code: `merge_feature` is built to say so exactly, by name, rather than fail
 silently or fall back to a wider credential.
+
+## 10. Overnight hardening: nine defects that would have surfaced on the Mac
+
+A second cloud session, explicitly asked to attack every weakness in the
+chain from `ship()` onward that did not require real credentials, before the
+real pilot. `0ee8436..8691c5b`, nine commits, all pushed to
+`claude/wiz-canonical-integration`. In order:
+
+1. **`TypedMemory.correct`/`.supersede` deadlocked on their own lock.**
+   Non-reentrant `threading.Lock`, acquired, then `remember()` called from
+   inside the `with` block, acquiring the same lock again. Not flaky — every
+   call hung, forever, reproducing identically on the unmodified branch. This
+   is why `tests/wiz` could never complete in either cloud session; it would
+   have hung identically on the Mac.
+2. **The planning session's proposed acceptance criteria were never wired
+   in.** `feature.metadata["proposed_criteria"]` was read in one place and
+   written in none — `contract_for()`'s own docstring describes the intended
+   mechanism, and nothing ever fed it. Every feature's contract came from
+   keyword-parsing the raw request text alone, however much the planning
+   session's repository investigation could have named a real selector or
+   route. Closed by having the planning prompt ask for one optional fenced
+   `acceptance-criteria` JSON block and `_plan()` extract it — additive only,
+   same as the mechanism was designed for.
+3. **`ship()` had no lock.** Two READY features could be shipped from two
+   threads at once; nothing serialised the merge → production-observation →
+   production-verification critical section. Proved with a test that failed
+   3/3 runs before the fix (two features' production verifications
+   overlapping) and passed after. One `threading.Lock` on the pipeline
+   instance, the same in-memory shape every other single-flight guard in this
+   codebase already uses.
+4. **`open_pull_request` was not idempotent.** A crash between GitHub
+   confirming a PR and this process recording its number left a feature
+   stuck at READY forever — `run()` stops at READY by design, and `ship()`
+   refused "no pull request" with nothing to retry it. Fixed with a
+   no-op guard for the common case and branch-matched reconciliation via
+   `list_pull_requests` for the crash window, since GitHub itself refuses a
+   second PR from the same head branch.
+5. **A retry against an already-merged PR stalled silently.** The mirror
+   crash window, on the merge itself: `evaluate_shipping`'s
+   `pull_request_open` gate correctly refuses to merge an already-merged PR,
+   but the refusal was generic and the feature sat at READY with no
+   indication a merge had actually happened. Now recognised specifically and
+   routed to `HUMAN_REQUIRED` with a reason that says so — deliberately not
+   auto-resolved, since whether production was ever verified depends on
+   which crash this was.
+6. **The dead Priority-N stack's unreachability was a one-time grep, not an
+   enforced invariant.** Extended `test_dependency_direction.py` with the
+   same AST-import-parsing approach it already uses for reliability/wiz, so
+   a future accidental import is caught rather than merely re-discovered.
+7. **`redact_secrets()` was documented for the pull-request body and owner
+   notifications, called from neither.** Both are real Claude-generated or
+   client-exception prose reaching a real GitHub PR or a real Telegram
+   message. Wired in at both chokepoints, redacting before truncation rather
+   than after.
+8. **No gate anywhere scanned the diff itself for a committed credential.**
+   `EngineeringProfile` has four configurable gates — lint, typecheck, test,
+   build — and none is a secret scanner; the dead stack named
+   `no_secrets_detected` as a gate and the live pipeline that superseded it
+   has no equivalent. Promoted reliability's already-hardened
+   `_has_critical_secret()` (real scanner, pattern-table fallback, fails
+   closed on "cannot tell") to a public `has_critical_secret()` and gated the
+   diff on it immediately before commit, feeding a detected secret back as
+   retry evidence the same way a failing lint gate is.
+9. **The Control Center had no route to ever call `ship()`, and the button
+   did not exist either.** The single most consequential finding: every one
+   of the above exists inside `FeaturePipeline.ship()`, and
+   `Authority.PRODUCTION_CHANGE` can only ever be held by
+   `Channel.CONTROL_CENTER` — but `wiz_routes.py` had `/build`, `/approve`,
+   `/cancel`, and no `/ship`, and the dashboard's Ready section rendered
+   "Nothing waiting to ship" with no button under it. LOW-risk autonomous
+   shipping was fully built and fully tested and had no door. Added
+   `POST /features/{id}/ship`, matching `/build`'s established pattern
+   exactly (pre-check the authority, refuse a concurrent click, drive it in
+   a background thread), and the dashboard button that calls it.
+
+Every fix above was verified failing before it was applied and passing after
+— either by writing the test first and watching it fail against the
+unmodified code, or by temporarily reverting the fix and re-running the new
+test — not merely written and assumed correct. Full `tests/wiz`: **1208
+passed, 1 failed (the same pre-existing dead-stack failure §7 and §19
+already named, unrelated to any of the above), 0 skipped** — this session
+also installed `fastapi`/`httpx` (already a declared project extra), which
+brought a previously-skipped 25-test route file into the active count.
+Critical reliability regression (`test_merge`, `test_postmerge`,
+`test_notify`, `test_notify_ledger`): 221 passed, unchanged.
+
+Not found: a second dead client, a second parallel merge system, evidence
+that binds to the wrong feature, or a fake-success path reachable from any
+live entry point. The architecture audited clean everywhere except the nine
+items above — each a real, load-bearing gap, not an invented one.
+
+Nothing in this section required real credentials and nothing in it should
+still be discoverable on the Mac. What remains genuinely needs that machine:
+whether `GITHUB_READONLY_TOKEN` actually carries Pull requests: Write, and
+the real pilot itself.
