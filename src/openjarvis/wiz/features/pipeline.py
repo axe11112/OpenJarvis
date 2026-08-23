@@ -61,6 +61,7 @@ from openjarvis.wiz.features.model import (
     FeatureState,
     Priority,
 )
+from openjarvis.wiz.features.postship import complete as _complete_postship
 from openjarvis.wiz.features.preview import PreviewObserver
 from openjarvis.wiz.features.profile import EngineeringProfile
 from openjarvis.wiz.features.risk import classify, classify_paths
@@ -139,9 +140,16 @@ class FeaturePipeline:
     #: Advisory only. Deterministic gates remain authoritative.
     reviewer: Any = None
 
-    #: Opens the pull request when a feature reaches READY. Merging is a
-    #: separate authority this pipeline never exercises.
+    #: Opens the pull request when a feature reaches READY, and — only
+    #: through the explicit :meth:`ship` verb, never from :meth:`run` — merges
+    #: it. Opening is routine; :meth:`ship` is a separate authority this
+    #: pipeline's ordinary advancement never exercises on its own.
     shipper: Any = None
+
+    #: Proves a merged feature in production, or hands the failure to
+    #: reliability. Only used from :meth:`ship`, after ``shipper`` reports a
+    #: successful merge — see :mod:`openjarvis.wiz.features.postship`.
+    postship: Any = None
 
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
     clock: Callable[[], str] = _now
@@ -250,6 +258,133 @@ class FeaturePipeline:
                 self.queue.cancel(feature.id)
             except Exception:  # noqa: BLE001 - a queue that cannot forget it
                 logger.exception("could not remove %s from the queue", feature.id)
+        return feature
+
+    def ship(
+        self, feature_id: str, *, operator_approved: bool = False
+    ) -> FeatureRequest:
+        """Merge a READY feature and prove it in production, or say why not.
+
+        Deliberately not a step ``run`` reaches on its own. ``run`` advances a
+        feature up to the point a person becomes visible to it and stops at
+        ``READY`` even when a shipper and a post-ship verifier are both
+        configured, because opening a pull request is where its ordinary
+        autonomy ends by design — see :meth:`_open_pull_request`. ``ship`` is
+        the one call that can take a feature past that point, and every gate
+        that matters is re-asked inside it rather than trusted from whatever
+        ``READY`` last observed: the pull request and CI status are read fresh,
+        :meth:`FeatureShipper.merge_feature` re-checks the shipping gates, the
+        authority model and the token's actual write permission, and GitHub's
+        own merge call refuses server-side if the branch moved since any of
+        that was read.
+
+        A refusal leaves the feature exactly ``READY``. Nothing about calling
+        this and being told no — CI still running, the operator has not
+        approved a HIGH-risk feature, a scoped-down token — makes the feature
+        itself worse off; the same call can simply be made again once whatever
+        blocked it has changed.
+        """
+        feature = self._load(feature_id)
+        if feature.state is not FeatureState.READY:
+            self._record(
+                feature,
+                "feature.ship_refused",
+                f"the feature is {feature.state.value}, not READY",
+            )
+            return feature
+        if self.shipper is None:
+            self._record(feature, "feature.ship_refused", "no shipper is configured")
+            return feature
+        if not feature.pr_number:
+            self._record(
+                feature, "feature.ship_refused", "the feature has no pull request"
+            )
+            return feature
+
+        try:
+            pr = self.shipper.github.get_pull_request(feature.pr_number)
+        except Exception as exc:
+            self._record(
+                feature,
+                "feature.ship_refused",
+                f"could not read the pull request: {exc}",
+            )
+            return feature
+
+        required_contexts = list(
+            getattr(self.shipper.policy, "required_status_contexts", ()) or ()
+        )
+        status: Optional[Dict[str, Any]] = None
+        if required_contexts and pr.get("head_sha"):
+            try:
+                status = self.shipper.github.combined_status(
+                    pr["head_sha"], required_contexts=required_contexts
+                )
+            except Exception as exc:
+                logger.warning("could not read CI status for %s: %s", feature.id, exc)
+                status = {"state": "unreadable", "contexts": {}}
+
+        merge_result = self.shipper.merge_feature(
+            feature,
+            pull_request=pr,
+            status=status,
+            base_sha_at_verification=feature.base_sha,
+            observed_base_sha=pr.get("base_sha", ""),
+            operator_approved=operator_approved,
+        )
+        if not merge_result.get("merged"):
+            self._record(
+                feature,
+                "feature.ship_refused",
+                merge_result.get("reason", "the merge was refused"),
+            )
+            return feature
+
+        merge_sha = merge_result.get("sha", "")
+        self._transition(
+            feature, FeatureState.MERGING, f"merged pull request #{feature.pr_number}"
+        )
+        self._transition(
+            feature, FeatureState.DEPLOYING, "waiting for the production deployment"
+        )
+
+        if self.postship is None:
+            # Merged, but nothing here can prove production. Handed to a
+            # person rather than called COMPLETE on the strength of a merge
+            # alone — see the module docstring on why that word means what it
+            # says.
+            self._transition(
+                feature,
+                FeatureState.PRODUCTION_VERIFYING,
+                "no post-ship verifier is configured",
+            )
+            feature.transition(
+                FeatureState.HUMAN_REQUIRED,
+                at=self.clock(),
+                reason=(
+                    "merged, but I have no way to verify production — please "
+                    "check it yourself"
+                ),
+            )
+            self.store.save(feature)
+            self._record(feature, "feature.merged_unverified", f"merged at {merge_sha}")
+            self._release(feature)
+            return feature
+
+        self._transition(
+            feature,
+            FeatureState.PRODUCTION_VERIFYING,
+            f"verifying commit {merge_sha[:12]}",
+        )
+        result = self.postship.verify(feature, merge_commit_sha=merge_sha)
+        _complete_postship(feature, result, at=self.clock())
+        self.store.save(feature)
+        self._record(
+            feature,
+            "feature.shipped" if result.verified else "feature.production_unverified",
+            result.summary(),
+        )
+        self._release(feature)
         return feature
 
     def advance(self, feature: FeatureRequest) -> StepResult:

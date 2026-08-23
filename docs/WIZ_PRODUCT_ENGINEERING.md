@@ -225,9 +225,13 @@ Several files inherited from Phase B did not pass `ruff` and now do.
 Nothing in this work enabled any new production authority.
 
 - No channel is granted write authority by the shipped default policy.
-- Feature merging is off at every risk level, and unconfigurable for HIGH.
+- Feature merging is off at every risk level by default, and unconfigurable
+  for HIGH. (§9: the *mechanism* now exists — see below — but the default
+  policy still ships `merge_low_risk=False`, `merge_medium_risk=False`, and
+  there is still no field that could turn HIGH on.)
 - `SECRET_ACCESS` appears in no channel ceiling.
-- The pipeline contains no call that merges anything; a test greps for it.
+- `run` — the autonomous loop — still contains no call that merges anything.
+  A feature it advances on its own stops at `READY` exactly as before.
 
 ## 8. What remains before "Sir, it's live"
 
@@ -261,10 +265,126 @@ Honestly, and in order of what actually blocks it:
    the microphone.
 
 7. **A deliberate decision about feature merging** — which is the operator's,
-   not Wiz's. Everything up to the pull request can be autonomous today. The
-   merge is off, and turning it on is a sentence in a settings file with the
-   risk level named.
+   not Wiz's. Everything up to the pull request can be autonomous today. §9
+   built the mechanism this item used to be waiting on; the decision itself —
+   flipping `merge_low_risk` / `merge_medium_risk` in the settings file, with
+   the risk level named — is still, correctly, unmade by default.
 
 Steps 1, 2 and 5 are configuration. Steps 3 and 4 are a morning's work with a
 real deployment in front of you. Step 7 is a judgement nobody should make on
 your behalf.
+
+## 9. Shipping: the merge and post-ship wiring that did not exist
+
+This session audited the branch against a separate, parallel Wiz rebuild
+started from a clean checkout, specifically to check for exactly what §5c and
+this section describe: fakes, duplicated systems, and gaps between what the
+docs claimed and what the code did. Two real findings came out of it, and both
+are now closed.
+
+**Finding: a second, dead implementation is merged into this tree.**
+`wiz_orchestrator.py`, `feature_executor.py`, `feature_gate_integration.py`,
+`feature_shipping_authority.py`, `feature_contract.py`, `code_reviewer.py`,
+`acceptance_test_executor.py`, `claude_cli_executor.py` and
+`vercel_preview_tracker.py` are a complete, earlier "Priority 1–10" pipeline,
+merged into this tree at `333d335` alongside the `features/` package that
+superseded it. Nothing outside that group imports it — `assemble.py`,
+`product.py` and every live entry point are wired to `features/*` exclusively
+— and its own test (`test_wiz_orchestrator.py`) fails independently of
+anything in this session's changes. It is dead, not fake: the code is real and
+was once live, but no path reaches it today. Left in place rather than deleted
+here, because removing ~3,000 lines and their tests is a decision worth its
+own session, not a side effect of this one.
+
+**Finding: opening a pull request was where autonomy ended, in code as well as
+in policy — but the *mechanism* to go further did not exist, contrary to what
+§7/§8 implied.** `FeatureShippingPolicy` already had `merge_low_risk` and
+`merge_medium_risk` fields, and `evaluate_shipping` already computed a correct
+`ShipDecision` from them. But nothing ever read that decision and called
+`GitHubSource.merge_pull_request` — `FeatureShipper` had no merge method at
+all, and `FeaturePipeline.run` stopped at `READY` with no dispatch entry for
+`MERGING`, `DEPLOYING` or `PRODUCTION_VERIFYING`, despite `features/model.py`
+defining legal transitions through all of them and `features/postship.py`
+already containing a complete, tested, entirely unwired production verifier.
+Turning merging on was never going to be "a sentence in a settings file" — the
+sentence had nothing to act on.
+
+Closed, reusing what already existed rather than building a parallel path:
+
+- `FeatureShipper.merge_feature()` (`features/shipping.py`) is the missing
+  write. It re-evaluates the shipping gates, then asks GitHub what the
+  configured token can *actually* do — `GitHubSource.can_write()`, which reads
+  the repository's own `permissions` block for this credential rather than
+  trusting a collaborator role that can say "maintainer" while the token is
+  scoped read-only — and refuses closed if that check fails, errors, or the
+  merge call itself comes back 403. TOCTOU beyond that is closed by GitHub
+  itself: `merge_pull_request` sends the verified commit as the expected head
+  and the API refuses server-side if the branch moved.
+- `FeaturePipeline.ship()` is the new verb that calls it. Deliberately not a
+  step `run` reaches on its own — `run` still stops at `READY`, unchanged, and
+  a test now proves that behaviourally rather than by grepping the module
+  source for the string `merge_pull_request`, since that grep would no longer
+  mean what it used to. `ship` reads the pull request and CI status fresh,
+  calls `merge_feature`, and on a real merge drives the feature
+  `MERGING → DEPLOYING → PRODUCTION_VERIFYING`, then hands off to
+  `features/postship.py`'s already-built `PostShipVerifier` and `complete()`
+  — `COMPLETE` if production agrees, `HUMAN_REQUIRED` (with reliability's
+  incident store, unchanged) if it does not, or if no post-ship verifier is
+  configured to check at all.
+- `assemble.py` gained `_postship()`, reusing the same `VercelSource` (target
+  `"production"` instead of `"preview"`) and the same browser verifier the
+  preview stage already builds — no new client, no new credential path.
+  `runtime.py` wires `postship.journal` the same deferred way `pipeline.journal`
+  already was.
+
+**Credentials, unchanged.** Both the merge path and everything upstream of it
+run on `GITHUB_READONLY_TOKEN` and `VERCEL_READONLY_TOKEN` — the same
+environment variables `reliability/sources/github.py` and `.../vercel.py` have
+always read, resolved through `openjarvis.core.credentials`. No new
+credential store, no new token file, nothing this branch's `_shipper()` and
+`_preview_observer()` were not already doing. `GITHUB_READONLY_TOKEN` reads
+oddly for a name that can now merge a pull request; it is the operator's
+existing name for the one GitHub credential Wiz and reliability both hold, and
+renaming it was out of scope here — a fine-grained token can be
+"read-only" about repository content and still carry Pull requests: Write,
+which is the actual grant `can_write()` checks. The token's real scopes are a
+live-Mac question this cloud session cannot answer; see below.
+
+**Verified:** `tests/wiz/test_shipping.py` (37 tests, 7 new — `can_write()`
+refusing before a network call, a 403 from the merge call itself being
+reported not raised, GitHub's own decline being reported not raised),
+`tests/wiz/test_pipeline.py` (55 tests, 9 new, in a new `TestShip` class —
+merge-and-complete, state order, production disagreeing hands off, a feature
+that is not yet READY is refused, no shipper configured, a token without push
+permission stays READY, a channel without `PRODUCTION_CHANGE` cannot ship,
+merging without a postship verifier hands to a person, shipping twice merges
+once), plus `test_postship.py`, `test_preview.py` and `test_runtime.py`
+unchanged and still green — 172 tests across the six touched files, all
+passing. The full `tests/wiz/` run that produced the **641 passed** figure in
+§6 did not complete cleanly in this session's container (it hung during
+collection with near-zero CPU use, not mid-run — consistent with §6's own note
+that this environment is not the author's Mac); it was not re-confirmed here
+and should be before this branch is trusted beyond the files listed above.
+
+**Still true, and now testable rather than assumed:** merging remains off by
+default (`FeatureShippingPolicy()` still ships `merge_low_risk=False`), still
+requires `Authority.PRODUCTION_CHANGE`, which no channel but
+`Channel.CONTROL_CENTER` can ever hold, and still cannot be configured for
+HIGH risk. What changed is that turning it on now does something.
+
+**What this session could not do, and why:** prove any of the above against
+the real `axe11112/Wize-Performance` repository or a real Vercel deployment.
+This is a cloud container with a proxy-injected `GITHUB_TOKEN` and no
+`GITHUB_READONLY_TOKEN` / `VERCEL_READONLY_TOKEN` in its environment — the
+credential the *service* on the real Mac actually runs with, per
+`docs/…` commit `2dd16a7`'s own hard-won lesson, is not something a cloud
+session can read out of thin air, and building a second credential path to
+work around that was explicitly the wrong move. `can_write()` and
+`merge_pull_request` were exercised against a `FakeGitHub` double whose
+behaviour is asserted, not against GitHub's API. The real proof — does the
+Mac's actual `GITHUB_READONLY_TOKEN` have Pull requests: Write, does a real
+merge land, does `VercelSource` find the resulting production deployment by
+SHA — needs that machine, that token, and a real LOW-risk feature request. If
+it turns out the token lacks the grant, that is not a bug in this session's
+code: `merge_feature` is built to say so exactly, by name, rather than fail
+silently or fall back to a wider credential.

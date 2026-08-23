@@ -487,6 +487,9 @@ def build_wiz(
         pipeline = getattr(product, "pipeline", None)
         if pipeline is not None and getattr(pipeline, "journal", None) is None:
             pipeline.journal = resolved_journal
+        postship = getattr(pipeline, "postship", None)
+        if postship is not None and getattr(postship, "journal", None) is None:
+            postship.journal = resolved_journal
 
     # Declared whether or not the product side is assembled, and *unavailable*
     # when it is not.

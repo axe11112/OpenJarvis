@@ -89,6 +89,8 @@ def assemble(
     # consent granted to a process the operator has not seen since.
     approvals = ApprovalStore(clock=time.monotonic)
 
+    verifier = _verifier(Path(resolved.evidence_root).expanduser())
+
     pipeline = FeaturePipeline(
         store=store,
         profile=profile,
@@ -96,7 +98,7 @@ def assemble(
         workspace=workspace,
         check_suite_factory=_check_suite_factory,
         preview=_preview_observer(config, profile),
-        verifier=_verifier(Path(resolved.evidence_root).expanduser()),
+        verifier=verifier,
         queue=queue,
         approvals=approvals,
         journal=None,  # set by build_wiz, which owns the journal
@@ -105,6 +107,8 @@ def assemble(
         if resolved.independent_review
         else None,
         shipper=_shipper(resolved, config, profile),
+        # journal likewise set by build_wiz, once construction has succeeded.
+        postship=_postship(config, profile, verifier),
     )
 
     return ProductVerbs(
@@ -225,6 +229,41 @@ def _verifier(evidence_root: Path) -> Any:
         return BrowserProbeRunner(headless=True, viewport=viewport.size)
 
     return FeatureVerifier(runner_factory=runner_for, evidence_root=evidence_root)
+
+
+def _postship(config: Any, profile: EngineeringProfile, verifier: Any) -> Any:
+    """Proves a merged feature in production, when previews are configured.
+
+    Reuses the same Vercel client :func:`_preview_observer` builds and the same
+    browser verifier the preview stage used — see the module docstring on
+    :class:`~openjarvis.wiz.features.postship.PostShipVerifier` for why that
+    reuse is the point rather than a shortcut.
+    """
+    if profile.preview_provider != "vercel":
+        return None
+    try:
+        from openjarvis.reliability.sources.vercel import VercelSource
+        from openjarvis.wiz.features.postship import PostShipVerifier
+        from openjarvis.wiz.features.preview import PreviewObserver
+    except ImportError as exc:  # pragma: no cover - depends on extras
+        logger.warning("no post-ship support available: %s", exc)
+        return None
+
+    vercel_config = getattr(getattr(config, "reliability", None), "vercel", None)
+    if vercel_config is None or not getattr(vercel_config, "project_id", ""):
+        return None
+    try:
+        source = VercelSource(
+            project_id=vercel_config.project_id,
+            team_id=getattr(vercel_config, "team_id", ""),
+        )
+    except Exception as exc:
+        logger.warning("could not build the Vercel client for post-ship: %s", exc)
+        return None
+    return PostShipVerifier(
+        deployments=PreviewObserver(vercel=source, target="production"),
+        verifier=verifier,
+    )
 
 
 def _reviewer(engineer: Any, workspace: Any) -> Any:

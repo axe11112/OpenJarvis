@@ -397,6 +397,111 @@ class FeatureShipper:
             feature, policy=self.policy, authority=self.authority, **kwargs
         )
 
+    def merge_feature(
+        self,
+        feature: FeatureRequest,
+        *,
+        pull_request: Mapping[str, Any],
+        status: Optional[Mapping[str, Any]] = None,
+        base_sha_at_verification: str = "",
+        observed_base_sha: str = "",
+        operator_approved: bool = False,
+    ) -> Dict[str, Any]:
+        """Merge the feature's pull request, if every gate and authority agree.
+
+        ``evaluate_shipping`` is pure and cannot ask GitHub anything; this
+        method is the one place that does, and it asks two questions
+        ``evaluate_shipping`` has no way to answer on its own.
+
+        The first is the same authority question, re-asked immediately before
+        the write rather than trusted from an earlier call, because a decision
+        computed even a second ago is a decision about a world that may have
+        changed.
+
+        The second is new: whether the credential this process is actually
+        running with can push to this repository at all. A repository's
+        collaborator list can say "maintainer" while the token in the
+        environment is scoped read-only — those are different facts, and only
+        asking GitHub what the token itself may do (``can_write()``, which
+        reads the API's own ``permissions`` block for this token rather than
+        inferring it from role metadata) answers the one that matters. Refusing
+        here, before attempting the merge, means a scoped-down token produces a
+        clear refusal instead of an opaque 403 three gates later.
+
+        TOCTOU beyond that is closed by GitHub itself: ``merge_pull_request``
+        sends the verified commit as the expected head and the API refuses the
+        merge server-side if the branch moved between this call and its own
+        read — see :meth:`GitHubSource.merge_pull_request`.
+        """
+        decision = self.evaluate(
+            feature,
+            pull_request=pull_request,
+            status=status,
+            base_sha_at_verification=base_sha_at_verification,
+            observed_base_sha=observed_base_sha,
+            operator_approved=operator_approved,
+        )
+        if not decision.allowed:
+            return {
+                "merged": False,
+                "reason": decision.explain(),
+                "gates": decision.to_dict(),
+            }
+
+        try:
+            can_write = bool(self.github.can_write())
+        except Exception as exc:
+            reason = f"could not verify GitHub write permission: {exc}"
+            logger.warning("refusing merge of %s: %s", feature.id, reason)
+            self._record(feature, "feature.merge_refused", reason)
+            return {"merged": False, "reason": reason}
+        if not can_write:
+            reason = (
+                "the configured GitHub token does not have push permission on "
+                "this repository, so I am not attempting the merge — a "
+                "collaborator role is not the same fact as what this token "
+                "may actually do"
+            )
+            logger.warning("refusing merge of %s: %s", feature.id, reason)
+            self._record(feature, "feature.merge_refused", reason)
+            return {"merged": False, "reason": reason}
+
+        attempt = feature.attempts[-1] if feature.attempts else None
+        verified_sha = attempt.commit_sha if attempt else ""
+        number = feature.pr_number or int(pull_request.get("number", 0) or 0)
+        if not number:
+            reason = "no pull request number to merge"
+            self._record(feature, "feature.merge_refused", reason)
+            return {"merged": False, "reason": reason}
+
+        try:
+            result = self.github.merge_pull_request(
+                number=number,
+                expected_head_sha=verified_sha,
+                method="squash",
+                title=self._title(feature),
+            )
+        except Exception as exc:
+            reason = str(exc)
+            logger.warning("merge of %s failed: %s", feature.id, reason)
+            self._record(feature, "feature.merge_failed", reason)
+            return {
+                "merged": False,
+                "reason": reason,
+                "permission_error": "403" in reason or "permission" in reason.lower(),
+            }
+
+        if not result.get("merged"):
+            reason = (
+                result.get("message") or "GitHub reported the merge did not complete"
+            )
+            self._record(feature, "feature.merge_refused", reason)
+            return {"merged": False, "reason": reason}
+
+        sha = result.get("sha", "")
+        self._record(feature, "feature.merged", sha)
+        return {"merged": True, "sha": sha}
+
     def _title(self, feature: FeatureRequest) -> str:
         return f"{feature.title} ({feature.id})"
 

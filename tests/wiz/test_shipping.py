@@ -305,6 +305,113 @@ class TestPullRequests:
         assert not hasattr(FeatureShipper, "commit_to_base")
 
 
+class TestMerging:
+    """merge_feature: the write path evaluate_shipping cannot exercise itself."""
+
+    class FakeGitHub:
+        def __init__(self, *, can_write=True, merge_result=None, merge_raises=None):
+            self.calls = []
+            self._can_write = can_write
+            self._merge_result = merge_result or {"merged": True, "sha": "deadbeef"}
+            self._merge_raises = merge_raises
+
+        def can_write(self):
+            return self._can_write
+
+        def merge_pull_request(self, **kwargs):
+            self.calls.append(kwargs)
+            if self._merge_raises is not None:
+                raise self._merge_raises
+            return self._merge_result
+
+    def _shipper(self, github, *, merge_low_risk=True):
+        return FeatureShipper(
+            policy=FeatureShippingPolicy(merge_low_risk=merge_low_risk),
+            github=github,
+            authority=AuthorityPolicy(
+                grants={
+                    Channel.CONTROL_CENTER: frozenset(
+                        {Authority.PR_WRITE, Authority.PRODUCTION_CHANGE}
+                    )
+                }
+            ),
+        )
+
+    def test_a_verified_low_risk_feature_merges_when_everything_agrees(self):
+        github = self.FakeGitHub()
+        shipper = self._shipper(github)
+        result = shipper.merge_feature(ready_feature(), pull_request=open_pr())
+        assert result["merged"]
+        assert result["sha"] == "deadbeef"
+        assert github.calls[0]["number"] == 7
+        assert github.calls[0]["expected_head_sha"] == VERIFIED_SHA
+
+    def test_failing_gates_refuse_without_touching_github(self):
+        # merge_low_risk is off: evaluate_shipping refuses before any network call.
+        github = self.FakeGitHub()
+        shipper = self._shipper(github, merge_low_risk=False)
+        result = shipper.merge_feature(ready_feature(), pull_request=open_pr())
+        assert not result["merged"]
+        assert github.calls == []
+
+    def test_a_token_without_push_permission_refuses_even_though_gates_pass(self):
+        # The gates all pass; only the token's actual grant is missing. A
+        # collaborator role saying "maintainer" must not be trusted over this.
+        github = self.FakeGitHub(can_write=False)
+        shipper = self._shipper(github)
+        result = shipper.merge_feature(ready_feature(), pull_request=open_pr())
+        assert not result["merged"]
+        assert "push permission" in result["reason"]
+        assert github.calls == []
+
+    def test_a_403_from_the_actual_merge_call_is_reported_not_raised(self):
+        github = self.FakeGitHub(merge_raises=RuntimeError("403 Forbidden"))
+        shipper = self._shipper(github)
+        result = shipper.merge_feature(ready_feature(), pull_request=open_pr())
+        assert not result["merged"]
+        assert result["permission_error"] is True
+        assert "403" in result["reason"]
+
+    def test_github_declining_to_merge_is_reported_not_raised(self):
+        # merged=False without an exception: e.g. GitHub's own head-mismatch
+        # check (the server-side half of TOCTOU protection) rejected it.
+        github = self.FakeGitHub(
+            merge_result={
+                "merged": False,
+                "sha": "",
+                "message": "Head branch was modified",
+            }
+        )
+        shipper = self._shipper(github)
+        result = shipper.merge_feature(ready_feature(), pull_request=open_pr())
+        assert not result["merged"]
+        assert "Head branch was modified" in result["reason"]
+
+    def test_a_channel_without_production_change_cannot_merge(self):
+        github = self.FakeGitHub()
+        shipper = FeatureShipper(
+            policy=FeatureShippingPolicy(merge_low_risk=True),
+            github=github,
+            authority=AuthorityPolicy(
+                grants={Channel.CONTROL_CENTER: frozenset({Authority.PR_WRITE})}
+            ),
+        )
+        result = shipper.merge_feature(ready_feature(), pull_request=open_pr())
+        assert not result["merged"]
+        assert github.calls == []
+
+    def test_the_shipper_never_merges_high_risk_however_it_is_configured(self):
+        github = self.FakeGitHub()
+        shipper = self._shipper(github)
+        result = shipper.merge_feature(
+            ready_feature(risk="HIGH"),
+            pull_request=open_pr(),
+            operator_approved=False,
+        )
+        assert not result["merged"]
+        assert github.calls == []
+
+
 class TestTheDescription:
     def test_it_says_what_was_asked_what_changed_and_what_proved_it(self):
         body = pull_request_body(ready_feature())

@@ -807,15 +807,17 @@ class TestReadyOpensAPullRequestAndNothingMore:
         pipeline.run(feature.id)
         assert shipper.opened == []
 
-    def test_the_pipeline_never_merges_anything(self):
-        # Merging is a separate authority and this module does not hold it.
-        import inspect
-
-        from openjarvis.wiz.features import pipeline as module
-
-        source = inspect.getsource(module)
-        assert "merge_pull_request" not in source
-        assert ".merge(" not in source
+    def test_run_never_merges_anything(self, tmp_path, clock):
+        # `run` is the autonomous loop; it stops at READY whatever is
+        # configured. Only the separate `ship` verb — see TestShip — can take
+        # a feature further, and nothing here calls it.
+        shipper = self.FakeShipper()
+        pipeline = build_pipeline(tmp_path, clock)
+        pipeline.shipper = shipper
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert shipper.merged == []
 
     def test_a_shipper_that_fails_does_not_undo_ready(self, tmp_path, clock):
         class Broken:
@@ -827,6 +829,200 @@ class TestReadyOpensAPullRequestAndNothingMore:
         feature = pipeline.submit(REQUEST, actor=operator_actor())
         result = pipeline.run(feature.id)
         assert result.state is FeatureState.READY
+
+
+class TestShip:
+    """`ship`: the explicit verb `run` never reaches on its own."""
+
+    #: Matches FakeWorkspace.commit_sha, so a real merge decision sees the
+    #: pull request head as the exact commit the pipeline verified.
+    HEAD_SHA = "feedface" + "0" * 32
+    #: Matches the worktree's base_commit, so "the base branch has not moved"
+    #: is a gate that can actually be satisfied by a fake.
+    BASE_SHA = "base1234" + "0" * 32
+
+    class FakeGitHub:
+        def __init__(self, *, can_write=True, merge_result=None):
+            self.pr_calls: List[Dict[str, Any]] = []
+            self.merge_calls: List[Dict[str, Any]] = []
+            self._can_write = can_write
+            self._merge_result = merge_result or {
+                "merged": True,
+                "sha": "deadbeef" + "0" * 32,
+            }
+
+        def create_pull_request(self, **kwargs):
+            self.pr_calls.append(kwargs)
+            return {"html_url": "https://github.com/a/b/pull/7", "number": 7}
+
+        def get_pull_request(self, number):
+            return {
+                "number": number,
+                "head_sha": TestShip.HEAD_SHA,
+                "base_sha": TestShip.BASE_SHA,
+                "state": "open",
+                "mergeable": True,
+            }
+
+        def combined_status(self, sha, *, required_contexts=()):
+            return {"state": "success", "contexts": {}}
+
+        def can_write(self):
+            return self._can_write
+
+        def merge_pull_request(self, **kwargs):
+            self.merge_calls.append(kwargs)
+            return self._merge_result
+
+    class FakePostShip:
+        def __init__(self, *, verified=True, reason="production agrees"):
+            self.calls: List[str] = []
+            self.journal = None
+            self._verified = verified
+            self._reason = reason
+
+        def verify(self, feature, *, merge_commit_sha):
+            from openjarvis.wiz.features.postship import PostShipResult
+
+            self.calls.append(merge_commit_sha)
+            return PostShipResult(verified=self._verified, reason=self._reason)
+
+    def _shipper(self, github, *, production_change=True):
+        from openjarvis.wiz.features.shipping import (
+            FeatureShipper,
+            FeatureShippingPolicy,
+        )
+
+        authorities = {Authority.PR_WRITE}
+        if production_change:
+            authorities.add(Authority.PRODUCTION_CHANGE)
+        return FeatureShipper(
+            # The REQUEST fixture classifies MEDIUM once a real diff exists
+            # (a component file, touched with no path-level risk signal), so
+            # both are enabled — the point of these tests is `ship`'s own
+            # wiring, not re-proving evaluate_shipping's risk gate.
+            policy=FeatureShippingPolicy(merge_low_risk=True, merge_medium_risk=True),
+            github=github,
+            authority=AuthorityPolicy(
+                grants={Channel.CONTROL_CENTER: frozenset(authorities)}
+            ),
+        )
+
+    def _ready(self, tmp_path, clock, *, shipper, postship=None):
+        pipeline = build_pipeline(tmp_path, clock)
+        pipeline.shipper = shipper
+        pipeline.postship = postship
+        submitted = pipeline.submit(REQUEST, actor=operator_actor())
+        feature = pipeline.run(submitted.id)
+        return pipeline, feature
+
+    def test_a_ready_feature_merges_and_reaches_complete(self, tmp_path, clock):
+        github = self.FakeGitHub()
+        postship = self.FakePostShip(verified=True)
+        pipeline, feature = self._ready(
+            tmp_path, clock, shipper=self._shipper(github), postship=postship
+        )
+        assert feature.state is FeatureState.READY
+
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.COMPLETE
+        assert github.merge_calls[0]["number"] == 7
+        assert github.merge_calls[0]["expected_head_sha"] == self.HEAD_SHA
+        assert postship.calls == [github._merge_result["sha"]]
+
+    def test_states_are_visited_in_order(self, tmp_path, clock):
+        github = self.FakeGitHub()
+        pipeline, feature = self._ready(
+            tmp_path,
+            clock,
+            shipper=self._shipper(github),
+            postship=self.FakePostShip(verified=True),
+        )
+        shipped = pipeline.ship(feature.id)
+        visited = [entry["to"] for entry in shipped.history]
+        tail = [
+            FeatureState.READY.value,
+            FeatureState.MERGING.value,
+            FeatureState.DEPLOYING.value,
+            FeatureState.PRODUCTION_VERIFYING.value,
+            FeatureState.COMPLETE.value,
+        ]
+        assert visited[-len(tail) :] == tail
+
+    def test_production_disagreeing_hands_over_not_completes(self, tmp_path, clock):
+        github = self.FakeGitHub()
+        postship = self.FakePostShip(verified=False, reason="the button is missing")
+        pipeline, feature = self._ready(
+            tmp_path, clock, shipper=self._shipper(github), postship=postship
+        )
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.HUMAN_REQUIRED
+        # The merge itself is not undone — only a person decides on a revert.
+        assert github.merge_calls
+
+    def test_a_feature_not_yet_ready_is_refused(self, tmp_path, clock):
+        pipeline = build_pipeline(tmp_path, clock)
+        pipeline.shipper = self._shipper(self.FakeGitHub())
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        # Deliberately not run(): the feature is still RECEIVED.
+        result = pipeline.ship(feature.id)
+        assert result.state is FeatureState.RECEIVED
+
+    def test_no_shipper_configured_is_refused(self, tmp_path, clock):
+        pipeline = build_pipeline(tmp_path, clock)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        result = pipeline.ship(feature.id)
+        assert result.state is FeatureState.READY
+
+    def test_a_token_without_push_permission_refuses_and_stays_ready(
+        self, tmp_path, clock
+    ):
+        github = self.FakeGitHub(can_write=False)
+        pipeline, feature = self._ready(
+            tmp_path,
+            clock,
+            shipper=self._shipper(github),
+            postship=self.FakePostShip(),
+        )
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.READY
+        assert github.merge_calls == []
+
+    def test_a_channel_without_production_change_cannot_ship(self, tmp_path, clock):
+        github = self.FakeGitHub()
+        pipeline, feature = self._ready(
+            tmp_path,
+            clock,
+            shipper=self._shipper(github, production_change=False),
+            postship=self.FakePostShip(),
+        )
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.READY
+        assert github.merge_calls == []
+
+    def test_no_postship_configured_merges_but_hands_to_a_person(self, tmp_path, clock):
+        github = self.FakeGitHub()
+        pipeline, feature = self._ready(
+            tmp_path, clock, shipper=self._shipper(github), postship=None
+        )
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.HUMAN_REQUIRED
+        assert github.merge_calls  # the merge did happen; only proof is missing
+
+    def test_shipping_twice_only_merges_once(self, tmp_path, clock):
+        # The second call finds the feature COMPLETE, not READY, and refuses
+        # before touching GitHub again.
+        github = self.FakeGitHub()
+        pipeline, feature = self._ready(
+            tmp_path,
+            clock,
+            shipper=self._shipper(github),
+            postship=self.FakePostShip(verified=True),
+        )
+        pipeline.ship(feature.id)
+        pipeline.ship(feature.id)
+        assert len(github.merge_calls) == 1
 
 
 class TestTheReviewIsAdvisory:
