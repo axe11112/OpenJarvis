@@ -300,6 +300,16 @@ class TestThePage:
         assert "cdn" not in _PAGE.lower()
         assert "<script src=" not in _PAGE
 
+    def test_a_ready_feature_gets_a_ship_button(self):
+        # A backend route with no button behind it is not something an
+        # operator can actually click — the Ready section is where a
+        # finished feature waits, and this is the button that calls /ship.
+        from openjarvis.server.wiz_dashboard import _PAGE
+
+        assert 'render("ready", listed.result.ready, {ship: true})' in _PAGE
+        assert "opts.ship" in _PAGE
+        assert "/features/${f.id}/ship" in _PAGE
+
 
 class TestTheMorningSummary:
     def test_it_is_readable_and_says_whether_it_is_worth_sending(self, client):

@@ -210,6 +210,11 @@ function featureCard(f, opts) {
     b.onclick = () => act(`/features/${f.id}/build`, b);
     actions.append(b);
   }
+  if (opts.ship) {
+    const b = el('<button type="button">Ship it</button>');
+    b.onclick = () => act(`/features/${f.id}/ship`, b);
+    actions.append(b);
+  }
   if (busy) {
     const b = el('<button type="button" class="quiet">Stop</button>');
     b.onclick = () => act(`/features/${f.id}/cancel`, b);
@@ -268,7 +273,7 @@ async function refresh() {
     const listed = await api("/features");
     if (listed.ok) {
       render("active", listed.result.building, {});
-      render("ready", listed.result.ready, {});
+      render("ready", listed.result.ready, {ship: true});
       render("blocked", listed.result.waiting_for_you, {retry: true, approve: true});
     }
 
