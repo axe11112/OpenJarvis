@@ -361,6 +361,35 @@ class FeaturePipeline:
             operator_approved=operator_approved,
         )
         if not merge_result.get("merged"):
+            if pr.get("merged"):
+                # Not a refusal: the PR is already merged. Either this is a
+                # retry after a crash between GitHub confirming the merge and
+                # this process recording it, or a person merged it by hand
+                # while Wiz waited. Either way "ship_refused" would be false
+                # — nothing here refused anything — and leaving the feature
+                # sitting at READY forever would hide a merge that already
+                # happened. This is not a state ship() can safely continue
+                # from on its own: which of the two it was changes whether
+                # production has already been checked, and guessing wrong in
+                # either direction is exactly the "fake continuation" this
+                # pipeline elsewhere refuses to do.
+                feature.transition(
+                    FeatureState.HUMAN_REQUIRED,
+                    at=self.clock(),
+                    reason=(
+                        "the pull request is already merged, but I do not "
+                        "know whether I was the one who merged it or "
+                        "whether production has been verified — please check"
+                    ),
+                )
+                self.store.save(feature)
+                self._record(
+                    feature,
+                    "feature.merge_already_done",
+                    f"PR #{feature.pr_number} was already merged",
+                )
+                self._release(feature)
+                return feature
             self._record(
                 feature,
                 "feature.ship_refused",

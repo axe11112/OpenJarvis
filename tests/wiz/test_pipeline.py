@@ -1159,6 +1159,39 @@ class TestShip:
         # SHA — neither verified the other's deployment.
         assert postship.calls[0][1] != postship.calls[1][1]
 
+    def test_a_retry_against_an_already_merged_pr_asks_a_person_not_a_stall(
+        self, tmp_path, clock
+    ):
+        # The crash window this covers: GitHub confirmed the merge, but this
+        # process never recorded it (killed, or a second process retried
+        # first). The feature is still READY locally. ship() must not
+        # silently refuse forever — "the PR is closed" is technically true
+        # and explains nothing an operator could act on — and must not guess
+        # that it is safe to continue into production verification either.
+        class AlreadyMergedGitHub(self.FakeGitHub):
+            def get_pull_request(self, number):
+                return {
+                    "number": number,
+                    "head_sha": TestShip.HEAD_SHA,
+                    "base_sha": TestShip.BASE_SHA,
+                    "state": "closed",
+                    "mergeable": None,
+                    "merged": True,
+                }
+
+        github = AlreadyMergedGitHub()
+        pipeline, feature = self._ready(
+            tmp_path,
+            clock,
+            shipper=self._shipper(github),
+            postship=self.FakePostShip(verified=True),
+        )
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.HUMAN_REQUIRED
+        assert "already merged" in shipped.history[-1]["reason"]
+        # No second merge was attempted against the already-merged PR.
+        assert github.merge_calls == []
+
 
 class TestTheReviewIsAdvisory:
     class DisapprovingReviewer:
