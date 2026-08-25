@@ -82,6 +82,48 @@ class FakePipeline:
             self.store.save(feature)
         return feature
 
+    def run(self, feature_id, *, max_steps=30):
+        """Matches ``FeaturePipeline.run``'s contract, for the routes tests.
+
+        Stops at READY, same as the real pipeline — this fake never merges
+        anything on its own either.
+        """
+        feature = self.store.get(feature_id)
+        if feature is None:
+            raise KeyError(feature_id)
+        if feature.state is FeatureState.RECEIVED:
+            feature.transition(
+                FeatureState.READY, at="2026-08-19T10:05:00+00:00", reason="built"
+            )
+            self.store.save(feature)
+        return feature
+
+    def auto_ship_if_eligible(
+        self,
+        feature_id,
+        *,
+        emergency_stop_engaged=lambda: False,
+        reliability_busy=lambda: False,
+        audit_healthy=lambda: True,
+    ):
+        """Matches ``FeaturePipeline.auto_ship_if_eligible``'s contract.
+
+        Deliberately re-checks the same narrow conditions the real method
+        does — LOW risk, and none of the cross-cutting blockers — so a route
+        test proving "a MEDIUM-risk feature never gets shipped automatically"
+        is proving something about the wiring, not just about this fake.
+        """
+        feature = self.store.get(feature_id)
+        if feature is None:
+            raise KeyError(feature_id)
+        if feature.state is not FeatureState.READY:
+            return feature
+        if (feature.risk or "").strip().upper() != "LOW":
+            return feature
+        if emergency_stop_engaged() or reliability_busy() or not audit_healthy():
+            return feature
+        return self.ship(feature_id)
+
     def ship(self, feature_id, *, operator_approved=False):
         """Matches ``FeaturePipeline.ship``'s contract, for the routes tests."""
         self.shipped = getattr(self, "shipped", [])

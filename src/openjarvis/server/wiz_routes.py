@@ -95,6 +95,49 @@ def _notification_ledger(config: Any) -> Any:
         return None
 
 
+def _emergency_stop_engaged(config: Any) -> bool:
+    """Whether the operator's one emergency stop is pulled.
+
+    The exact same flag file the reliability watcher honours (see
+    :func:`openjarvis.reliability.watch.stop_flag_path`) — not a second
+    switch a panicked operator would have to remember exists. Unreadable is
+    treated as engaged: a stop this process cannot confirm is clear is not a
+    stop this process should ship features through.
+    """
+    try:
+        from openjarvis.reliability.watch import stop_flag_path
+
+        return stop_flag_path(config).is_file()
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _audit_healthy(journal: Any) -> bool:
+    """Whether Wiz's own hash-chained journal still checks out.
+
+    No journal attached is not "healthy" here — it is nothing this process can
+    vouch for, which for an autonomous merge decision is the same refusal.
+    """
+    if journal is None:
+        return False
+    try:
+        intact, _break_at = journal.verify()
+        return bool(intact)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _reliability_busy(pipeline: Any) -> bool:
+    """Whether the development queue currently defers to production."""
+    queue = getattr(pipeline, "queue", None)
+    if queue is None:
+        return False
+    try:
+        return bool(queue.snapshot().get("production_busy", False))
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _handle(
     capability: str, *, text: str = "", approved: bool = False, **arguments: Any
 ) -> Any:
@@ -430,6 +473,19 @@ def _start(feature_id: str) -> Dict[str, Any]:
     def drive() -> None:
         try:
             pipeline.run(feature_id)
+            # `run` never ships anything on its own — see `FeaturePipeline.
+            # ship`'s docstring — so a READY feature only ever goes further
+            # here, and only for the narrow case the operator configured in
+            # advance: LOW risk, `merge_low_risk` on, and every one of the
+            # cross-cutting checks `evaluate_shipping` cannot see for itself.
+            pipeline.auto_ship_if_eligible(
+                feature_id,
+                emergency_stop_engaged=lambda: _emergency_stop_engaged(
+                    runtime.config
+                ),
+                reliability_busy=lambda: _reliability_busy(pipeline),
+                audit_healthy=lambda: _audit_healthy(runtime.journal),
+            )
         except Exception:  # pragma: no cover - the thread must not die silently
             logger.exception("feature %s failed in the background", feature_id)
         finally:

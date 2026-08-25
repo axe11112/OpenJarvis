@@ -1197,6 +1197,182 @@ class TestShip:
         assert github.merge_calls == []
 
 
+class TestAutoShipIfEligible:
+    """`auto_ship_if_eligible`: the only caller allowed to reach `ship` on its
+    own, and only for LOW risk with `merge_low_risk` on.
+    """
+
+    def _low_risk_ready(self, tmp_path, clock, *, shipper, postship=None):
+        pipeline, feature = TestShip()._ready(
+            tmp_path, clock, shipper=shipper, postship=postship
+        )
+        assert feature.state is FeatureState.READY
+        # Isolated from risk classification, which is proved elsewhere
+        # (TestRiskIsRedecidedOnTheRealDiff) — this class is about the
+        # trigger's own wiring, so the risk is set directly to LOW.
+        feature.risk = "LOW"
+        pipeline.store.save(feature)
+        return pipeline, feature
+
+    def test_low_risk_with_every_gate_clear_ships(self, tmp_path, clock):
+        github = TestShip.FakeGitHub()
+        pipeline, feature = self._low_risk_ready(
+            tmp_path,
+            clock,
+            shipper=TestShip()._shipper(github),
+            postship=TestShip.FakePostShip(verified=True),
+        )
+        result = pipeline.auto_ship_if_eligible(feature.id)
+        assert result.state is FeatureState.COMPLETE
+        assert github.merge_calls
+
+    def test_medium_risk_is_never_attempted(self, tmp_path, clock):
+        github = TestShip.FakeGitHub()
+        pipeline, feature = self._low_risk_ready(
+            tmp_path,
+            clock,
+            shipper=TestShip()._shipper(github),
+            postship=TestShip.FakePostShip(verified=True),
+        )
+        feature.risk = "MEDIUM"
+        pipeline.store.save(feature)
+        result = pipeline.auto_ship_if_eligible(feature.id)
+        assert result.state is FeatureState.READY
+        assert github.merge_calls == []
+
+    def test_high_risk_is_never_attempted(self, tmp_path, clock):
+        github = TestShip.FakeGitHub()
+        pipeline, feature = self._low_risk_ready(
+            tmp_path,
+            clock,
+            shipper=TestShip()._shipper(github),
+            postship=TestShip.FakePostShip(verified=True),
+        )
+        feature.risk = "HIGH"
+        pipeline.store.save(feature)
+        result = pipeline.auto_ship_if_eligible(feature.id)
+        assert result.state is FeatureState.READY
+        assert github.merge_calls == []
+
+    def test_unknown_risk_is_never_attempted(self, tmp_path, clock):
+        github = TestShip.FakeGitHub()
+        pipeline, feature = self._low_risk_ready(
+            tmp_path,
+            clock,
+            shipper=TestShip()._shipper(github),
+            postship=TestShip.FakePostShip(verified=True),
+        )
+        feature.risk = ""
+        pipeline.store.save(feature)
+        result = pipeline.auto_ship_if_eligible(feature.id)
+        assert result.state is FeatureState.READY
+        assert github.merge_calls == []
+
+    def test_merge_low_risk_switched_off_never_attempts(self, tmp_path, clock):
+        from openjarvis.wiz.features.shipping import FeatureShippingPolicy
+
+        github = TestShip.FakeGitHub()
+        shipper = TestShip()._shipper(github)
+        shipper.policy = FeatureShippingPolicy(merge_low_risk=False)
+        pipeline, feature = self._low_risk_ready(
+            tmp_path, clock, shipper=shipper, postship=TestShip.FakePostShip()
+        )
+        result = pipeline.auto_ship_if_eligible(feature.id)
+        assert result.state is FeatureState.READY
+        assert github.merge_calls == []
+
+    def test_no_shipper_configured_never_attempts(self, tmp_path, clock):
+        pipeline = build_pipeline(tmp_path, clock)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        feature = pipeline.store.get(feature.id)
+        feature.risk = "LOW"
+        pipeline.store.save(feature)
+        result = pipeline.auto_ship_if_eligible(feature.id)
+        assert result.state is FeatureState.READY
+
+    def test_not_ready_is_left_alone(self, tmp_path, clock):
+        pipeline = build_pipeline(tmp_path, clock)
+        pipeline.shipper = TestShip()._shipper(TestShip.FakeGitHub())
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        # Deliberately not run(): still RECEIVED.
+        result = pipeline.auto_ship_if_eligible(feature.id)
+        assert result.state is FeatureState.RECEIVED
+
+    def test_emergency_stop_blocks_the_attempt(self, tmp_path, clock):
+        github = TestShip.FakeGitHub()
+        pipeline, feature = self._low_risk_ready(
+            tmp_path,
+            clock,
+            shipper=TestShip()._shipper(github),
+            postship=TestShip.FakePostShip(verified=True),
+        )
+        result = pipeline.auto_ship_if_eligible(
+            feature.id, emergency_stop_engaged=lambda: True
+        )
+        assert result.state is FeatureState.READY
+        assert github.merge_calls == []
+
+    def test_reliability_busy_blocks_the_attempt(self, tmp_path, clock):
+        github = TestShip.FakeGitHub()
+        pipeline, feature = self._low_risk_ready(
+            tmp_path,
+            clock,
+            shipper=TestShip()._shipper(github),
+            postship=TestShip.FakePostShip(verified=True),
+        )
+        result = pipeline.auto_ship_if_eligible(
+            feature.id, reliability_busy=lambda: True
+        )
+        assert result.state is FeatureState.READY
+        assert github.merge_calls == []
+
+    def test_unhealthy_audit_blocks_the_attempt(self, tmp_path, clock):
+        github = TestShip.FakeGitHub()
+        pipeline, feature = self._low_risk_ready(
+            tmp_path,
+            clock,
+            shipper=TestShip()._shipper(github),
+            postship=TestShip.FakePostShip(verified=True),
+        )
+        result = pipeline.auto_ship_if_eligible(
+            feature.id, audit_healthy=lambda: False
+        )
+        assert result.state is FeatureState.READY
+        assert github.merge_calls == []
+
+    def test_calling_it_twice_only_merges_once(self, tmp_path, clock):
+        github = TestShip.FakeGitHub()
+        pipeline, feature = self._low_risk_ready(
+            tmp_path,
+            clock,
+            shipper=TestShip()._shipper(github),
+            postship=TestShip.FakePostShip(verified=True),
+        )
+        pipeline.auto_ship_if_eligible(feature.id)
+        pipeline.auto_ship_if_eligible(feature.id)
+        assert len(github.merge_calls) == 1
+
+    def test_a_restart_finding_the_feature_already_complete_is_a_no_op(
+        self, tmp_path, clock
+    ):
+        # Simulates the process restarting between the first successful
+        # auto-ship and a second call reaching this feature again: nothing
+        # about `auto_ship_if_eligible` may assume it is the first caller.
+        github = TestShip.FakeGitHub()
+        pipeline, feature = self._low_risk_ready(
+            tmp_path,
+            clock,
+            shipper=TestShip()._shipper(github),
+            postship=TestShip.FakePostShip(verified=True),
+        )
+        first = pipeline.auto_ship_if_eligible(feature.id)
+        assert first.state is FeatureState.COMPLETE
+        second = pipeline.auto_ship_if_eligible(feature.id)
+        assert second.state is FeatureState.COMPLETE
+        assert len(github.merge_calls) == 1
+
+
 class TestTheReviewIsAdvisory:
     class DisapprovingReviewer:
         def __init__(self):
