@@ -91,6 +91,39 @@ class TestStoppingIsAlwaysAllowed:
             assert LEGAL_TRANSITIONS.get(state, frozenset()) == frozenset()
 
 
+class TestResumingFromHumanRequired:
+    """resume_from_human_required is deliberately not a LEGAL_TRANSITIONS
+    entry — see openjarvis.wiz.features.recovery for why. These tests pin the
+    behaviour of the separate method instead."""
+
+    def test_it_only_works_from_human_required(self):
+        feature = _feature(FeatureState.BUILDING)
+        with pytest.raises(InvalidFeatureTransition):
+            feature.resume_from_human_required(
+                FeatureState.BUILDING, at="t", reason="x"
+            )
+
+    def test_it_only_targets_building(self):
+        feature = _feature(FeatureState.HUMAN_REQUIRED)
+        with pytest.raises(InvalidFeatureTransition):
+            feature.resume_from_human_required(FeatureState.READY, at="t", reason="x")
+
+    def test_a_successful_resume_is_marked_in_history(self):
+        feature = _feature(FeatureState.HUMAN_REQUIRED)
+        feature.resume_from_human_required(
+            FeatureState.BUILDING, at="t", reason="evidence says this is fine"
+        )
+        assert feature.state is FeatureState.BUILDING
+        assert feature.history[-1]["resumed"] is True
+        assert feature.history[-1]["from"] == "HUMAN_REQUIRED"
+        assert feature.history[-1]["to"] == "BUILDING"
+
+    def test_it_does_not_widen_check_transition(self):
+        with pytest.raises(InvalidFeatureTransition):
+            feature = _feature(FeatureState.HUMAN_REQUIRED)
+            feature.transition(FeatureState.BUILDING, at="t")
+
+
 class TestTheIterativeLoop:
     def test_a_failed_check_sends_the_work_back_to_building(self):
         feature = _feature(FeatureState.TESTING)

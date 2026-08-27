@@ -170,9 +170,15 @@ LEGAL_TRANSITIONS: Dict[FeatureState, FrozenSet[FeatureState]] = {
     state: allowed | _from(FeatureState.HUMAN_REQUIRED, FeatureState.CANCELLED)
     for state, allowed in _PROGRESS.items()
 }
-# Terminal states progress nowhere on their own. A human moving a feature out of
-# HUMAN_REQUIRED does so by creating the next step explicitly, not by a
-# transition Wiz can make.
+# Terminal states progress nowhere on their own — not even HUMAN_REQUIRED,
+# and this is checked by test, deliberately: "reachable from everywhere, and
+# stopping is always allowed" must not quietly become "escapable by anything
+# that calls transition()". A human moving a feature out of HUMAN_REQUIRED
+# does so by creating the next step explicitly, not by a transition Wiz (or
+# a docile recovery path standing in for it) can make — see
+# :meth:`FeatureRequest.resume_from_human_required`, which is a distinct,
+# separately-audited method for exactly that reason, not a LEGAL_TRANSITIONS
+# entry.
 for _terminal in TERMINAL_STATES:
     LEGAL_TRANSITIONS.setdefault(_terminal, frozenset())
 
@@ -353,6 +359,50 @@ class FeatureRequest:
         self.state = target
         self.updated_at = at
 
+    def resume_from_human_required(
+        self, target: FeatureState, *, at: str, reason: str
+    ) -> None:
+        """Leave ``HUMAN_REQUIRED`` — deliberately not via :meth:`transition`.
+
+        This exists for one caller:
+        :class:`~openjarvis.wiz.features.recovery.FeatureRecovery`, acting on
+        an operator's explicit, evidence-backed decision that a feature the
+        ordinary attempt loop gave up on should be looked at again. It is a
+        separate method rather than a :data:`LEGAL_TRANSITIONS` entry because
+        that table backs a test asserting every terminal state — including
+        this one — progresses nowhere *on its own*; adding an entry here would
+        make that false for every caller of :meth:`transition`, not just this
+        one, deliberate, audited exception.
+
+        ``target`` must be ``BUILDING`` — resume always re-enters the ordinary
+        attempt loop at the top, so the same gates (:class:`FeaturePipeline`'s
+        or :class:`FeatureRecovery`'s) run again rather than being skipped.
+        Every history entry this writes carries ``"resumed": True`` so the
+        audit trail can tell a recovery hop apart from an ordinary one at a
+        glance, without having to know this method exists.
+        """
+        if self.state is not FeatureState.HUMAN_REQUIRED:
+            raise InvalidFeatureTransition(
+                f"resume_from_human_required called from {self.state.value}, "
+                "not HUMAN_REQUIRED"
+            )
+        target = FeatureState.parse(target)
+        if target is not FeatureState.BUILDING:
+            raise InvalidFeatureTransition(
+                f"HUMAN_REQUIRED may only resume into BUILDING, not {target.value}"
+            )
+        self.history.append(
+            {
+                "at": at,
+                "from": self.state.value,
+                "to": target.value,
+                "reason": reason,
+                "resumed": True,
+            }
+        )
+        self.state = target
+        self.updated_at = at
+
     def next_attempt(self, *, at: str, hypothesis: str = "") -> FeatureAttempt:
         attempt = FeatureAttempt(
             number=len(self.attempts) + 1, started_at=at, hypothesis=hypothesis
@@ -373,7 +423,9 @@ class FeatureRequest:
 
         # Documentation-only features
         if any(x in request_lower for x in ["readme", "docs", "documentation", "wiki"]):
-            if not any(x in request_lower for x in ["code", "implementation", "feature"]):
+            if not any(
+                x in request_lower for x in ["code", "implementation", "feature"]
+            ):
                 return False
 
         # Configuration-only (environment variables, config files without code)
