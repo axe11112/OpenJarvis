@@ -25,15 +25,33 @@ from rich.panel import Panel
 from rich.table import Table
 
 _STATE_STYLE = {
+    "RECEIVED": "dim",
+    "UNDERSTANDING": "cyan",
+    "PLANNING": "cyan",
+    "APPROVED_FOR_BUILD": "cyan",
+    "BUILDING": "cyan",
+    "TESTING": "cyan",
+    "PREVIEWING": "cyan",
+    "VERIFYING": "cyan",
     "READY": "bold green",
+    "MERGING": "cyan",
+    "DEPLOYING": "cyan",
+    "PRODUCTION_VERIFYING": "cyan",
     "COMPLETE": "green",
     "HUMAN_REQUIRED": "bold magenta",
     "CANCELLED": "dim",
-    "BUILDING": "cyan",
-    "VERIFYING": "cyan",
 }
 
 _RISK_STYLE = {"HIGH": "bold red", "MEDIUM": "yellow", "LOW": "dim"}
+
+#: Read with ``.get(key, _DEFAULT_STYLE)``, never ``.get(key, "")`` — an empty
+#: string produces the Rich markup tag ``[]``, which Rich treats as an
+#: unrecognised open tag rather than "no style". The ``[/]`` that follows then
+#: has nothing valid to close and raises ``MarkupError``, which took the whole
+#: ``wiz list`` table down the moment a feature sat in a state (``TESTING``,
+#: ``PLANNING``, ...) this dict hadn't been kept in sync with. A default that
+#: is always a real style name keeps an unmapped key cosmetic, never fatal.
+_DEFAULT_STYLE = "white"
 
 
 def _console() -> Console:
@@ -251,9 +269,9 @@ def list_features() -> None:
         for row in rows:
             table.add_row(
                 row["id"],
-                row["title"][:60],
-                f"[{_STATE_STYLE.get(row['state'], '')}]{row['state']}[/]",
-                f"[{_RISK_STYLE.get(row['risk'], '')}]{row['risk']}[/]",
+                escape(row["title"][:60]),
+                f"[{_STATE_STYLE.get(row['state'], _DEFAULT_STYLE)}]{row['state']}[/]",
+                f"[{_RISK_STYLE.get(row['risk'], _DEFAULT_STYLE)}]{row['risk']}[/]",
                 str(row.get("attempts", 0)),
             )
         console.print(table)
