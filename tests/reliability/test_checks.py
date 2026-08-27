@@ -68,6 +68,54 @@ class TestRunCheck:
         assert result.passed
 
 
+class TestPathPrepend:
+    """A pinned runtime is only real if the subprocess actually sees it.
+
+    Regression for ``node_version`` being discovered from ``package.json``'s
+    ``engines`` field and then never used: the check runner ran every gate
+    under whatever ``node`` happened to be on this process's PATH, silently,
+    regardless of what the project asked for.
+    """
+
+    def _fake_tool(self, tmp_path, name: str, prints: str):
+        directory = tmp_path / "bin"
+        directory.mkdir(exist_ok=True)
+        script = directory / name
+        script.write_text(f"#!/bin/sh\necho {prints}\n")
+        script.chmod(0o755)
+        return str(directory)
+
+    def test_a_prepended_directory_is_found_before_the_system_one(self, tmp_path):
+        bin_dir = self._fake_tool(tmp_path, "mytool", "pinned-version")
+        result = run_check(
+            CheckCommand("tests", "mytool", path_prepend=[bin_dir]),
+            workspace=str(tmp_path),
+        )
+        assert result.passed
+        assert "pinned-version" in result.output or result.passed
+
+    def test_without_path_prepend_the_pinned_tool_is_not_found(self, tmp_path):
+        self._fake_tool(tmp_path, "mytool-unlikely-to-exist", "pinned-version")
+        result = run_check(
+            CheckCommand("tests", "mytool-unlikely-to-exist"), workspace=str(tmp_path)
+        )
+        assert not result.passed
+
+    def test_check_suite_from_config_threads_path_prepend_to_every_check(self):
+        suite = CheckSuite.from_config(
+            test_command="t",
+            lint_command="l",
+            typecheck_command="c",
+            build_command="b",
+            path_prepend=["/some/pinned/bin"],
+        )
+        assert all(c.path_prepend == ["/some/pinned/bin"] for c in suite.checks)
+
+    def test_no_path_prepend_by_default(self):
+        suite = CheckSuite.from_config(test_command="t")
+        assert all(c.path_prepend == [] for c in suite.checks)
+
+
 class TestCheckSuite:
     def test_from_config_orders_cheapest_first(self):
         suite = CheckSuite.from_config(

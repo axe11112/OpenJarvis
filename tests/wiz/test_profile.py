@@ -6,6 +6,7 @@ import json
 
 from openjarvis.wiz.features.profile import (
     EngineeringProfile,
+    _major_version,
     discover_profile,
     load_profiles,
 )
@@ -162,3 +163,65 @@ class TestNothingIsHardcoded:
 
         for literal in literals:
             assert "wize" not in literal.lower(), literal
+
+
+class TestMajorVersion:
+    def test_plain_number(self):
+        assert _major_version("22") == 22
+
+    def test_dotted_x_range(self):
+        assert _major_version("24.x") == 24
+
+    def test_caret_range(self):
+        assert _major_version("^24.0.0") == 24
+
+    def test_comparator(self):
+        assert _major_version(">=22.4.0") == 22
+
+    def test_no_digits_is_unresolvable(self):
+        assert _major_version("lts/*") is None
+
+    def test_empty_is_unresolvable(self):
+        assert _major_version("") is None
+
+
+def _fake_node(bin_dir, version: str) -> None:
+    """A real, runnable executable -- resolution must run it, not read its path."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    node = bin_dir / "node"
+    node.write_text(f"#!/bin/sh\necho v{version}\n")
+    node.chmod(0o755)
+
+
+class TestResolveNodeBinDir:
+    def test_no_node_version_resolves_to_nothing(self, tmp_path):
+        profile = EngineeringProfile(name="x", node_version="")
+        assert profile.resolve_node_bin_dir() == ""
+
+    def test_finds_a_matching_openjarvis_managed_install(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        bin_dir = tmp_path / ".openjarvis" / "tools" / "node24" / "bin"
+        _fake_node(bin_dir, "24.20.0")
+        profile = EngineeringProfile(name="x", node_version="24.x")
+        assert profile.resolve_node_bin_dir() == str(bin_dir)
+
+    def test_a_wrong_major_version_is_not_matched(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        bin_dir = tmp_path / ".openjarvis" / "tools" / "node24" / "bin"
+        # Directory name says 24, but the binary itself reports 22 -- the
+        # binary is what gets trusted, never the path name.
+        _fake_node(bin_dir, "22.4.0")
+        profile = EngineeringProfile(name="x", node_version="24.x")
+        assert profile.resolve_node_bin_dir() == ""
+
+    def test_nothing_installed_resolves_to_empty_not_an_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        profile = EngineeringProfile(name="x", node_version="24.x")
+        assert profile.resolve_node_bin_dir() == ""
+
+    def test_nvm_install_is_found(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        bin_dir = tmp_path / ".nvm" / "versions" / "node" / "v24.20.0" / "bin"
+        _fake_node(bin_dir, "24.20.0")
+        profile = EngineeringProfile(name="x", node_version="24")
+        assert profile.resolve_node_bin_dir() == str(bin_dir)

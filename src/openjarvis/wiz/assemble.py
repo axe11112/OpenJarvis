@@ -187,7 +187,19 @@ def describe(
 def _check_suite_factory(profile: EngineeringProfile) -> Any:
     from openjarvis.reliability.checks import CheckSuite
 
-    return CheckSuite.from_config(**profile.check_commands())
+    node_bin_dir = profile.resolve_node_bin_dir()
+    if profile.node_version and not node_bin_dir:
+        logger.warning(
+            "target '%s' asks for node_version=%r but no matching Node was "
+            "found on this machine; checks will run under whatever `node` "
+            "this process already has",
+            profile.name,
+            profile.node_version,
+        )
+    return CheckSuite.from_config(
+        **profile.check_commands(),
+        path_prepend=[node_bin_dir] if node_bin_dir else None,
+    )
 
 
 def _preview_observer(config: Any, profile: EngineeringProfile) -> Any:

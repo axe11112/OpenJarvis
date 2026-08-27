@@ -47,6 +47,13 @@ class CheckCommand:
     #: a lint rule should not veto an outage fix.
     required: bool = True
     timeout: int = 1800
+    #: Directories prepended to PATH before running *command*, earliest wins.
+    #: Exists for one reason: a project can pin a runtime version
+    #: (``package.json``'s ``engines.node``, ``.nvmrc``) that the machine
+    #: running Wiz does not default to, and a check run under the wrong
+    #: runtime is not evidence about the change — it is evidence about the
+    #: machine. Empty by default, meaning "whatever this process already has".
+    path_prepend: List[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -152,6 +159,7 @@ def run_check(check: CheckCommand, *, workspace: str) -> CheckResult:
     error, and conflating the two would either block every repair or hide real
     breakage.
     """
+    import os
     import time
 
     if not check.command.strip():
@@ -163,6 +171,11 @@ def run_check(check: CheckCommand, *, workspace: str) -> CheckResult:
             required=check.required,
         )
 
+    env = None
+    if check.path_prepend:
+        env = dict(os.environ)
+        env["PATH"] = os.pathsep.join([*check.path_prepend, env.get("PATH", "")])
+
     started = time.monotonic()
     try:
         proc = subprocess.run(
@@ -173,6 +186,7 @@ def run_check(check: CheckCommand, *, workspace: str) -> CheckResult:
             text=True,
             timeout=check.timeout,
             check=False,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return CheckResult(
@@ -227,19 +241,38 @@ class CheckSuite:
         typecheck_command: str = "",
         build_command: str = "",
         timeout: int = 1800,
+        path_prepend: Optional[List[str]] = None,
     ) -> "CheckSuite":
         """Build the standard suite from configured commands.
 
         Lint is advisory: a style violation is a poor reason to leave production
         broken. Tests, types and the build are required, because each of them
         failing means the change is not shippable at all.
+
+        *path_prepend* applies to every check equally — a project either needs
+        a pinned runtime for all four gates or none of them, and letting them
+        disagree would make "which Node ran the tests" a question with more
+        than one honest answer.
         """
+        prepend = list(path_prepend or [])
         return cls(
             checks=[
-                CheckCommand("lint", lint_command, required=False, timeout=timeout),
-                CheckCommand("typecheck", typecheck_command, timeout=timeout),
-                CheckCommand("tests", test_command, timeout=timeout),
-                CheckCommand("build", build_command, timeout=timeout),
+                CheckCommand(
+                    "lint",
+                    lint_command,
+                    required=False,
+                    timeout=timeout,
+                    path_prepend=prepend,
+                ),
+                CheckCommand(
+                    "typecheck", typecheck_command, timeout=timeout, path_prepend=prepend
+                ),
+                CheckCommand(
+                    "tests", test_command, timeout=timeout, path_prepend=prepend
+                ),
+                CheckCommand(
+                    "build", build_command, timeout=timeout, path_prepend=prepend
+                ),
             ]
         )
 

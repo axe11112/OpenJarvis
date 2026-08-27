@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
@@ -35,6 +37,60 @@ _NODE_SCRIPTS = {
     "test_command": ("test", "test:ci", "test:unit"),
     "build_command": ("build",),
 }
+
+#: First integer found anywhere in a version string: "24.x" -> 24, "^24.0.0"
+#: -> 24, ">=22.4.0" -> 22, "lts/*" -> None.
+_MAJOR_VERSION_RE = re.compile(r"(\d+)")
+
+
+def _major_version(node_version: str) -> Optional[int]:
+    match = _MAJOR_VERSION_RE.search(node_version)
+    return int(match.group(1)) if match else None
+
+
+def _node_bin_candidates(major: int) -> List[str]:
+    """Places a pinned Node major version might live on this machine.
+
+    Ordered by how likely each is to be exactly what the operator meant: nvm
+    is a per-version manager, so a hit there is unambiguous; Homebrew's
+    keg-only ``node@N`` formulae are the same; the OpenJarvis-managed
+    directory is the fallback JARVIS itself can populate (a version download,
+    kept local and out of the way, precisely so a pin has somewhere to land
+    on a machine with neither of the other two) when nothing else has it.
+    """
+    home = Path.home()
+    candidates = sorted(
+        (home / ".nvm" / "versions" / "node").glob(f"v{major}.*"), reverse=True
+    )
+    return [
+        *(str(p / "bin") for p in candidates),
+        f"/opt/homebrew/opt/node@{major}/bin",
+        f"/usr/local/opt/node@{major}/bin",
+        str(home / ".openjarvis" / "tools" / f"node{major}" / "bin"),
+    ]
+
+
+def _bin_dir_has_major(bin_dir: str, major: int) -> bool:
+    """Whether *bin_dir* holds a real, runnable ``node`` of *major*.
+
+    Run rather than trusted by path name: a directory can exist and be
+    stale, half-uninstalled, or a leftover from a version that was since
+    switched — the only honest check is asking the binary what it is.
+    """
+    node = Path(bin_dir) / "node"
+    if not node.is_file():
+        return False
+    try:
+        proc = subprocess.run(
+            [str(node), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return _major_version(proc.stdout.strip().lstrip("v")) == major
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +130,36 @@ class EngineeringProfile:
             "test_command": self.test_command,
             "build_command": self.build_command,
         }
+
+    def resolve_node_bin_dir(self) -> str:
+        """Where the ``node_version`` this project asked for actually lives.
+
+        ``node_version`` is discovered from ``package.json``'s ``engines.node``
+        or ``.nvmrc``, but discovering it is not the same as running gates
+        under it — the machine's default ``node`` may be a different major
+        version, and a check that ran under the wrong one is not evidence
+        about the change, it is evidence about the machine (see
+        :func:`~openjarvis.reliability.checks.CheckCommand.path_prepend`).
+
+        Only the major version is matched — "24.x" and "24.20.0" both mean
+        "a 24", and pinning tighter than the project's own ``engines`` field
+        does would be inventing a constraint nobody asked for. Every candidate
+        is verified by actually running it, never trusted by path name alone:
+        a stale or half-removed install must lose silently to "not found",
+        not report a version it no longer has.
+
+        Returns the directory to prepend to ``PATH``, or ``""`` when no
+        ``node_version`` is set or nothing on this machine matches it — in
+        which case checks run under whatever ``node`` this process already
+        has, exactly as before this existed.
+        """
+        major = _major_version(self.node_version)
+        if major is None:
+            return ""
+        for candidate in _node_bin_candidates(major):
+            if _bin_dir_has_major(candidate, major):
+                return candidate
+        return ""
 
     @property
     def configured_gates(self) -> List[str]:
