@@ -26,6 +26,7 @@ from typing import Any, Callable, Dict, Optional
 from openjarvis.wiz.approvals import ApprovalStore
 from openjarvis.wiz.features.acceptance import Viewport
 from openjarvis.wiz.features.engineer import ClaudeCodeEngineeringAgent
+from openjarvis.wiz.features.model import FeatureState
 from openjarvis.wiz.features.pipeline import FeaturePipeline
 from openjarvis.wiz.features.profile import EngineeringProfile
 from openjarvis.wiz.features.queue import DevelopmentQueue
@@ -114,7 +115,7 @@ def assemble(
     return ProductVerbs(
         pipeline=pipeline,
         memory=memory,
-        runner=lambda feature_id: pipeline.run(feature_id),
+        runner=lambda feature_id: _run_and_auto_ship(pipeline, config, feature_id),
     )
 
 
@@ -200,6 +201,80 @@ def _check_suite_factory(profile: EngineeringProfile) -> Any:
         **profile.check_commands(),
         path_prepend=[node_bin_dir] if node_bin_dir else None,
     )
+
+
+def _run_and_auto_ship(pipeline: FeaturePipeline, config: Any, feature_id: str) -> Any:
+    """What every intake channel gets for free: ``run``, then the one thing it
+    never does on its own.
+
+    :meth:`~openjarvis.wiz.features.pipeline.FeaturePipeline.run` stops dead at
+    ``READY`` — deliberately, and that is not renegotiable here. Reaching
+    production without a person is a *second*, separate decision, made once in
+    advance in :class:`~openjarvis.wiz.features.shipping.FeatureShippingPolicy`
+    rather than implicitly by whoever happened to type the request. This is
+    where that second decision actually gets asked, for every caller of
+    ``ProductVerbs.runner`` alike — the CLI, and anything else built on the
+    same capability — so "genuinely LOW-risk work may go all the way on its
+    own" is true of Wiz's real intake, not only of a path the HTTP server
+    happens to also take.
+
+    :meth:`~FeaturePipeline.auto_ship_if_eligible` is already a strict no-op
+    for anything not sitting at ``READY`` with LOW risk and ``merge_low_risk``
+    on, so calling it unconditionally after every ``run`` costs nothing on the
+    far more common paths that end in ``HUMAN_REQUIRED`` or a still-MEDIUM
+    ``READY``.
+    """
+    feature = pipeline.run(feature_id)
+    if feature.state is not FeatureState.READY:
+        return feature
+    return pipeline.auto_ship_if_eligible(
+        feature_id,
+        emergency_stop_engaged=lambda: _emergency_stop_engaged(config),
+        reliability_busy=lambda: _reliability_busy(pipeline),
+        audit_healthy=lambda: _audit_healthy(pipeline.journal),
+    )
+
+
+def _emergency_stop_engaged(config: Any) -> bool:
+    """Whether the operator's one emergency stop is pulled.
+
+    The exact same flag file the reliability watcher honours — not a second
+    switch a panicked operator would have to remember exists. Unreadable is
+    treated as engaged: a stop this process cannot confirm is clear is not a
+    stop this process should ship features through.
+    """
+    try:
+        from openjarvis.reliability.watch import stop_flag_path
+
+        return stop_flag_path(config).is_file()
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _audit_healthy(journal: Any) -> bool:
+    """Whether Wiz's own hash-chained journal still checks out.
+
+    No journal attached is not "healthy" here — it is nothing this process can
+    vouch for, which for an autonomous merge decision is the same refusal.
+    """
+    if journal is None:
+        return False
+    try:
+        intact, _break_at = journal.verify()
+        return bool(intact)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _reliability_busy(pipeline: Any) -> bool:
+    """Whether the development queue currently defers to production."""
+    queue = getattr(pipeline, "queue", None)
+    if queue is None:
+        return False
+    try:
+        return bool(queue.snapshot().get("production_busy", False))
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def _preview_observer(config: Any, profile: EngineeringProfile) -> Any:
