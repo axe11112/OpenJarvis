@@ -282,6 +282,96 @@ class TestShipping:
         assert "already working" in body["message"]
 
 
+class TestAutomaticShipping:
+    """/build: for LOW risk with everything configured, READY does not wait
+    for a separate click on /ship — see `_start`'s `drive` and
+    `FeaturePipeline.auto_ship_if_eligible`.
+    """
+
+    def _client(self, tmp_path, monkeypatch, *, risk):
+        pipeline = FakePipeline()
+        pipeline.approvals = None
+        pipeline.queue = None
+        feature = pipeline.submit(
+            "Add a download button",
+            actor=Actor(
+                actor_id="operator", channel=Channel.CONTROL_CENTER, authenticated=True
+            ),
+        )
+        feature.risk = risk
+        pipeline.store.save(feature)
+
+        product = ProductVerbs(
+            pipeline=pipeline, memory=None, runner=lambda i: pipeline.run(i)
+        )
+        runtime = build_wiz(
+            home=tmp_path,
+            policy=AuthorityPolicy(
+                grants={
+                    Channel.CONTROL_CENTER: frozenset(
+                        {
+                            Authority.READ,
+                            Authority.CODE_WRITE,
+                            Authority.PRODUCTION_CHANGE,
+                        }
+                    )
+                }
+            ),
+            journal=WizJournal(tmp_path / "j.jsonl"),
+            store_factory=lambda: (_ for _ in ()).throw(FileNotFoundError("none")),
+            product=product,
+        )
+        wiz_routes.reset_state()
+        monkeypatch.setattr(wiz_routes, "_runtime", lambda: runtime)
+        monkeypatch.setattr(wiz_routes, "_emergency_stop_engaged", lambda config: False)
+        monkeypatch.setattr(wiz_routes, "_reliability_busy", lambda pipeline: False)
+        monkeypatch.setattr(wiz_routes, "_audit_healthy", lambda journal: True)
+        app = FastAPI()
+        app.include_router(wiz_routes.router)
+        test_client = TestClient(app)
+        test_client.pipeline = pipeline
+        test_client.feature_id = feature.id
+        return test_client
+
+    def test_low_risk_ships_itself_after_build(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path, monkeypatch, risk="LOW")
+        response = client.post(f"/api/wiz/features/{client.feature_id}/build")
+        assert response.json()["started"] is True
+
+        for _ in range(50):
+            if client.pipeline.store.get(client.feature_id).state.value == "COMPLETE":
+                break
+            time.sleep(0.01)
+        assert client.pipeline.store.get(client.feature_id).state.value == "COMPLETE"
+        wiz_routes.reset_state()
+
+    def test_medium_risk_stops_at_ready(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path, monkeypatch, risk="MEDIUM")
+        response = client.post(f"/api/wiz/features/{client.feature_id}/build")
+        assert response.json()["started"] is True
+
+        for _ in range(20):
+            if wiz_routes._RUNNING.get(client.feature_id) is None:
+                break
+            time.sleep(0.01)
+        assert client.pipeline.store.get(client.feature_id).state.value == "READY"
+        assert getattr(client.pipeline, "shipped", []) == []
+        wiz_routes.reset_state()
+
+    def test_emergency_stop_prevents_automatic_shipping(self, tmp_path, monkeypatch):
+        client = self._client(tmp_path, monkeypatch, risk="LOW")
+        monkeypatch.setattr(wiz_routes, "_emergency_stop_engaged", lambda config: True)
+        response = client.post(f"/api/wiz/features/{client.feature_id}/build")
+        assert response.json()["started"] is True
+
+        for _ in range(20):
+            if wiz_routes._RUNNING.get(client.feature_id) is None:
+                break
+            time.sleep(0.01)
+        assert client.pipeline.store.get(client.feature_id).state.value == "READY"
+        wiz_routes.reset_state()
+
+
 class TestThePage:
     def test_the_page_is_served_without_a_build_step(self):
         from openjarvis.server.wiz_dashboard import router

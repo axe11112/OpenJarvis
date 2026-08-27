@@ -445,6 +445,82 @@ class FeaturePipeline:
         self._release(feature)
         return feature
 
+    def auto_ship_if_eligible(
+        self,
+        feature_id: str,
+        *,
+        emergency_stop_engaged: Callable[[], bool] = lambda: False,
+        reliability_busy: Callable[[], bool] = lambda: False,
+        audit_healthy: Callable[[], bool] = lambda: True,
+    ) -> FeatureRequest:
+        """Ship *feature_id* on its own, iff it never needed a person to say so.
+
+        Not a step :meth:`run` reaches — ``run`` stops at ``READY`` by design
+        and stays that way; see :meth:`ship`'s docstring and
+        ``TestReadyOpensAPullRequestAndNothingMore.test_run_never_merges_anything``.
+        This is a second, deliberately narrow caller sitting above both: the
+        thing an operator wires in after ``run`` returns, when they have
+        decided in advance — in :class:`~openjarvis.wiz.features.shipping.
+        FeatureShippingPolicy`, in configuration, not here — that genuinely
+        LOW-risk work may go all the way on its own.
+
+        Every check below is a reason *not to call* :meth:`ship` at all, not a
+        looser version of what :meth:`ship` already checks — the pull request
+        state, the base branch, the required status contexts, the authority
+        model and the token's write permission are re-verified fresh inside
+        :meth:`ship` regardless of how it was invoked, exactly as they are for
+        the operator's own Ship button. What this method adds is the three
+        things ``evaluate_shipping`` has no way to see because they are not
+        about this feature: whether the operator has pulled the emergency
+        stop, whether reliability is busy with production, and whether Wiz's
+        own audit trail still checks out. A machine that cannot prove the last
+        merge it recorded is the last merge that happened has no business
+        deciding to make another one by itself.
+
+        MEDIUM, HIGH and UNKNOWN risk are refused here, before ``ship`` is
+        even called — not just left to ``evaluate_shipping``'s own risk gate —
+        because the brief is explicit that this trigger must never *attempt*
+        an autonomous merge outside LOW, not merely fail to complete one.
+
+        Idempotent: a feature not sitting at exactly ``READY`` with
+        ``merge_low_risk`` on is left untouched, so calling this twice, or
+        after a restart finds the feature already ``MERGING``, ``COMPLETE`` or
+        back at ``READY`` from a refusal, never risks a second merge attempt.
+        """
+        feature = self._load(feature_id)
+        if feature.state is not FeatureState.READY:
+            return feature
+        if (feature.risk or "").strip().upper() != Risk.LOW.value:
+            return feature
+        if self.shipper is None or not getattr(
+            self.shipper.policy, "merge_low_risk", False
+        ):
+            return feature
+
+        if emergency_stop_engaged():
+            self._record(
+                feature,
+                "feature.auto_ship_skipped",
+                "the emergency stop is engaged; not shipping automatically",
+            )
+            return feature
+        if reliability_busy():
+            self._record(
+                feature,
+                "feature.auto_ship_skipped",
+                "reliability is busy with production; deferring automatic shipping",
+            )
+            return feature
+        if not audit_healthy():
+            self._record(
+                feature,
+                "feature.auto_ship_skipped",
+                "the audit trail is not healthy; refusing to ship automatically",
+            )
+            return feature
+
+        return self.ship(feature_id)
+
     def advance(self, feature: FeatureRequest) -> StepResult:
         """Perform exactly one transition."""
         if feature.terminal:

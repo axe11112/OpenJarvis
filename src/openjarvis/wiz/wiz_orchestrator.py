@@ -270,7 +270,7 @@ class WizOrchestrator:
             "timeline": [
                 {
                     "stage": "Validation",
-                    "status": "passed" if progress > 0.1 else "pending",
+                    "status": "passed" if progress >= 0.1 else "pending",
                 },
                 {
                     "stage": "Execution",
