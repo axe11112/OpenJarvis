@@ -300,6 +300,54 @@ def test_a_configured_but_stopped_scheduler_is_a_failure():
     assert check.state is HealthState.FAILED
 
 
+def _with_free_bytes(monkeypatch, free):
+    import openjarvis.wiz.features.diskspace as diskspace
+
+    class Usage:
+        def __init__(self, free):
+            self.free = free
+
+    monkeypatch.setattr(diskspace.shutil, "disk_usage", lambda p: Usage(free))
+
+
+def test_plenty_of_free_disk_is_healthy(monkeypatch):
+    _with_free_bytes(monkeypatch, 20 * 1024**3)
+    report = build_wiz_health(disk_path="/")
+    check = next(c for c in report.checks if c.name == "disk")
+    assert check.state is HealthState.HEALTHY
+
+
+def test_low_free_disk_is_degraded_not_yet_failed(monkeypatch):
+    _with_free_bytes(monkeypatch, 5 * 1024**3)
+    report = build_wiz_health(disk_path="/")
+    check = next(c for c in report.checks if c.name == "disk")
+    assert check.state is HealthState.DEGRADED
+
+
+def test_disk_below_the_pipelines_own_floor_is_a_failure(monkeypatch):
+    # FEAT-00007 (a bare "JavaScript heap out of memory") and FEAT-00008 (the
+    # CLI process itself died) — the disk check must say so plainly, and
+    # below the same floor the pipeline's own preflight refuses to start work
+    # under (see openjarvis.wiz.features.diskspace.DEFAULT_MIN_FREE_BYTES).
+    _with_free_bytes(monkeypatch, 512 * 1024 * 1024)
+    report = build_wiz_health(disk_path="/")
+    check = next(c for c in report.checks if c.name == "disk")
+    assert check.state is HealthState.FAILED
+    assert "GiB" in check.summary
+
+
+def test_an_unstattable_disk_path_is_unknown_not_a_crash(monkeypatch):
+    import openjarvis.wiz.features.diskspace as diskspace
+
+    def raises(path):
+        raise OSError("no such volume")
+
+    monkeypatch.setattr(diskspace.shutil, "disk_usage", raises)
+    report = build_wiz_health(disk_path="/nowhere")
+    check = next(c for c in report.checks if c.name == "disk")
+    assert check.state is HealthState.UNKNOWN
+
+
 # ---------------------------------------------------------------------------
 # The overall verdict
 # ---------------------------------------------------------------------------

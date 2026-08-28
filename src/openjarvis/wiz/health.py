@@ -299,6 +299,43 @@ def _voice_check(voice_probe: Optional[Callable[[], Any]]) -> CheckResult:
     return result
 
 
+def _disk_space_check(path: Optional[str]) -> CheckResult:
+    """Free disk on the volume feature worktrees are built on.
+
+    The same 2 GiB floor :func:`openjarvis.wiz.features.diskspace.has_enough_disk`
+    checks before every pipeline step — read here too so an operator sees it
+    coming in ``jarvis wiz doctor`` rather than discovering it mid-build. A
+    full disk emptied this machine once (see FEAT-00007, FEAT-00008) and
+    surfaced as a bare "JavaScript heap out of memory" and a process death
+    respectively — neither said "disk" anywhere in the failure. This is the
+    other half of not letting that repeat: the pipeline refuses to *start*
+    heavy work when low; this is where a person finds out before it matters.
+    """
+    from openjarvis.wiz.features.diskspace import DEFAULT_MIN_FREE_BYTES, free_bytes
+
+    result = CheckResult(name="disk")
+    target = path or "/"
+    try:
+        free = free_bytes(target)
+    except OSError as exc:
+        result.state = HealthState.UNKNOWN
+        result.detail = f"could not check free disk at {target}: {exc}"
+        return result
+    gib = free / (1024**3)
+    result.detail = f"{gib:.1f} GiB free at {target}"
+    if free < DEFAULT_MIN_FREE_BYTES:
+        result.state = HealthState.FAILED
+        result.summary = f"only {gib:.1f} GiB free — below the safe minimum"
+        result.remediation = "free disk space before starting more feature work"
+    elif free < DEFAULT_MIN_FREE_BYTES * 5:
+        result.state = HealthState.DEGRADED
+        result.summary = f"{gib:.1f} GiB free — getting low"
+    else:
+        result.state = HealthState.HEALTHY
+        result.summary = f"{gib:.1f} GiB free"
+    return result
+
+
 def _scheduler_check(scheduler: Any) -> CheckResult:
     result = CheckResult(name="scheduler")
     if scheduler is None:
@@ -346,6 +383,7 @@ def default_checks(
     telegram_allowed_chat_ids: str = "",
     voice_probe: Optional[Callable[[], Any]] = None,
     scheduler: Any = None,
+    disk_path: Optional[str] = None,
 ) -> List[CheckResult]:
     """Every check Wiz runs about itself. Nothing here reads an incident."""
     return [
@@ -358,6 +396,7 @@ def default_checks(
         _telegram_check(telegram_bot_token, telegram_allowed_chat_ids),
         _voice_check(voice_probe),
         _scheduler_check(scheduler),
+        _disk_space_check(disk_path),
     ]
 
 
@@ -373,6 +412,7 @@ def build_wiz_health(
     telegram_allowed_chat_ids: str = "",
     voice_probe: Optional[Callable[[], Any]] = None,
     scheduler: Any = None,
+    disk_path: Optional[str] = None,
 ) -> WizHealthReport:
     """Assemble a report from live collaborators.
 
@@ -392,6 +432,7 @@ def build_wiz_health(
             telegram_allowed_chat_ids=telegram_allowed_chat_ids,
             voice_probe=voice_probe,
             scheduler=scheduler,
+            disk_path=disk_path,
         )
     )
 

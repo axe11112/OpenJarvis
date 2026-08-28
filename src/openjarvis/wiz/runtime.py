@@ -278,6 +278,7 @@ class WizRuntime:
         channel = getattr(self.config, "channel", None)
         telegram = getattr(channel, "telegram", None)
 
+        workspace = getattr(getattr(self.product, "pipeline", None), "workspace", None)
         report = build_wiz_health(
             journal=self.journal,
             registry=self.registry,
@@ -290,6 +291,7 @@ class WizRuntime:
             ),
             voice_probe=self._voice_probe,
             scheduler=self._scheduler,
+            disk_path=getattr(workspace, "root", None),
         )
         chain_ok: Optional[bool] = None
         chain_break: Optional[int] = None
