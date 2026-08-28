@@ -249,3 +249,77 @@ class TestItSendsNothingItself:
         briefing = compose(store=Broken(), now="2026-08-19")
         assert isinstance(briefing, Briefing)
         assert not briefing.worth_sending
+
+
+class _Entry:
+    def __init__(self, title):
+        self.title = title
+
+
+class _Memory:
+    def __init__(self, entries):
+        self._entries = entries
+        self.calls = []
+
+    def on_day(self, day, *, kinds):
+        self.calls.append((day, tuple(kinds)))
+        return list(self._entries)
+
+
+class TestMemoryIsOnlyAFallbackForAMissingStore:
+    """Regression: a feature that failed and stopped at HUMAN_REQUIRED must
+    never also be reported as "I built X" from memory's fallback, which
+    remembers every feature *touched* that day regardless of outcome — a
+    real bug caught by actually running `jarvis wiz morning` against
+    FEAT-00002, which appeared under both "needs you" and "I built" at once.
+    """
+
+    def test_a_store_with_a_genuinely_quiet_day_does_not_fall_back_to_memory(
+        self, store
+    ):
+        # The store answered — correctly, nothing was built — and that must
+        # be the final answer, not a cue to go ask memory instead.
+        feature(
+            store,
+            title="Error page glow: blue to violet",
+            state=FeatureState.HUMAN_REQUIRED,
+            updated="2026-08-18T13:47:08+00:00",
+        )
+        memory = _Memory([_Entry("Error page glow: blue to violet")])
+
+        briefing = compose(store=store, memory=memory, now="2026-08-19")
+
+        assert briefing.built == []
+        assert not memory.calls, "memory should not even be asked"
+        assert any("Error page glow" in item for item in briefing.needs_you)
+
+    def test_memory_is_used_when_the_store_is_not_configured_at_all(self):
+        memory = _Memory([_Entry("Add a download button")])
+        briefing = compose(store=None, memory=memory, now="2026-08-19")
+        assert briefing.built == ["Add a download button"]
+
+    def test_memory_is_used_when_the_store_raises(self):
+        class Broken:
+            def list(self, **kwargs):
+                raise RuntimeError("gone")
+
+            def active(self, **kwargs):
+                raise RuntimeError("gone")
+
+        memory = _Memory([_Entry("Add a download button")])
+        briefing = compose(store=Broken(), memory=memory, now="2026-08-19")
+        assert briefing.built == ["Add a download button"]
+
+    def test_a_store_with_something_genuinely_built_never_asks_memory(self, store):
+        feature(
+            store,
+            title="Add a download button",
+            state=FeatureState.READY,
+            updated="2026-08-18T10:00:00+00:00",
+        )
+        memory = _Memory([_Entry("a completely different thing")])
+
+        briefing = compose(store=store, memory=memory, now="2026-08-19")
+
+        assert briefing.built == ["Add a download button"]
+        assert not memory.calls

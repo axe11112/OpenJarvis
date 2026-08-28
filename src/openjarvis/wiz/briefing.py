@@ -138,18 +138,29 @@ def compose(
 
     briefing.health = _health(reliability, site_name)
 
+    # Whether the store answered at all — not whether it had anything to say.
+    # A day with nothing built is the ordinary case and must not fall
+    # through to memory, which remembers every feature *touched* regardless
+    # of outcome: a feature that failed three times and stopped at
+    # HUMAN_REQUIRED is still "remembered" the day it was attempted, and
+    # reporting that as "I built X" the same day it also appears under
+    # "needs you" is exactly the hallucinated narrative this module's own
+    # docstring refuses to produce.
+    store_answered = False
     if store is not None:
         try:
             briefing.needs_you = _needs_you(store)
             briefing.in_progress = _in_progress(store)
             briefing.built = _built_on(store, yesterday)
+            store_answered = True
         except Exception:
             logger.exception("could not read the feature store for the briefing")
 
-    if memory is not None and not briefing.built:
+    if memory is not None and not store_answered:
         # The store is the better source — it knows *states*. Memory is the
-        # fallback for a machine where features have been pruned but the record
-        # of what was built survives.
+        # fallback for a machine where the store is absent or unreadable
+        # (features pruned, a moved database) and the record of what was
+        # built survives only in memory.
         try:
             briefing.built = [
                 entry.title for entry in memory.on_day(yesterday, kinds=["feature"])
