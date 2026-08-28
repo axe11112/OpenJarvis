@@ -420,3 +420,19 @@ class TestReading:
         product.request_feature(request("Add a coach weekly summary"))
         found = product.search(request("find the coach summary"))
         assert found["query"] == "the coach summary"
+
+    def test_metrics_reports_real_counts_not_a_percentage_from_nothing(self, product):
+        with_none = product.feature_metrics(request("how autonomous are you"))
+        assert with_none["available"]
+        assert with_none["metrics"]["sample_size"] == 0
+        assert "have been recorded" in with_none["say"].lower()
+
+        product.request_feature(request("Add a download button"))
+        with_one = product.feature_metrics(request("how autonomous are you"))
+        assert with_one["metrics"]["sample_size"] == 1
+        assert "1 feature(s) recorded" in with_one["say"]
+
+    def test_metrics_is_unavailable_with_no_pipeline_configured(self):
+        product = ProductVerbs(pipeline=None, memory=None)
+        result = product.feature_metrics(request("how autonomous are you"))
+        assert not result["available"]

@@ -92,6 +92,13 @@ def product_intent_rules() -> List[IntentRule]:
             weight=14,
         ),
         intent_rule(
+            "feature.metrics",
+            r"\b(how autonomous (are you|is wiz)|autonomy rate|"
+            r"how (much|many) (have you shipped|did you ship) (on your own|"
+            r"autonomously)|show me the numbers|feature metrics)\b",
+            weight=14,
+        ),
+        intent_rule(
             "product.recent",
             r"\b(what did (we|you) (build|ship|do)|"
             r"what happened (yesterday|today|last night|overnight|this week)|"
@@ -187,6 +194,13 @@ def product_capabilities(
             probe=memory_available,
         ),
         CapabilitySpec(
+            name="feature.metrics",
+            summary="say how much of what I have built actually shipped on its own",
+            authority=Authority.READ,
+            risk=Risk.LOW,
+            probe=pipeline_available,
+        ),
+        CapabilitySpec(
             name="product.recent",
             summary="say what was built recently, and why",
             authority=Authority.READ,
@@ -226,6 +240,7 @@ class ProductVerbs:
             "feature.build": self.build_feature,
             "feature.list": self.list_features,
             "feature.status": self.feature_status,
+            "feature.metrics": self.feature_metrics,
             "feature.cancel": self.cancel_feature,
             "product.recent": self.recent,
             "product.search": self.search,
@@ -321,6 +336,24 @@ class ProductVerbs:
         if feature is None:
             return {"available": False, "detail": f"I have no request {feature_id!r}"}
         return {"available": True, "feature": feature.to_dict()}
+
+    def feature_metrics(self, request: Request) -> Dict[str, Any]:
+        """Real counts of what actually happened — see features/metrics.py.
+
+        Architecture existing is not autonomy; this reads the FeatureStore
+        and reports only what is actually recorded there, sample size
+        included, so a caller never mistakes five features for a statistic.
+        """
+        if self.pipeline is None:
+            return {"available": False, "detail": "feature work is not configured here"}
+        from openjarvis.wiz.features.metrics import summarize_features
+
+        metrics = summarize_features(self.pipeline.store)
+        return {
+            "available": True,
+            "metrics": metrics.to_dict(),
+            "say": metrics.render(),
+        }
 
     def cancel_feature(self, request: Request) -> Dict[str, Any]:
         """Stop work on a request.
