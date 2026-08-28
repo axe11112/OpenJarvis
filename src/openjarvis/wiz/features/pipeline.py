@@ -53,6 +53,7 @@ from openjarvis.wiz.features.acceptance import (
     criteria_from_mapping,
     extract_proposed_criteria,
 )
+from openjarvis.wiz.features.diskspace import has_enough_disk
 from openjarvis.wiz.features.engineer import (
     ClaudeCodeEngineeringAgent,
     CodingEngineUnavailable,
@@ -530,6 +531,22 @@ class FeaturePipeline:
         if yielded is not None:
             return yielded
 
+        root = getattr(self.workspace, "root", None)
+        if root and not has_enough_disk(root):
+            # Checked before the step runs, not after it fails: FEAT-00007
+            # crashed a coding session with a bare "JavaScript heap out of
+            # memory" when the real problem was disk, and FEAT-00008 died
+            # too abruptly to even record a failed attempt. Both left a
+            # feature stuck rather than a clear, actionable stop.
+            return self._stop(
+                feature,
+                "I'm stopping before doing more work: this machine is "
+                "nearly out of disk space, and a coding session, a build "
+                "or a preview is more likely to crash than finish. Free "
+                "some space and try again.",
+                kind="feature.disk_exhausted",
+            )
+
         step = self._steps().get(feature.state)
         if step is None:
             return StepResult(
@@ -907,6 +924,7 @@ class FeaturePipeline:
 
         self._transition(feature, FeatureState.READY, verification.summary())
         pr = self._open_pull_request(feature)
+        self._cleanup_worktree(feature)
         self._release(feature)
 
         message = f"Sir, {feature.title} is ready. Preview: {feature.preview_url}"
@@ -999,6 +1017,32 @@ class FeaturePipeline:
         feature.base_sha = worktree.base_commit
         self.store.save(feature)
         return worktree
+
+    def _cleanup_worktree(self, feature: FeatureRequest) -> None:
+        """Tear down a READY feature's worktree — its job is done.
+
+        By the time a feature reaches READY, its commit is already pushed to
+        the base branch's remote (that is what the preview was built from),
+        so nothing downstream — opening the pull request, shipping, postship
+        verification — ever reads the local worktree again. Left in place, it
+        is pure disk cost: node_modules and a `next build` typically outweigh
+        the source by two orders of magnitude, and every READY feature leaves
+        one behind forever. FEAT-00001 through FEAT-00006 did exactly that —
+        about 20 GiB of dead build output before this was wired in.
+
+        Best-effort: a feature is READY either way, and a worktree that
+        cannot be removed is a disk problem to fix by hand, not a reason to
+        fail the feature that already succeeded.
+        """
+        worktree = self._worktrees.pop(feature.id, None)
+        if worktree is None:
+            return
+        try:
+            self.workspace.remove(worktree, succeeded=True)
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "could not clean up the worktree for %s", feature.id, exc_info=True
+            )
 
     def _release(self, feature: FeatureRequest) -> None:
         if self.queue is not None:

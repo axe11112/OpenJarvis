@@ -44,12 +44,14 @@ class FakeWorkspace:
 
     def __init__(self, tmp_path, changed_files=None, diff_text="+ nothing sensitive"):
         self.tmp_path = tmp_path
+        self.root = str(tmp_path)
         self.created = []
         self.changed = list(
             ["src/components/Summary.tsx"] if changed_files is None else changed_files
         )
         self.commits = []
         self.pushes = []
+        self.removed = []
         self.commit_sha = "feedface" + "0" * 32
         self.diff_text = diff_text
 
@@ -82,6 +84,9 @@ class FakeWorkspace:
 
     def has_changes(self, worktree):
         return bool(self.changed)
+
+    def remove(self, worktree, *, succeeded=True):
+        self.removed.append((worktree, succeeded))
 
 
 class ScriptedEngineer(ClaudeCodeEngineeringAgent):
@@ -799,6 +804,55 @@ class TestIntake:
         assert waiting[0].priority is Priority.P2
 
 
+class TestDiskSpacePreflight:
+    """FEAT-00007 crashed a coding session with a bare "JavaScript heap out
+    of memory"; the machine was actually out of disk. FEAT-00008 died too
+    abruptly to even record a failed attempt. Both should instead stop
+    cleanly, before doing more work that is likely to crash mid-way."""
+
+    def test_advance_refuses_to_start_when_disk_is_low(
+        self, tmp_path, clock, monkeypatch
+    ):
+        import openjarvis.wiz.features.pipeline as pipeline_module
+
+        monkeypatch.setattr(pipeline_module, "has_enough_disk", lambda root: False)
+        pipeline = build_pipeline(tmp_path, clock)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert "disk" in result.history[-1]["reason"].lower()
+        # Nothing was attempted: still RECEIVED-shaped, no attempt recorded.
+        assert not result.attempts
+
+    def test_a_workspace_with_no_root_skips_the_check(
+        self, tmp_path, clock, monkeypatch
+    ):
+        # A test double or an unconfigured workspace has no volume to check;
+        # that must not be treated as "unsafe to proceed".
+        import openjarvis.wiz.features.pipeline as pipeline_module
+
+        monkeypatch.setattr(
+            pipeline_module,
+            "has_enough_disk",
+            lambda root: (_ for _ in ()).throw(AssertionError("should not be called")),
+        )
+        workspace = FakeWorkspace(tmp_path)
+        workspace.root = None
+        pipeline = build_pipeline(tmp_path, clock, workspace=workspace)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+
+    def test_healthy_disk_proceeds_normally(self, tmp_path, clock, monkeypatch):
+        import openjarvis.wiz.features.pipeline as pipeline_module
+
+        monkeypatch.setattr(pipeline_module, "has_enough_disk", lambda root: True)
+        pipeline = build_pipeline(tmp_path, clock)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+
+
 class TestAudit:
     def test_every_step_is_journalled(self, tmp_path, clock):
         pipeline = build_pipeline(tmp_path, clock)
@@ -878,6 +932,55 @@ class TestReadyOpensAPullRequestAndNothingMore:
         feature = pipeline.submit(REQUEST, actor=operator_actor())
         result = pipeline.run(feature.id)
         assert result.state is FeatureState.READY
+
+
+class TestReadyCleansUpItsWorktree:
+    """FEAT-00001 through FEAT-00006 each left node_modules and a `next
+    build` on disk forever once READY — nothing downstream of READY ever
+    reads the local worktree again, since its commit is already pushed."""
+
+    def test_the_worktree_is_removed_once_ready(self, tmp_path, clock):
+        workspace = FakeWorkspace(tmp_path)
+        shipper = TestReadyOpensAPullRequestAndNothingMore.FakeShipper()
+        pipeline = build_pipeline(tmp_path, clock, workspace=workspace)
+        pipeline.shipper = shipper
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert len(workspace.removed) == 1
+        removed_worktree, succeeded = workspace.removed[0]
+        assert removed_worktree is workspace.created[0]
+        assert succeeded is True
+
+    def test_a_worktree_that_cannot_be_removed_does_not_undo_ready(
+        self, tmp_path, clock
+    ):
+        class Unremovable(FakeWorkspace):
+            def remove(self, worktree, *, succeeded=True):
+                raise OSError("device busy")
+
+        pipeline = build_pipeline(tmp_path, clock, workspace=Unremovable(tmp_path))
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+
+    def test_a_feature_that_does_not_reach_ready_keeps_its_worktree(
+        self, tmp_path, clock
+    ):
+        # Preserved for inspection — see FeaturePipeline.run's own docstring
+        # on stopping "with its worktree intact".
+        workspace = FakeWorkspace(tmp_path)
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            workspace=workspace,
+            suite_results=[FakeCheckResult(passed=False, summary="broken")],
+            max_attempts=1,
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is not FeatureState.READY
+        assert workspace.removed == []
 
 
 class TestShip:
@@ -1335,9 +1438,7 @@ class TestAutoShipIfEligible:
             shipper=TestShip()._shipper(github),
             postship=TestShip.FakePostShip(verified=True),
         )
-        result = pipeline.auto_ship_if_eligible(
-            feature.id, audit_healthy=lambda: False
-        )
+        result = pipeline.auto_ship_if_eligible(feature.id, audit_healthy=lambda: False)
         assert result.state is FeatureState.READY
         assert github.merge_calls == []
 
