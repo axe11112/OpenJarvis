@@ -285,7 +285,9 @@ class TestPullRequests:
         assert result["created"]
         assert feature.pr_number == 7
         assert github.calls[0]["head"] == "wiz/feature/FEAT-00042"
-        assert github.calls[0]["base"] == "main"
+        # No `base` kwarg: GitHubSource.create_pull_request fixes the base
+        # branch on the client itself and does not accept one from a caller.
+        assert "base" not in github.calls[0]
 
     def test_a_channel_without_pr_write_opens_nothing(self):
         github = self.FakeGitHub()
@@ -386,6 +388,37 @@ class TestPullRequests:
         result = shipper.open_pull_request(ready_feature())
         assert not result["created"]
         assert "403" in result["reason"]
+
+    class RealSignatureFakeGitHub:
+        """Mirrors GitHubSource.create_pull_request's actual signature.
+
+        Unlike ``FakeGitHub`` above, this has no ``**kwargs`` catch-all, so a
+        caller passing a keyword argument the real client does not accept
+        raises ``TypeError`` here exactly as it would against the real
+        ``GitHubSource`` — the failure mode a permissive fake hides.
+        """
+
+        def create_pull_request(self, *, head, title, body, labels=None):
+            return {"html_url": "https://github.com/a/b/pull/9", "number": 9}
+
+    def test_matches_the_real_github_sources_create_pull_request_signature(self):
+        # Regression for a READY feature (FEAT-00006) that never got a pull
+        # request: the caller passed base=self.base_branch, but
+        # GitHubSource.create_pull_request has no `base` parameter — the base
+        # branch is fixed on the client itself. open_pull_request's broad
+        # except swallowed the resulting TypeError silently, so the feature
+        # sat at READY with pr_number 0 and no visible error.
+        shipper = FeatureShipper(
+            policy=FeatureShippingPolicy(),
+            github=self.RealSignatureFakeGitHub(),
+            authority=AuthorityPolicy(
+                grants={Channel.CONTROL_CENTER: frozenset({Authority.PR_WRITE})}
+            ),
+        )
+        feature = ready_feature()
+        result = shipper.open_pull_request(feature)
+        assert result["created"], result.get("reason")
+        assert feature.pr_number == 9
 
 
 class TestMerging:

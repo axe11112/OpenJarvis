@@ -400,7 +400,6 @@ class FeatureShipper:
                 title=self._title(feature),
                 body=pull_request_body(feature),
                 head=feature.branch,
-                base=self.base_branch,
             )
         except Exception as exc:
             reconciled = self._find_existing_pull_request(feature)
