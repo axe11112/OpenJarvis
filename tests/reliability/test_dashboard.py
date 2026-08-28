@@ -448,6 +448,81 @@ def test_snapshot_reflects_configuration_not_defaults(config, store):
     assert snapshot.monitoring_enabled is True
 
 
+class TestEngineeringSection:
+    """The Control Center's Wiz half, read through an injected callable —
+    never a direct import. This module keeps a production website alive;
+    reliability must never depend on the assistant layered around it, so
+    what it accepts here is a plain zero-argument callable, never anything
+    typed to openjarvis.wiz. See test_dependency_direction.py, and
+    openjarvis.wiz.dashboard_snapshot for the callable's real
+    implementation and its own dedicated, wiz-side tests.
+    """
+
+    def test_no_callable_is_reported_unavailable_not_omitted(self, config, store):
+        service = DashboardService(config, store=store, probe_verification="none")
+        snapshot = service.snapshot()
+        assert snapshot.engineering == {
+            "available": False,
+            "detail": "no engineering target configured",
+        }
+
+    def test_the_callables_return_value_passes_through_verbatim(self, config, store):
+        payload = {"available": True, "metrics": {"sample_size": 3}}
+        service = DashboardService(
+            config, store=store, probe_verification="none", wiz_snapshot=lambda: payload
+        )
+        assert service.snapshot().engineering == payload
+
+    def test_a_raising_callable_does_not_break_the_rest_of_the_snapshot(
+        self, config, store
+    ):
+        def broken():
+            raise RuntimeError("gone")
+
+        service = DashboardService(
+            config, store=store, probe_verification="none", wiz_snapshot=broken
+        )
+        snapshot = service.snapshot()
+        assert snapshot.engineering == {
+            "available": False,
+            "detail": "could not read Wiz state",
+        }
+        # The rest of the page still renders — a broken Wiz side must never
+        # take down the Wize side.
+        assert snapshot.target_repository == "owner/Target-App"
+
+    def test_reliability_dashboard_service_never_imports_wiz(self):
+        import ast
+        from pathlib import Path
+
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "src"
+            / "openjarvis"
+            / "reliability"
+            / "dashboard"
+            / "service.py"
+        )
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            module = (
+                getattr(node, "module", None)
+                if isinstance(node, ast.ImportFrom)
+                else None
+            )
+            names = (
+                [a.name for a in node.names]
+                if isinstance(node, (ast.Import, ast.ImportFrom))
+                else []
+            )
+            assert module != "openjarvis.wiz" and not (module or "").startswith(
+                "openjarvis.wiz."
+            )
+            assert not any(
+                n == "openjarvis.wiz" or n.startswith("openjarvis.wiz.") for n in names
+            )
+
+
 def test_incidents_come_from_the_store(service, store):
     """Not a cache, not a copy: the store the watcher writes."""
     first = _incident(store, title="Login broken", component="authentication")

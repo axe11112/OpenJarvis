@@ -2212,6 +2212,50 @@ def reliability_dashboard(
     Nothing here can repair, deploy, merge or modify an incident. The only
     actions it offers are asking launchd to start or restart the watcher
     service, and both are refused while an emergency stop is engaged.
+
+    Reliability-only: no engineering section. ``jarvis wiz dashboard`` runs
+    the identical Control Center with Wiz's own section added — see
+    ``run_control_center`` below, which this and that command both call.
+    """
+    run_control_center(
+        _load_config(),
+        host=host,
+        port=port,
+        open_browser=open_browser,
+        probe_verification=probe_verification,
+        watcher_control=watcher_control,
+        auto_recover=auto_recover,
+        use_tailscale=use_tailscale,
+        enable_voice=enable_voice,
+        certfile=certfile,
+        keyfile=keyfile,
+    )
+
+
+def run_control_center(
+    config: Any,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    open_browser: bool = False,
+    probe_verification: str = "http",
+    watcher_control: bool = True,
+    auto_recover: bool = True,
+    use_tailscale: bool = False,
+    enable_voice: bool = False,
+    certfile: str = "",
+    keyfile: str = "",
+    wiz_snapshot: Any = None,
+) -> None:
+    """Build and serve the Control Center. Blocks until Ctrl-C.
+
+    The one entry point both ``jarvis reliability dashboard`` and
+    ``jarvis wiz dashboard`` run through, so there is exactly one Control
+    Center implementation rather than two that can drift. ``wiz_snapshot``
+    is a plain zero-argument callable, never a Wiz-typed object — this
+    module must never import ``openjarvis.wiz`` (see
+    ``test_dependency_direction.py``), so the caller that can import both
+    builds the closure and hands it in already-built.
     """
     from openjarvis.reliability.dashboard.access import (
         detect_tailscale,
@@ -2221,7 +2265,6 @@ def reliability_dashboard(
     from openjarvis.reliability.dashboard.service import DashboardService
 
     console = Console()
-    config = _load_config()
     store = _get_store(config)
 
     access = detect_tailscale() if use_tailscale else loopback_policy()
@@ -2243,6 +2286,7 @@ def reliability_dashboard(
         store=store,
         probe_verification=probe_verification,
         auto_recover=auto_recover,
+        wiz_snapshot=wiz_snapshot,
     )
     voice_endpoints = (
         _build_voice(config, store, console, access) if enable_voice else None

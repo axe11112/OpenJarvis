@@ -100,6 +100,7 @@ class DashboardService:
         cycle_seconds: Optional[float] = None,
         diagnostic_factory: Any = None,
         clock: Any = time.monotonic,
+        wiz_snapshot: Any = None,
     ) -> None:
         if probe_verification not in self.PROBE_MODES:
             raise ValueError(
@@ -109,6 +110,16 @@ class DashboardService:
         self._config = config
         self._store = store
         self._supervisor = supervisor or LaunchdSupervisor(config)
+        #: A zero-argument callable returning the engineering-section dict,
+        #: or None. Deliberately opaque: this module reads the incident
+        #: store to keep a production website alive, and must never import
+        #: openjarvis.wiz to do it — see test_dependency_direction.py's
+        #: reliability/wiz boundary, which is exactly the property "a bug in
+        #: an optional convenience feature can stop the thing that notices
+        #: the site is down" depends on. The caller that *can* import both
+        #: (jarvis wiz dashboard, in wiz_cmd.py) builds this closure and
+        #: hands it in already-built.
+        self._wiz_snapshot = wiz_snapshot
         self._probe_verification = probe_verification
         self._auto_recover = auto_recover
         self._clock = clock
@@ -369,6 +380,7 @@ class DashboardService:
             autonomy=self._autonomy(),
             outages=self._outages(),
             ledger=self._ledger(),
+            engineering=self._wiz(),
         )
 
     def _outages(self) -> List[Any]:
@@ -400,6 +412,23 @@ class DashboardService:
         except Exception:  # noqa: BLE001
             logger.exception("could not compute autonomy metrics")
             return {"available": False}
+
+    def _wiz(self) -> Dict[str, Any]:
+        """Wiz — the feature-shipping half — read through an injected callable.
+
+        Never imports openjarvis.wiz: this package keeps a production
+        website alive, and reliability must never depend on the assistant
+        layered around it — see test_dependency_direction.py. The caller
+        that *can* import both (``jarvis wiz dashboard``) builds the closure
+        and hands it in already-built; this just calls it defensively.
+        """
+        if self._wiz_snapshot is None:
+            return {"available": False, "detail": "no engineering target configured"}
+        try:
+            return dict(self._wiz_snapshot())
+        except Exception:  # noqa: BLE001
+            logger.exception("could not read wiz state for the dashboard")
+            return {"available": False, "detail": "could not read Wiz state"}
 
     def _incidents(self) -> List[Any]:
         try:

@@ -471,6 +471,11 @@ class Snapshot:
     #: gives up too easily" is a number somebody can watch rather than an
     #: impression — and so the opposite failure is just as visible.
     autonomy: Dict[str, Any] = field(default_factory=dict)
+    #: The feature-shipping half — Wiz's own health, what needs the owner,
+    #: what is currently in progress, and how much of it shipped on its own.
+    #: Named distinctly from `wiz` above (the persona status line) on
+    #: purpose: same character, two different things it can say.
+    engineering: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize the whole snapshot for the API."""
@@ -493,6 +498,7 @@ class Snapshot:
             "safety": self.safety.to_dict(),
             "blind_spots": list(self.blind_spots),
             "autonomy": dict(self.autonomy),
+            "engineering": dict(self.engineering),
             "open_incident_count": self.open_incident_count,
             "resolved_incident_count": self.resolved_incident_count,
             "audit_chain_intact": self.audit_chain_intact,
@@ -1141,6 +1147,7 @@ def build_snapshot(
     autonomy: Optional[Dict[str, Any]] = None,
     outages: Optional[List[Any]] = None,
     ledger: Any = None,
+    engineering: Optional[Dict[str, Any]] = None,
 ) -> Snapshot:
     """Assemble the whole read model from state that was already gathered.
 
@@ -1216,6 +1223,7 @@ def build_snapshot(
         watcher=watcher,
         notes=list(notes or []),
         autonomy=dict(autonomy or {}),
+        engineering=dict(engineering or {}),
     )
 
 

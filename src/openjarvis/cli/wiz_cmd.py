@@ -16,6 +16,7 @@ better outcome than losing what they asked for.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import click
@@ -23,6 +24,8 @@ from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
+
+logger = logging.getLogger(__name__)
 
 _STATE_STYLE = {
     "RECEIVED": "dim",
@@ -412,6 +415,101 @@ def status() -> None:
             console.print(f"  {channel}: {authorities}")
 
     _ = load_config  # imported for parity with the other commands' lazy loading
+
+
+@wiz.command("dashboard")
+@click.option("--host", default="127.0.0.1", show_default=True, help="Bind address.")
+@click.option("--port", default=8765, show_default=True, help="Port to listen on.")
+@click.option(
+    "--open/--no-open",
+    "open_browser",
+    default=False,
+    show_default=True,
+    help="Open the Control Center in the default browser once it is serving.",
+)
+@click.option(
+    "--probe-verification",
+    type=click.Choice(["none", "http", "all"]),
+    default="http",
+    show_default=True,
+    help="How much of the probe fleet the dashboard runs itself for a real verdict.",
+)
+@click.option(
+    "--watcher-control/--no-watcher-control",
+    default=True,
+    show_default=True,
+    help="Offer Start/Restart buttons for the launchd watcher service.",
+)
+@click.option(
+    "--auto-recover/--no-auto-recover",
+    default=True,
+    show_default=True,
+    help="Ask launchd to start the watcher when the dashboard finds it offline.",
+)
+@click.option(
+    "--tailscale/--no-tailscale",
+    "use_tailscale",
+    default=False,
+    show_default=True,
+    help="Also listen on this machine's Tailscale address.",
+)
+@click.option(
+    "--voice/--no-voice",
+    "enable_voice",
+    default=False,
+    show_default=True,
+    help="Mount the Sir Voice call routes and the installable phone app.",
+)
+@click.option("--cert", "certfile", default="", help="TLS certificate.")
+@click.option("--key", "keyfile", default="", help="TLS private key.")
+def dashboard(
+    host: str,
+    port: int,
+    open_browser: bool,
+    probe_verification: str,
+    watcher_control: bool,
+    auto_recover: bool,
+    use_tailscale: bool,
+    enable_voice: bool,
+    certfile: str,
+    keyfile: str,
+) -> None:
+    """Serve the one Control Center — Wize's health and Wiz's, together.
+
+    The identical server ``jarvis reliability dashboard`` runs — same
+    incidents, same probes, same safety interlocks — with one addition: an
+    "engineering" section built from the same WizRuntime `jarvis wiz` itself
+    runs on. Not a second dashboard; the same process, reading one more
+    thing. See ``run_control_center`` in reliability_cmd.py, which both
+    commands call.
+    """
+    from openjarvis.cli.reliability_cmd import run_control_center
+    from openjarvis.core.config import load_config
+    from openjarvis.wiz.assemble import assemble
+    from openjarvis.wiz.dashboard_snapshot import build_engineering_snapshot
+    from openjarvis.wiz.runtime import build_wiz
+
+    config = load_config()
+    try:
+        runtime = build_wiz(config=config, product=assemble(config=config))
+    except Exception:  # noqa: BLE001 - the Control Center must still start
+        logger.exception("could not assemble Wiz for the Control Center")
+        runtime = None
+
+    run_control_center(
+        config,
+        host=host,
+        port=port,
+        open_browser=open_browser,
+        probe_verification=probe_verification,
+        watcher_control=watcher_control,
+        auto_recover=auto_recover,
+        use_tailscale=use_tailscale,
+        enable_voice=enable_voice,
+        certfile=certfile,
+        keyfile=keyfile,
+        wiz_snapshot=lambda: build_engineering_snapshot(runtime),
+    )
 
 
 @wiz.command("ask")
