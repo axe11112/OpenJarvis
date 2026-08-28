@@ -462,6 +462,18 @@ class GitHubSource(BaseSignalSource):
         logger.info("github: created branch %s from %s", branch, source_ref)
         return sha
 
+    def branch_head_sha(self, branch: str) -> str:
+        """The commit *branch* currently points to on the remote, or ``""``.
+
+        Read-only counterpart to the ref lookup :meth:`create_branch` already
+        does before branching — pulled out so a caller can ask "has this
+        branch moved?" without creating anything.
+        """
+        ref = self.client.get_json(
+            f"/repos/{self.repo}/git/ref/heads/{branch}", default={}
+        )
+        return str(((ref or {}).get("object") or {}).get("sha", ""))
+
     def assert_paths_allowed(self, paths: List[str]) -> None:
         """Raise when any of *paths* is off-limits to automated repair."""
         blocked = [p for p in paths if is_protected_path(p, self._protected_paths)]

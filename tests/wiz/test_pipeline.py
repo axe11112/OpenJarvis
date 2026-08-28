@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List
 
 import pytest
@@ -22,6 +23,7 @@ from openjarvis.wiz.features.pipeline import FeaturePipeline
 from openjarvis.wiz.features.preview import PreviewObserver
 from openjarvis.wiz.features.profile import EngineeringProfile
 from openjarvis.wiz.features.queue import DevelopmentQueue
+from openjarvis.wiz.features.shipping import FeatureShipper, FeatureShippingPolicy
 from openjarvis.wiz.features.store import FeatureStore
 from openjarvis.wiz.features.verification import FeatureVerifier
 from openjarvis.wiz.journal import WizJournal
@@ -513,6 +515,30 @@ class TestRiskIsRedecidedOnTheRealDiff:
         assert result.risk == "HIGH"
         assert result.attempts == []
 
+    def test_the_escalated_risk_is_persisted_not_just_held_in_memory(
+        self, tmp_path, clock
+    ):
+        # Regression for FEAT-00009: the request text alone ("adjust the
+        # spacing") classifies LOW at _understand() and that LOW gets saved
+        # then. Only the plan-informed reassessment in _decide_to_build
+        # raises it to HIGH — and `run()`'s return value is the same
+        # in-memory object the pipeline mutated, so asserting on it (as
+        # TestAnAgentMayRaiseTheRisk... does above) could not have caught a
+        # missing store.save() for that escalation. A *second* read, the way
+        # `jarvis wiz show` or Control Center actually reads it (a fresh
+        # process, a fresh load from the store), is what proves persistence.
+        engineer = ScriptedEngineer(
+            plan_claim="This is high risk: it changes how sessions are stored."
+        )
+        pipeline = build_pipeline(tmp_path, clock, engineer=engineer)
+        feature = pipeline.submit("adjust the spacing", actor=operator_actor())
+        assert feature.risk != "HIGH", "the request text alone should read as LOW"
+        pipeline.run(feature.id)
+
+        reloaded = pipeline.store.get(feature.id)
+        assert reloaded.risk == "HIGH"
+        assert reloaded.metadata.get("risk_reasons")
+
     def test_an_approval_bound_to_this_plan_lets_it_build(self, tmp_path, clock):
         now = {"t": 0.0}
         approvals = ApprovalStore(clock=lambda: now["t"], ttl_seconds=900)
@@ -981,6 +1007,190 @@ class TestReadyCleansUpItsWorktree:
         result = pipeline.run(feature.id)
         assert result.state is not FeatureState.READY
         assert workspace.removed == []
+
+
+class TestRecoverMissingPullRequest:
+    """A READY feature whose pull request never got opened — FEAT-00006's
+    exact shape — has to be able to get one without a person noticing and
+    intervening by hand."""
+
+    #: Matches FakeWorkspace.commit_sha, the same convention TestShip uses.
+    HEAD_SHA = "feedface" + "0" * 32
+
+    class FlakyGitHub:
+        """Fails create_pull_request until told not to, like the real bug did."""
+
+        def __init__(self):
+            self.calls: List[Dict[str, Any]] = []
+            self.fail = True
+            self.branch_sha = TestRecoverMissingPullRequest.HEAD_SHA
+
+        def create_pull_request(self, **kwargs):
+            self.calls.append(kwargs)
+            if self.fail:
+                raise RuntimeError("still broken")
+            return {"html_url": "https://github.com/a/b/pull/9", "number": 9}
+
+        def list_pull_requests(self, *, state="open"):
+            return []
+
+        def branch_head_sha(self, branch):
+            return self.branch_sha
+
+    class StubPreview:
+        def __init__(self, *, usable=True, reason=""):
+            self.usable = usable
+            self.reason = reason
+            self.calls: List[str] = []
+
+        def observe(self, *, commit_sha, branch=""):
+            self.calls.append(commit_sha)
+            return SimpleNamespace(usable=self.usable, reason=self.reason)
+
+    def _ready_without_a_pull_request(self, tmp_path, clock, *, workspace=None):
+        """Drive a real feature to READY through a shipper whose first (and,
+        during the run, only) attempt to open a pull request fails — exactly
+        the shape a stale create_pull_request contract left behind."""
+        github = self.FlakyGitHub()
+        shipper = FeatureShipper(
+            policy=FeatureShippingPolicy(merge_low_risk=True), github=github
+        )
+        pipeline = build_pipeline(tmp_path, clock, workspace=workspace)
+        pipeline.shipper = shipper
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert not result.pr_number
+        github.fail = False
+        github.calls.clear()  # the run above already made (and failed) one
+        return pipeline, result, github
+
+    def test_recovers_and_opens_the_pull_request(self, tmp_path, clock):
+        pipeline, feature, github = self._ready_without_a_pull_request(tmp_path, clock)
+        result = pipeline.recover_missing_pull_request(feature.id)
+        assert result.pr_number == 9
+        assert result.pr_url.endswith("/pull/9")
+
+    def test_is_idempotent_once_a_pull_request_exists(self, tmp_path, clock):
+        pipeline, feature, github = self._ready_without_a_pull_request(tmp_path, clock)
+        first = pipeline.recover_missing_pull_request(feature.id)
+        second = pipeline.recover_missing_pull_request(feature.id)
+        assert first.pr_number == second.pr_number == 9
+        assert len(github.calls) == 1
+
+    def test_refuses_when_the_feature_is_not_ready(self, tmp_path, clock):
+        pipeline = build_pipeline(tmp_path, clock)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.recover_missing_pull_request(feature.id)
+        assert result.state is FeatureState.RECEIVED
+        assert not result.pr_number
+
+    def test_refuses_high_risk(self, tmp_path, clock):
+        pipeline, feature, github = self._ready_without_a_pull_request(tmp_path, clock)
+        feature.risk = "HIGH"
+        pipeline.store.save(feature)
+        result = pipeline.recover_missing_pull_request(feature.id)
+        assert not result.pr_number
+        assert github.calls == []
+
+    def test_refuses_when_the_branch_has_moved(self, tmp_path, clock):
+        pipeline, feature, github = self._ready_without_a_pull_request(tmp_path, clock)
+        github.branch_sha = "somethingelse" + "0" * 19
+        result = pipeline.recover_missing_pull_request(feature.id)
+        assert not result.pr_number
+        assert github.calls == []
+
+    def test_refuses_when_acceptance_evidence_does_not_match_the_commit(
+        self, tmp_path, clock
+    ):
+        pipeline, feature, github = self._ready_without_a_pull_request(tmp_path, clock)
+        feature.metadata["verification"]["commit_sha"] = "stale123" + "0" * 24
+        pipeline.store.save(feature)
+        result = pipeline.recover_missing_pull_request(feature.id)
+        assert not result.pr_number
+        assert github.calls == []
+
+    def test_refuses_when_the_preview_is_no_longer_usable(self, tmp_path, clock):
+        pipeline, feature, github = self._ready_without_a_pull_request(tmp_path, clock)
+        pipeline.preview = self.StubPreview(usable=False, reason="preview expired")
+        result = pipeline.recover_missing_pull_request(feature.id)
+        assert not result.pr_number
+        assert github.calls == []
+
+    def test_a_missing_preview_configuration_does_not_block_recovery(
+        self, tmp_path, clock
+    ):
+        # Not every profile configures a preview observer; absence is not a
+        # refusal reason on its own — only an observed-and-unusable preview is.
+        pipeline, feature, github = self._ready_without_a_pull_request(tmp_path, clock)
+        pipeline.preview = None
+        result = pipeline.recover_missing_pull_request(feature.id)
+        assert result.pr_number == 9
+
+    def test_cleans_up_the_worktree_once_recovered(self, tmp_path, clock):
+        workspace = FakeWorkspace(tmp_path)
+        pipeline, feature, github = self._ready_without_a_pull_request(
+            tmp_path, clock, workspace=workspace
+        )
+        pipeline.recover_missing_pull_request(feature.id)
+        assert len(workspace.removed) == 1
+
+    def test_auto_ship_if_eligible_recovers_then_ships(self, tmp_path, clock):
+        # The wiring that actually matters for unattended operation: the same
+        # call every intake channel already makes after `run` self-heals a
+        # missing pull request before deciding whether to ship.
+        class FullyRecoverableGitHub(self.FlakyGitHub):
+            def __init__(self):
+                super().__init__()
+                self.merge_calls: List[Dict[str, Any]] = []
+
+            def get_pull_request(self, number):
+                return {
+                    "number": number,
+                    "head_sha": TestRecoverMissingPullRequest.HEAD_SHA,
+                    "base_sha": "base1234" + "0" * 32,
+                    "state": "open",
+                    "mergeable": True,
+                }
+
+            def combined_status(self, sha, *, required_contexts=()):
+                return {"state": "success", "contexts": [], "required": {}}
+
+            def can_write(self):
+                return True
+
+            def merge_pull_request(self, **kwargs):
+                self.merge_calls.append(kwargs)
+                return {"merged": True, "sha": "deadbeef" + "0" * 32}
+
+        github = FullyRecoverableGitHub()
+        shipper = FeatureShipper(
+            policy=FeatureShippingPolicy(merge_low_risk=True),
+            github=github,
+            authority=AuthorityPolicy(
+                grants={
+                    Channel.CONTROL_CENTER: frozenset(
+                        {Authority.PR_WRITE, Authority.PRODUCTION_CHANGE}
+                    )
+                }
+            ),
+        )
+        pipeline = build_pipeline(tmp_path, clock)
+        pipeline.shipper = shipper
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert not result.pr_number
+        github.fail = False
+        # This test is about the recovery -> ship wiring, not about risk
+        # classification (covered elsewhere) — force LOW so auto_ship's own
+        # risk gate does not mask what is being tested here.
+        result.risk = "LOW"
+        pipeline.store.save(result)
+
+        shipped = pipeline.auto_ship_if_eligible(feature.id)
+        assert shipped.pr_number == 9
+        assert github.merge_calls, "recovery must lead into the normal ship path"
 
 
 class TestShip:

@@ -520,6 +520,17 @@ class FeaturePipeline:
             )
             return feature
 
+        if not feature.pr_number:
+            # A feature can reach READY with no pull request — a shipping
+            # integration failure, a permission error, a transient outage —
+            # and `run()` never revisits READY to try again. Self-heal that
+            # one gap here, under the same three checks just re-asked above,
+            # rather than leaving every such feature stranded until someone
+            # notices and intervenes by hand.
+            feature = self.recover_missing_pull_request(feature_id)
+            if not feature.pr_number:
+                return feature
+
         return self.ship(feature_id)
 
     def advance(self, feature: FeatureRequest) -> StepResult:
@@ -673,20 +684,24 @@ class FeaturePipeline:
             return self._stop(feature, denial, kind="feature.authority_refused")
 
         if assessment.risk is Risk.HIGH and not self._approved_for(feature, contract):
-            feature.state = FeatureState.PLANNING
-            return StepResult(
-                feature,
-                progressed=False,
-                message=(
-                    "Sir, I need your approval before I build this, because "
-                    + (
-                        assessment.reasons[0]
-                        if assessment.reasons
-                        else "it is high risk"
-                    )
-                    + "."
-                ),
+            # Not `_transition`: PLANNING -> PLANNING is not a legal forward
+            # transition (see LEGAL_TRANSITIONS), and the state itself is not
+            # changing here — only the risk assessment and its reasons are.
+            # But `feature.risk` was already reassigned above (line ~650) as
+            # part of computing `assessment`, and without an explicit save
+            # here that escalation lived only in this call's memory: `jarvis
+            # wiz show` and Control Center kept reporting whatever risk the
+            # feature had *before* planning, and an approval request created
+            # against the true (HIGH) risk could not be redeemed against a
+            # feature record that still claimed a lower one.
+            message = (
+                "Sir, I need your approval before I build this, because "
+                + (assessment.reasons[0] if assessment.reasons else "it is high risk")
+                + "."
             )
+            self.store.save(feature)
+            self._record(feature, "feature.needs_approval", message)
+            return StepResult(feature, progressed=False, message=message)
 
         self._transition(
             feature, FeatureState.APPROVED_FOR_BUILD, f"risk {feature.risk}"
@@ -950,6 +965,111 @@ class FeaturePipeline:
         if result.get("created"):
             self._record(feature, "feature.pr_created", str(result.get("url", "")))
         return result
+
+    def recover_missing_pull_request(self, feature_id: str) -> FeatureRequest:
+        """Retry opening a pull request for a READY feature that never got one.
+
+        The gap ``run()`` cannot self-heal: :meth:`_open_pull_request` runs
+        exactly once, at the ``VERIFYING -> READY`` transition inside
+        :meth:`_finish`, and ``run()`` on an already-READY feature is
+        deliberately a no-op — see its own docstring. A feature that reached
+        READY while opening the pull request itself failed (a stale
+        integration, a permission error, a transient GitHub outage) had no
+        way back before this. This is that one missing step, run once
+        evidence proves it is still safe to — not a second ``run()``, and not
+        a bypass of anything ``ship()`` itself still checks fresh before
+        merging.
+
+        Idempotent: a feature that already has a pull request is returned
+        unchanged, so calling this by mistake, twice, or after a restart
+        never risks a duplicate. A refusal — wrong state, elevated risk,
+        evidence that has gone stale — leaves the feature exactly READY, the
+        same contract ``ship()``'s own refusals keep; nothing here fabricates
+        a state transition.
+        """
+        feature = self._load(feature_id)
+
+        if feature.state is not FeatureState.READY:
+            self._record(
+                feature,
+                "feature.pr_recovery_refused",
+                f"the feature is {feature.state.value}, not READY",
+            )
+            return feature
+
+        if feature.pr_number:
+            # Already has one — not a refusal, just nothing to recover.
+            return feature
+
+        if self.shipper is None:
+            self._record(
+                feature, "feature.pr_recovery_refused", "no shipper is configured"
+            )
+            return feature
+
+        if (feature.risk or "").strip().upper() == Risk.HIGH.value:
+            self._record(
+                feature,
+                "feature.pr_recovery_refused",
+                "risk is HIGH; recovery does not open pull requests unattended "
+                "for HIGH risk",
+            )
+            return feature
+
+        attempt = feature.attempts[-1] if feature.attempts else None
+        if attempt is None or not attempt.commit_sha:
+            self._record(
+                feature,
+                "feature.pr_recovery_refused",
+                "no verified commit is on record",
+            )
+            return feature
+
+        verification = feature.metadata.get("verification") or {}
+        if (
+            not verification.get("passed")
+            or verification.get("commit_sha") != attempt.commit_sha
+        ):
+            self._record(
+                feature,
+                "feature.pr_recovery_refused",
+                "the recorded acceptance evidence does not match the verified commit",
+            )
+            return feature
+
+        try:
+            current_head = self.shipper.github.branch_head_sha(feature.branch)
+        except Exception as exc:
+            self._record(
+                feature,
+                "feature.pr_recovery_refused",
+                f"could not read the branch: {exc}",
+            )
+            return feature
+        if not current_head or current_head[:12] != attempt.commit_sha[:12]:
+            self._record(
+                feature,
+                "feature.pr_recovery_refused",
+                "the branch has moved since verification; this is not a simple retry",
+            )
+            return feature
+
+        if self.preview is not None:
+            observation = self.preview.observe(
+                commit_sha=attempt.commit_sha, branch=feature.branch
+            )
+            if not observation.usable:
+                self._record(
+                    feature,
+                    "feature.pr_recovery_refused",
+                    observation.reason or "the preview is no longer usable",
+                )
+                return feature
+
+        pr = self._open_pull_request(feature)
+        if pr.get("created") or pr.get("reconciled"):
+            self._cleanup_worktree(feature)
+        return feature
 
     # -- the iterative loop -------------------------------------------------
 
