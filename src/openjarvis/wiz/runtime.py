@@ -439,6 +439,40 @@ def default_capabilities(
     ]
 
 
+def _feature_owner_notifier(config: Any, root: Path) -> Optional[Any]:
+    """Build the feature pipeline's owner notifier from live config, or None.
+
+    Reuses the exact channel construction ``jarvis wiz listen`` already uses
+    for the reliability side — same bot token, same allowlist, same
+    ``TelegramNotifier`` — rather than a second transport. ``None`` when
+    notifications are off or no Telegram credentials are configured, the
+    same "declared, not disowned" shape every optional collaborator here
+    takes: absence is silence, not an error.
+    """
+    rc = getattr(config, "reliability", None)
+    notify = getattr(rc, "notify", None)
+    if not getattr(notify, "enabled", False):
+        return None
+    telegram = getattr(getattr(config, "channel", None), "telegram", None)
+    bot_token = str(getattr(telegram, "bot_token", "") or "")
+    allowed_chat_ids = str(getattr(telegram, "allowed_chat_ids", "") or "")
+    if not bot_token or not allowed_chat_ids:
+        return None
+
+    from openjarvis.reliability.notify import TelegramNotifier
+    from openjarvis.wiz.features.notify import FeatureOwnerNotifier
+
+    chat_id = allowed_chat_ids.split(",")[0].strip()
+    transport = TelegramNotifier(
+        chat_id=chat_id, bot_token=bot_token, allowed_chat_ids=allowed_chat_ids
+    )
+    return FeatureOwnerNotifier(
+        send=lambda text: transport.send(text),
+        ledger_path=root / "feature_notify_ledger.json",
+        persona=bool(getattr(notify, "persona", True)),
+    )
+
+
 def build_wiz(
     *,
     home: Optional[Path] = None,
@@ -492,6 +526,10 @@ def build_wiz(
         postship = getattr(pipeline, "postship", None)
         if postship is not None and getattr(postship, "journal", None) is None:
             postship.journal = resolved_journal
+        if pipeline is not None and getattr(pipeline, "owner_notifier", None) is None:
+            notifier = _feature_owner_notifier(config, root)
+            if notifier is not None:
+                pipeline.owner_notifier = notifier
 
     # Declared whether or not the product side is assembled, and *unavailable*
     # when it is not.

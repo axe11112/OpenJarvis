@@ -138,6 +138,11 @@ class FeaturePipeline:
 
     queue: Any = None
     journal: Any = None
+
+    #: Tells the owner exactly two things — a feature shipped, or a feature
+    #: needs them — and stays silent about every step in between. See
+    #: :mod:`openjarvis.wiz.features.notify`.
+    owner_notifier: Any = None
     approvals: Optional[ApprovalStore] = None
     policy: Optional[AuthorityPolicy] = None
 
@@ -1289,25 +1294,35 @@ class FeaturePipeline:
         return feature
 
     def _record(self, feature: FeatureRequest, kind: str, reason: str) -> None:
-        if self.journal is None:
-            return
-        try:
-            self.journal.record(
-                at=self.clock(),
-                kind=kind,
-                capability="feature.build",
-                actor_id=feature.actor_id,
-                channel=feature.source,
-                reason=reason[:1000],
-                detail={
-                    "feature_id": feature.id,
-                    "state": feature.state.value,
-                    "risk": feature.risk,
-                    "attempts": feature.attempts_used,
-                },
-            )
-        except Exception:
-            logger.exception("could not journal a feature event")
+        if self.journal is not None:
+            try:
+                self.journal.record(
+                    at=self.clock(),
+                    kind=kind,
+                    capability="feature.build",
+                    actor_id=feature.actor_id,
+                    channel=feature.source,
+                    reason=reason[:1000],
+                    detail={
+                        "feature_id": feature.id,
+                        "state": feature.state.value,
+                        "risk": feature.risk,
+                        "attempts": feature.attempts_used,
+                    },
+                )
+            except Exception:
+                logger.exception("could not journal a feature event")
+
+        # Every event is journalled; the owner hears about almost none of
+        # them. FeatureOwnerNotifier.notify itself decides which `kind`s are
+        # an outcome worth a phone buzzing rather than a step — see its own
+        # module docstring — so this call is unconditional and cheap when
+        # nothing is configured to receive it.
+        if self.owner_notifier is not None:
+            try:
+                self.owner_notifier.notify(feature, kind=kind, reason=reason)
+            except Exception:
+                logger.exception("owner notification failed for %s", feature.id)
 
 
 # ---------------------------------------------------------------------------

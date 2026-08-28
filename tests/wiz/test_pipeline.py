@@ -19,6 +19,7 @@ from openjarvis.wiz.features.engineer import (
     EngineeringSession,
 )
 from openjarvis.wiz.features.model import FeatureState, Priority
+from openjarvis.wiz.features.notify import NEEDS_OWNER_KINDS
 from openjarvis.wiz.features.pipeline import FeaturePipeline
 from openjarvis.wiz.features.preview import PreviewObserver
 from openjarvis.wiz.features.profile import EngineeringProfile
@@ -955,6 +956,75 @@ class TestReadyOpensAPullRequestAndNothingMore:
 
         pipeline = build_pipeline(tmp_path, clock)
         pipeline.shipper = Broken()
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+
+
+class TestOwnerNotification:
+    """The pipeline's own half of FeatureOwnerNotifier's contract: it is
+    asked about every event, not just the ones that turn out to matter."""
+
+    class SpyNotifier:
+        def __init__(self):
+            self.calls = []
+
+        def notify(self, feature, *, kind, reason):
+            self.calls.append((feature.id, kind, reason))
+            return True
+
+    def test_a_ready_feature_with_no_shipper_is_not_notified(self, tmp_path, clock):
+        # No PR was opened, nothing shipped — nothing to say yet.
+        spy = self.SpyNotifier()
+        pipeline = build_pipeline(tmp_path, clock)
+        pipeline.owner_notifier = spy
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        kinds = [kind for _, kind, _ in spy.calls]
+        assert "feature.shipped" not in kinds
+
+    def test_a_stalled_feature_notifies_needs_a_person(self, tmp_path, clock):
+        spy = self.SpyNotifier()
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            suite_results=[FakeCheckResult(passed=False, summary="broken")],
+            max_attempts=1,
+        )
+        pipeline.owner_notifier = spy
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert any(kind in NEEDS_OWNER_KINDS for _, kind, _ in spy.calls)
+
+    def test_routine_progress_kinds_are_still_reported_to_the_notifier(
+        self, tmp_path, clock
+    ):
+        # The pipeline does not pre-filter — FeatureOwnerNotifier itself
+        # decides what is silence, so every kind must actually reach it.
+        spy = self.SpyNotifier()
+        pipeline = build_pipeline(tmp_path, clock)
+        pipeline.owner_notifier = spy
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        kinds = {kind for _, kind, _ in spy.calls}
+        assert "feature.received" in kinds
+        assert "feature.ready" in kinds
+
+    def test_no_notifier_configured_is_not_an_error(self, tmp_path, clock):
+        pipeline = build_pipeline(tmp_path, clock)
+        assert pipeline.owner_notifier is None
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+
+    def test_a_notifier_that_raises_does_not_break_the_pipeline(self, tmp_path, clock):
+        class Broken:
+            def notify(self, feature, *, kind, reason):
+                raise RuntimeError("telegram is down")
+
+        pipeline = build_pipeline(tmp_path, clock)
+        pipeline.owner_notifier = Broken()
         feature = pipeline.submit(REQUEST, actor=operator_actor())
         result = pipeline.run(feature.id)
         assert result.state is FeatureState.READY

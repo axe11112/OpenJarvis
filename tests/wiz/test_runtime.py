@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from openjarvis.wiz.authority import Actor, Authority, AuthorityPolicy, Channel
 from openjarvis.wiz.brain import Request
 from openjarvis.wiz.capabilities import Risk
 from openjarvis.wiz.journal import WizJournal
-from openjarvis.wiz.runtime import build_wiz, default_capabilities, operator
+from openjarvis.wiz.runtime import (
+    _feature_owner_notifier,
+    build_wiz,
+    default_capabilities,
+    operator,
+)
 
 
 class _FakeIncident:
@@ -228,3 +235,56 @@ class TestChannelsStillApply:
             ):
                 actor = Actor(actor_id="operator", channel=channel, authenticated=True)
                 assert not runtime.policy.decide(actor, authority).allowed
+
+
+def _config(
+    *, notify_enabled=True, bot_token="tok", allowed_chat_ids="123", persona=True
+):
+    return SimpleNamespace(
+        reliability=SimpleNamespace(
+            notify=SimpleNamespace(enabled=notify_enabled, persona=persona)
+        ),
+        channel=SimpleNamespace(
+            telegram=SimpleNamespace(
+                bot_token=bot_token, allowed_chat_ids=allowed_chat_ids
+            )
+        ),
+    )
+
+
+class TestFeatureOwnerNotifierAssembly:
+    """_feature_owner_notifier: absence is silence, not an error — the same
+    "declared, not disowned" shape every optional collaborator here takes."""
+
+    def test_notifications_disabled_gives_no_notifier(self, tmp_path):
+        config = _config(notify_enabled=False)
+        assert _feature_owner_notifier(config, tmp_path) is None
+
+    def test_no_bot_token_gives_no_notifier(self, tmp_path):
+        config = _config(bot_token="")
+        assert _feature_owner_notifier(config, tmp_path) is None
+
+    def test_no_allowed_chat_ids_gives_no_notifier(self, tmp_path):
+        config = _config(allowed_chat_ids="")
+        assert _feature_owner_notifier(config, tmp_path) is None
+
+    def test_no_config_at_all_gives_no_notifier(self, tmp_path):
+        assert _feature_owner_notifier(None, tmp_path) is None
+
+    def test_configured_telegram_produces_a_working_notifier(self, tmp_path):
+        config = _config()
+        notifier = _feature_owner_notifier(config, tmp_path)
+        assert notifier is not None
+        assert notifier.ledger_path == tmp_path / "feature_notify_ledger.json"
+
+    def test_build_wiz_wires_the_notifier_onto_the_pipeline(self, tmp_path):
+        pipeline = SimpleNamespace(journal=None, owner_notifier=None, postship=None)
+        product = SimpleNamespace(pipeline=pipeline, handlers=dict)
+        runtime = build_wiz(
+            home=tmp_path,
+            journal=WizJournal(tmp_path / "j.jsonl"),
+            product=product,
+            config=_config(),
+        )
+        assert runtime.product is product
+        assert pipeline.owner_notifier is not None
