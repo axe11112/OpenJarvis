@@ -600,6 +600,22 @@ class TestVoice:
         assert Authority.PRODUCTION_CHANGE not in CHANNEL_CEILING[Channel.VOICE]
         assert Authority.PR_WRITE not in CHANNEL_CEILING[Channel.VOICE]
 
+    def test_32b_a_low_confidence_utterance_is_never_dispatched(self):
+        # Live-verified this session against the real VoiceIntake and the
+        # real runtime: "uh" is refused before it ever reaches the
+        # dispatcher — min_words exists specifically because a laptop
+        # microphone mishears, and noise must never become a FeatureRequest.
+        from openjarvis.wiz.intake import VoiceIntake
+
+        class ExplodingWiz:
+            def handle(self, request):
+                raise AssertionError("a low-confidence utterance must never dispatch")
+
+        voice = VoiceIntake(wiz=ExplodingWiz())
+        result = voice.receive("uh", actor_id="owner")
+        assert not result.accepted
+        assert "did not catch" in result.reply.lower()
+
     def test_33_a_policy_cannot_escalate_voice_past_its_ceiling(self):
         policy = AuthorityPolicy(
             grants={Channel.VOICE: frozenset({Authority.PRODUCTION_CHANGE})}
