@@ -260,11 +260,21 @@ class TestFeatureOwnerNotifierAssembly:
         config = _config(notify_enabled=False)
         assert _feature_owner_notifier(config, tmp_path) is None
 
-    def test_no_bot_token_gives_no_notifier(self, tmp_path):
+    def test_no_bot_token_anywhere_gives_no_notifier(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
         config = _config(bot_token="")
         assert _feature_owner_notifier(config, tmp_path) is None
 
-    def test_no_allowed_chat_ids_gives_no_notifier(self, tmp_path):
+    def test_a_token_only_in_the_environment_is_still_used(self, tmp_path, monkeypatch):
+        # config.channel.telegram.bot_token is legitimately empty in the real
+        # deployment — the secret lives only in TELEGRAM_BOT_TOKEN, resolved
+        # by TelegramChannel itself — so the same fallback has to apply here.
+        monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "from-the-environment")
+        config = _config(bot_token="")
+        assert _feature_owner_notifier(config, tmp_path) is not None
+
+    def test_no_allowed_chat_ids_gives_no_notifier(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
         config = _config(allowed_chat_ids="")
         assert _feature_owner_notifier(config, tmp_path) is None
 

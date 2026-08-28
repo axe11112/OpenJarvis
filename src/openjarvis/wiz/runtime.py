@@ -20,6 +20,7 @@ confidently about a system it cannot see.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -454,7 +455,14 @@ def _feature_owner_notifier(config: Any, root: Path) -> Optional[Any]:
     if not getattr(notify, "enabled", False):
         return None
     telegram = getattr(getattr(config, "channel", None), "telegram", None)
-    bot_token = str(getattr(telegram, "bot_token", "") or "")
+    # TelegramChannel itself falls back to the TELEGRAM_BOT_TOKEN env var
+    # when no token is passed explicitly — the secret is meant to live only
+    # in the environment, never in config.toml — so the same fallback has to
+    # apply here, or this refuses to build a notifier in the one deployment
+    # shape (token in env, nothing in config) that is actually the normal one.
+    bot_token = str(getattr(telegram, "bot_token", "") or "") or os.environ.get(
+        "TELEGRAM_BOT_TOKEN", ""
+    )
     allowed_chat_ids = str(getattr(telegram, "allowed_chat_ids", "") or "")
     if not bot_token or not allowed_chat_ids:
         return None
