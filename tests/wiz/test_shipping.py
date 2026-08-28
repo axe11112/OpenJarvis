@@ -205,7 +205,7 @@ class TestContinuousIntegration:
                 merge_low_risk=True, required_status_contexts=("ci/build",)
             ),
             pull_request=open_pr(),
-            status={"contexts": {}},
+            status={"contexts": [], "required": {}},
         )
         assert not decision.allowed
         assert "ci/build is missing" in decision.explain()
@@ -217,7 +217,36 @@ class TestContinuousIntegration:
                 merge_low_risk=True, required_status_contexts=("ci/build",)
             ),
             pull_request=open_pr(),
-            status={"contexts": {"ci/build": "success"}},
+            status={"contexts": ["ci/build"], "required": {"ci/build": "success"}},
+        )
+        assert decision.allowed, decision.explain()
+
+    def test_matches_the_real_combined_status_shape(self):
+        # Regression for FEAT-00011: GitHubSource.combined_status's
+        # "contexts" is a flat list of context name strings, not a mapping —
+        # dict()'ing it directly raised
+        # "dictionary update sequence element #0 has length 6; 2 is required"
+        # the first time this ever ran against a real GitHub token. The
+        # per-context verdict this gate needs is under "required".
+        real_shaped_status = {
+            "state": "success",
+            "contexts": ["Vercel", "lint"],
+            "count": 2,
+            "missing_permissions": [],
+            "sha": VERIFIED_SHA,
+            "required_configured": True,
+            "statuses_api": "readable",
+            "checks_api": "readable",
+            "required": {"Vercel": "success"},
+            "missing_required": [],
+        }
+        decision = evaluate_shipping(
+            ready_feature(),
+            policy=FeatureShippingPolicy(
+                merge_low_risk=True, required_status_contexts=("Vercel",)
+            ),
+            pull_request=open_pr(),
+            status=real_shaped_status,
         )
         assert decision.allowed, decision.explain()
 

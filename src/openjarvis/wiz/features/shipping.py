@@ -309,7 +309,10 @@ def evaluate_shipping(
 
     # -- 4. CI agrees, on exactly those checks ----------------------------
     if policy.required_status_contexts:
-        answered = dict((status or {}).get("contexts") or {})
+        # GitHubSource.combined_status's "contexts" is a flat list of every
+        # context name observed, for diagnostics; the per-context verdict
+        # this gate needs is under "required" — see its docstring.
+        answered = dict((status or {}).get("required") or {})
         for context in policy.required_status_contexts:
             state = str(answered.get(context, "")).lower()
             gate(
