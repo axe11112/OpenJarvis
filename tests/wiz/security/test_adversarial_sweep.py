@@ -72,6 +72,22 @@ def open_pr(sha=VERIFIED_SHA, state="open", mergeable=True, base_sha="base0000")
     }
 
 
+def _no_op_handler(failure) -> str:
+    """A PostShipVerifier.handler that touches nothing.
+
+    PostShipVerifier._fail() always calls ``self.handler or
+    handoff_to_reliability`` — and that default opens the REAL, live
+    incident database at ~/.openjarvis/reliability/incidents.db, not a test
+    fixture. Every PostShipVerifier built in this file must pass this
+    explicitly; a test proving a failure path must never *also* be the
+    thing that writes a real incident. (Discovered live, the hard way: nine
+    real "Add a download button did not work in production" incidents
+    appeared in the operator's real Control Center from early drafts of
+    this exact file, one per test run that hit a failure path.)
+    """
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # 1-3: secrets
 # ---------------------------------------------------------------------------
@@ -160,20 +176,27 @@ class TestPreview:
         stale = PreviewObservation(
             matched=True, ready=False, state="BUILDING", reason="still building"
         )
-        verifier = PostShipVerifier(deployments=FakeDeployments(stale))
+        verifier = PostShipVerifier(
+            deployments=FakeDeployments(stale), handler=_no_op_handler
+        )
         result = verifier.verify(ready_feature(), merge_commit_sha=VERIFIED_SHA)
         assert not result.verified
         assert "still building" in result.reason or result.reason
 
     def test_6_no_preview_at_all_is_a_failure_not_a_pass(self):
         missing = PreviewObservation(matched=False, reason="no deployment found")
-        verifier = PostShipVerifier(deployments=FakeDeployments(missing))
+        verifier = PostShipVerifier(
+            deployments=FakeDeployments(missing), handler=_no_op_handler
+        )
         result = verifier.verify(ready_feature(), merge_commit_sha=VERIFIED_SHA)
         assert not result.verified
 
     def test_7_vercel_unavailable_is_a_failure_not_a_silent_pass(self):
         verifier = PostShipVerifier(
-            deployments=FakeDeployments(RuntimeError("Vercel: 503 Service Unavailable"))
+            deployments=FakeDeployments(
+                RuntimeError("Vercel: 503 Service Unavailable")
+            ),
+            handler=_no_op_handler,
         )
         result = verifier.verify(ready_feature(), merge_commit_sha=VERIFIED_SHA)
         assert not result.verified
@@ -387,7 +410,7 @@ class TestProductionVerification:
             ]
         )
         observer = PreviewObserver(vercel=vercel, timeout_seconds=0.0, poll_seconds=0.0)
-        verifier = PostShipVerifier(deployments=observer)
+        verifier = PostShipVerifier(deployments=observer, handler=_no_op_handler)
         result = verifier.verify(
             ready_feature(branch="wiz/feature/FEAT-00042"),
             merge_commit_sha=VERIFIED_SHA,
