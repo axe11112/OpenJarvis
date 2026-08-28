@@ -99,12 +99,13 @@ class TestDependencyDirection:
 
 
 #: The "Priority 1-10" pipeline, superseded by wiz/features/* and merged into
-#: this tree at 333d335 without being removed. Audited (overnight hardening
-#: session, Part 7/19): every reference to these eleven modules outside this
-#: set is either another module in the set, or that module's own test file.
-#: Nothing in assemble.py, runtime.py, product.py, the CLI or the server
-#: routes imports any of them. Kept rather than deleted pending real-Mac pilot
-#: proof; this test exists so that stays true rather than merely audited-once.
+#: this tree at 333d335 without being removed. An earlier session audited
+#: every reference to these eleven modules and found none outside the
+#: cluster itself, then kept them pending a real-Mac pilot proving the
+#: canonical wiz/features/* path end to end — see FEAT-00013. That proof is
+#: done, and the modules (and their dedicated test files) were deleted for
+#: it. This just keeps them from quietly reappearing — a well-meaning import
+#: while debugging, a merge resurrecting an old branch's change.
 DEAD_PRIORITY_N_MODULES = (
     "wiz_orchestrator",
     "feature_executor",
@@ -119,61 +120,26 @@ DEAD_PRIORITY_N_MODULES = (
     "production_verifier",
 )
 
-#: Every file that is allowed to import the dead stack: each other, and their
-#: own test files. Anything else importing them is exactly the regression
-#: this test exists to catch — a canonical module reaching back into code
-#: this session proved unreachable, resurrecting it by accident.
-_DEAD_STACK_PATHS = {WIZ / f"{name}.py" for name in DEAD_PRIORITY_N_MODULES}
-_DEAD_STACK_TEST_PATHS = {
-    Path(__file__).resolve().parent / f"test_{name}.py"
-    for name in DEAD_PRIORITY_N_MODULES
-}
-# feature_pilot_integration.py exercises several of the above together and
-# is part of the same dead cluster's test coverage, not the live suite's.
-_DEAD_STACK_TEST_PATHS.add(
-    Path(__file__).resolve().parent / "test_feature_pilot_integration.py"
-)
 
+class TestDeadPriorityNStackStaysDeleted:
+    def test_none_of_the_dead_modules_have_come_back(self):
+        present = [
+            name for name in DEAD_PRIORITY_N_MODULES if (WIZ / f"{name}.py").is_file()
+        ]
+        assert present == [], f"deleted dead-stack module(s) reappeared: {present}"
 
-class TestDeadPriorityNStackIsUnreachable:
-    def test_no_canonical_module_imports_the_dead_stack(self):
+    def test_nothing_imports_a_dead_module_by_name(self):
         offenders: List[Tuple[str, str]] = []
-        for path in sorted(SRC.rglob("*.py")):
-            if path in _DEAD_STACK_PATHS:
-                continue  # the dead stack may reference itself
-            for module in _imports(path):
-                tail = module.rsplit(".", 1)[-1]
-                if tail in DEAD_PRIORITY_N_MODULES and module.startswith(
-                    "openjarvis.wiz."
-                ):
-                    offenders.append((str(path.relative_to(SRC)), module))
+        for root in (SRC, Path(__file__).resolve().parent):
+            for path in sorted(root.rglob("*.py")):
+                for module in _imports(path):
+                    tail = module.rsplit(".", 1)[-1]
+                    if tail in DEAD_PRIORITY_N_MODULES and module.startswith(
+                        "openjarvis.wiz."
+                    ):
+                        offenders.append((str(path), module))
         assert offenders == [], (
-            "a canonical module imports the dead Priority 1-10 stack; found: "
+            "something imports a module deleted as part of the dead "
+            "Priority 1-10 stack; found: "
             + ", ".join(f"{where} imports {what}" for where, what in offenders)
-        )
-
-    def test_no_canonical_test_imports_the_dead_stack(self):
-        tests_root = Path(__file__).resolve().parent
-        offenders: List[Tuple[str, str]] = []
-        for path in sorted(tests_root.glob("test_*.py")):
-            if path in _DEAD_STACK_TEST_PATHS or path == Path(__file__).resolve():
-                continue
-            for module in _imports(path):
-                tail = module.rsplit(".", 1)[-1]
-                if tail in DEAD_PRIORITY_N_MODULES and module.startswith(
-                    "openjarvis.wiz."
-                ):
-                    offenders.append((str(path.relative_to(tests_root)), module))
-        assert offenders == [], (
-            "a canonical test imports the dead Priority 1-10 stack; found: "
-            + ", ".join(f"{where} imports {what}" for where, what in offenders)
-        )
-
-    def test_the_dead_stack_still_exists_at_the_paths_this_test_checks(self):
-        # Guards against this test silently passing because the files were
-        # renamed or already deleted out from under it.
-        missing = [str(p) for p in _DEAD_STACK_PATHS if not p.is_file()]
-        assert missing == [], (
-            "expected dead-stack module(s) not found — update "
-            "DEAD_PRIORITY_N_MODULES if they were removed: " + ", ".join(missing)
         )
