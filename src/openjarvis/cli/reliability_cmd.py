@@ -771,6 +771,7 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
     store = _get_store(config)
     owner_commands = None
     owner_door = None
+    telegram_channel = None
     try:
         monitor, supervisor = _build_supervised_monitor(config, store)
         if not monitor.checks:
