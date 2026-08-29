@@ -18,7 +18,8 @@ Constraints:
 
 from __future__ import annotations
 
+from openjarvis.wiz.browser.acceptance import BrowserAcceptanceResult
 from openjarvis.wiz.browser.capabilities import browser_capabilities
 from openjarvis.wiz.browser.verbs import BrowserVerbs
 
-__all__ = ["browser_capabilities", "BrowserVerbs"]
+__all__ = ["browser_capabilities", "BrowserVerbs", "BrowserAcceptanceResult"]
