@@ -787,7 +787,7 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
         )
 
         # Single Telegram channel for receiving (shared by reliability + Wiz)
-        from openjarvis.channels import TelegramChannel
+        from openjarvis.channels.telegram import TelegramChannel
 
         telegram_channel = None
         if (rc.notify.enabled and
