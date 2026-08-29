@@ -786,7 +786,7 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
             from openjarvis.wiz.runtime import build_wiz
 
             wiz_runtime = build_wiz(config=config)
-            door = build_owner_door(config, runtime=wiz_runtime, commands=None, outages=getattr(supervisor, "outages", None))
+            door = build_owner_door(config, runtime=wiz_runtime)
             if door is not None:
                 notifier = getattr(supervisor, "notifier", None)
                 if notifier is not None:
