@@ -806,8 +806,9 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
             try:
                 from openjarvis.wiz.owner_channel import TelegramOwnerDoor, build_owner_door
                 from openjarvis.wiz.runtime import build_wiz
+                from openjarvis.wiz.assemble import assemble
 
-                wiz_runtime = build_wiz(config=config)
+                wiz_runtime = build_wiz(config=config, product=assemble(config=config))
                 door = build_owner_door(config, runtime=wiz_runtime)
                 if door is not None:
                     owner_door = TelegramOwnerDoor(door=door, notifier=_DummyNotifier(telegram_channel))
