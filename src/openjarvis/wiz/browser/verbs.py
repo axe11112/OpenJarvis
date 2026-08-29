@@ -47,6 +47,10 @@ class BrowserVerbs:
     screenshot_dir: Optional[Path] = None
     max_screenshots: int = 10
 
+    def __post_init__(self):
+        self._console_messages: list[Dict[str, Any]] = []
+        self._network_failures: list[Dict[str, Any]] = []
+
     def handlers(self) -> Dict[str, Callable[[Request], Any]]:
         """Map capability names to handler functions."""
         return {
@@ -76,6 +80,15 @@ class BrowserVerbs:
             from openjarvis.tools.browser import _session
 
             page = _session.page
+
+            # Clear previous capture
+            self._console_messages.clear()
+            self._network_failures.clear()
+
+            # Attach event listeners for console and network
+            page.on("console", lambda msg: self._on_console(msg))
+            page.on("requestfailed", lambda request: self._on_request_failed(request))
+
             page.goto(url, wait_until="load")
             return {
                 "success": True,
@@ -192,23 +205,14 @@ class BrowserVerbs:
             return {"success": False, "error": f"Screenshot failed: {e}"}
 
     def read_console(self, request: Request) -> Dict[str, Any]:
-        """Read page console messages."""
+        """Read page console messages (errors, warnings)."""
         try:
-            from openjarvis.tools.browser import _session
-
-            page = _session.page
-            # Evaluate a script to collect console-accessible state
-            # (Note: we do NOT execute arbitrary JS from user input)
-            # This gets cached console messages if they exist
-            messages = []
-
-            # For now, return what we can observe from the page state
-            # Real implementation would require page event listeners
-            # which must be attached at navigation time
+            # Return captured console messages with secrets redacted
+            redacted = [self._redact_secrets(msg) for msg in self._console_messages]
             return {
                 "success": True,
-                "messages": messages,
-                "note": "Real console capture requires event listeners (future enhancement)",
+                "messages": redacted,
+                "count": len(redacted),
             }
         except Exception as e:
             logger.exception("failed to read console")
@@ -217,17 +221,12 @@ class BrowserVerbs:
     def read_network(self, request: Request) -> Dict[str, Any]:
         """Read failed network requests."""
         try:
-            from openjarvis.tools.browser import _session
-
-            page = _session.page
-            # Network capture requires listeners attached at page creation
-            # This is currently a placeholder pending full implementation
-            failures = []
-
+            # Return captured network failures with secrets redacted
+            redacted = [self._redact_secrets(failure) for failure in self._network_failures]
             return {
                 "success": True,
-                "failures": failures,
-                "note": "Real network capture requires event listeners (future enhancement)",
+                "failures": redacted,
+                "count": len(redacted),
             }
         except Exception as e:
             logger.exception("failed to read network")
@@ -316,3 +315,73 @@ class BrowserVerbs:
             return {"success": True, "assertion": "text"}
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    # -- event listeners --
+
+    def _on_console(self, msg: Any) -> None:
+        """Handle console message event."""
+        try:
+            msg_type = getattr(msg, "type", "log")
+            text = getattr(msg, "text", "")
+            if msg_type in ("error", "warning"):
+                self._console_messages.append({
+                    "type": msg_type,
+                    "text": text,
+                })
+        except Exception as e:
+            logger.exception("error handling console message")
+
+    def _on_request_failed(self, request: Any) -> None:
+        """Handle failed request event."""
+        try:
+            url = getattr(request, "url", "")
+            method = getattr(request, "method", "")
+            failure = getattr(request, "failure", {})
+            error_text = str(failure) if failure else "unknown"
+
+            self._network_failures.append({
+                "url": url,
+                "method": method,
+                "error": error_text,
+            })
+        except Exception as e:
+            logger.exception("error handling failed request")
+
+    @staticmethod
+    def _redact_secrets(data: Any) -> Any:
+        """Redact known secrets from captured data."""
+        import re
+
+        if isinstance(data, dict):
+            redacted = {}
+            secret_patterns = {
+                "authorization": re.compile(r"Bearer\s+\S+", re.IGNORECASE),
+                "token": re.compile(r"token[=:]\s*\S+", re.IGNORECASE),
+                "password": re.compile(r"password[=:]\s*\S+", re.IGNORECASE),
+                "secret": re.compile(r"secret[=:]\s*\S+", re.IGNORECASE),
+                "api.key": re.compile(r"api[_-]?key[=:]\s*\S+", re.IGNORECASE),
+                "vercel.bypass": re.compile(r"x-deployment-bypass-secret\s*:\s*\S+", re.IGNORECASE),
+            }
+            for key, value in data.items():
+                if isinstance(value, str):
+                    redacted_value = value
+                    for pattern in secret_patterns.values():
+                        redacted_value = pattern.sub("[REDACTED]", redacted_value)
+                    redacted[key] = redacted_value
+                else:
+                    redacted[key] = BrowserVerbs._redact_secrets(value)
+            return redacted
+        elif isinstance(data, (list, tuple)):
+            return [BrowserVerbs._redact_secrets(item) for item in data]
+        elif isinstance(data, str):
+            redacted = data
+            secret_patterns = {
+                "authorization": re.compile(r"Bearer\s+\S+", re.IGNORECASE),
+                "token": re.compile(r"token[=:]\s*\S+", re.IGNORECASE),
+                "password": re.compile(r"password[=:]\s*\S+", re.IGNORECASE),
+                "secret": re.compile(r"secret[=:]\s*\S+", re.IGNORECASE),
+            }
+            for pattern in secret_patterns.values():
+                redacted = pattern.sub("[REDACTED]", redacted)
+            return redacted
+        return data
