@@ -786,9 +786,8 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
             from openjarvis.wiz.runtime import build_wiz
 
             wiz_runtime = build_wiz(config=config)
-            door = build_owner_door(config, runtime=wiz_runtime, commands=None, outages=supervisor.outages if supervisor else None)
+            door = build_owner_door(config, runtime=wiz_runtime, commands=None, outages=getattr(supervisor, "outages", None))
             if door is not None:
-                from openjarvis.reliability.sources.vercel import VercelSource
                 notifier = getattr(supervisor, "notifier", None)
                 if notifier is not None:
                     owner_door = TelegramOwnerDoor(door=door, notifier=notifier)
@@ -797,8 +796,8 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
                             "Listening for owner on Telegram "
                             "(both 'Fix it' and feature requests are understood)."
                         )
-        except ImportError:
-            pass  # Wiz not available
+        except (ImportError, AttributeError, Exception) as exc:
+            logger.debug("Could not start TelegramOwnerDoor: %s", exc)
 
         # Fall back to reliability-only if owner door wasn't started
         if owner_door is None:
