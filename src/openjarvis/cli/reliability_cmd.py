@@ -764,6 +764,7 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
 
     store = _get_store(config)
     owner_commands = None
+    owner_door = None
     try:
         monitor, supervisor = _build_supervised_monitor(config, store)
         if not monitor.checks:
@@ -778,12 +779,35 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
             f"({len(monitor.checks)} check(s))."
         )
 
-        owner_commands = _build_owner_commands(config, store, supervisor)
-        if owner_commands is not None and owner_commands.start():
-            console.print(
-                "Listening for owner replies on Telegram "
-                '(only "Fix it" and a status question are understood).'
-            )
+        # Try to use TelegramOwnerDoor if Wiz is available (handles both Wiz and reliability)
+        # Otherwise fall back to OwnerCommandListener (reliability only)
+        try:
+            from openjarvis.wiz.owner_channel import TelegramOwnerDoor, build_owner_door
+            from openjarvis.wiz.runtime import build_wiz
+
+            wiz_runtime = build_wiz(config=config)
+            door = build_owner_door(config, runtime=wiz_runtime, commands=None, outages=supervisor.outages if supervisor else None)
+            if door is not None:
+                from openjarvis.reliability.sources.vercel import VercelSource
+                notifier = getattr(supervisor, "notifier", None)
+                if notifier is not None:
+                    owner_door = TelegramOwnerDoor(door=door, notifier=notifier)
+                    if owner_door.start():
+                        console.print(
+                            "Listening for owner on Telegram "
+                            "(both 'Fix it' and feature requests are understood)."
+                        )
+        except ImportError:
+            pass  # Wiz not available
+
+        # Fall back to reliability-only if owner door wasn't started
+        if owner_door is None:
+            owner_commands = _build_owner_commands(config, store, supervisor)
+            if owner_commands is not None and owner_commands.start():
+                console.print(
+                    "Listening for owner replies on Telegram "
+                    '(only "Fix it" and a status question are understood).'
+                )
 
         # Crash recovery: park anything that was mid-repair when we last
         # stopped. Nothing is resumed automatically.
@@ -814,7 +838,9 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
             f"repairs deferred: {stats['repairs_deferred']}"
         )
     finally:
-        if owner_commands is not None:
+        if owner_door is not None:
+            owner_door.stop()
+        elif owner_commands is not None:
             owner_commands.stop()
         store.close()
 
