@@ -295,6 +295,22 @@ class OwnerDoor:
         capability = str(getattr(result, "capability", "") or "")
         reply = str(getattr(result, "reply", "") or "").strip()
 
+        # Auto-build after recording: feature.request on Telegram should seamlessly
+        # start execution (feature.build) so the owner gets smooth UX from one message
+        if (capability == "feature.request"
+            and getattr(result, "accepted", False)
+            and getattr(result, "feature_id", "")):
+            feature_id = str(result.feature_id)
+            build_result = self._auto_build_feature(feature_id, sender, chat_id)
+            if build_result.get("started", False):
+                # Auto-build succeeded; update response
+                capability = "feature.request+build"
+                reply = f"{reply} Starting work now."
+            else:
+                # Auto-build failed; include reason in reply
+                detail = build_result.get("detail", "could not start building")
+                reply = f"{reply} {detail}"
+
         if not reply and getattr(result, "accepted", False):
             # A read verb answered with facts and no words. The intake only
             # forwards a handler's own sentence, and the read verbs deliberately
@@ -316,6 +332,48 @@ class OwnerDoor:
             handled=bool(getattr(result, "accepted", False)),
             authorized=True,
         )
+
+    def _auto_build_feature(self, feature_id: str, sender: str, chat_id: Any) -> Dict[str, Any]:
+        """Automatically start building a just-recorded feature.
+
+        Called after feature.request succeeds to seamlessly transition to execution.
+        Uses the same authority path as explicit feature.build calls.
+        """
+        if self.intake is None or not hasattr(self.intake, "wiz"):
+            return {"started": False, "detail": "build system not configured"}
+
+        try:
+            from openjarvis.wiz.brain import Request
+            from openjarvis.wiz.authority import Channel
+            from openjarvis.wiz.authority import Actor
+
+            # Build request using same authority as the feature.request
+            actor = Actor(
+                actor_id=str(sender or chat_id),
+                channel=Channel.TELEGRAM,
+                authenticated=True,
+            )
+            request = Request(
+                text=f"build {feature_id}",
+                actor=actor,
+                arguments={"feature_id": feature_id},
+            )
+
+            outcome = self.intake.wiz.handle(request)
+            if not outcome.handled:
+                return {
+                    "started": False,
+                    "detail": str(outcome.message or "not authorized to build"),
+                }
+
+            result = outcome.result if isinstance(outcome.result, dict) else {}
+            return {
+                "started": bool(result.get("started", False)),
+                "detail": str(result.get("say", "")),
+            }
+        except Exception as exc:
+            logger.exception("auto-build failed for %s", feature_id)
+            return {"started": False, "detail": str(exc)}
 
     def _say(self, text: str) -> str:
         return f"Sir, {text}" if self.persona else text[:1].upper() + text[1:]
