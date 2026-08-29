@@ -57,8 +57,12 @@ _INJECTION_SHAPED = re.compile(
     r"\b(ignore (your|all|previous|prior)|disregard (the|your)|"
     r"you are now|developer mode|system prompt|new instructions|"
     r"forget (your|everything)|override|jailbreak|"
-    r"run the following|execute|sudo|rm -rf|curl |wget |bash -c|"
-    r"reveal|print (the|your) (token|secret|key)|api[ _-]?key)\b",
+    r"run the following|execute|sudo|rm -rf|curl |wget |bash -c|open a shell|"
+    r"reveal|print (the|your) (token|secret|key)|api[ _-]?key|"
+    r"merge (my|this|that|the|it)|push (directly )?to main|"
+    r"disable (the )?emergency stop|production admin|"
+    r"deploy (it |this |that )?yourself|grant (this|me) (\w+\s+)?"
+    r"(production_change|pr_write|secret_access))\b",
     re.IGNORECASE,
 )
 

@@ -48,13 +48,83 @@ this file can let a chat message merge a pull request or change production.
 
 from __future__ import annotations
 
+import json
 import logging
+import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["OwnerDoor", "OwnerReply", "TelegramOwnerDoor"]
+__all__ = ["OwnerDoor", "OwnerReply", "SeenMessages", "TelegramOwnerDoor"]
+
+
+@dataclass
+class SeenMessages:
+    """Which (chat id, message id) pairs have already been handled.
+
+    Telegram may redeliver an update — a dropped connection, a retried
+    webhook — and a message id is stable and per-chat, so keying on the pair
+    is exact rather than a text-similarity heuristic (which would also wrongly
+    collapse two genuinely separate messages that happen to say the same
+    thing). Persisted to disk when a path is given, so a redelivery that
+    lands after a watcher restart is still recognised — in-memory-only
+    otherwise, which still protects against redelivery within one process's
+    lifetime.
+    """
+
+    path: Optional[Path] = None
+    _seen: Set[Tuple[str, str]] = field(default_factory=set, repr=False)
+    _loaded: bool = field(default=False, repr=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def already_handled(self, chat_id: Any, message_id: Any) -> bool:
+        """Whether this exact message was already handled.
+
+        A missing message id (an older channel, a message the transport
+        does not give one to) can never be judged a duplicate — treating
+        "unknown" as "duplicate" would silently drop real messages.
+        """
+        mid = str(message_id or "")
+        if not mid:
+            return False
+        with self._lock:
+            self._ensure_loaded()
+            return (str(chat_id), mid) in self._seen
+
+    def record(self, chat_id: Any, message_id: Any) -> None:
+        mid = str(message_id or "")
+        if not mid:
+            return
+        with self._lock:
+            self._ensure_loaded()
+            self._seen.add((str(chat_id), mid))
+            self._save()
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        if self.path is None:
+            return
+        try:
+            data = json.loads(self.path.read_text())
+        except FileNotFoundError:
+            return
+        except (json.JSONDecodeError, OSError):
+            logger.exception("could not read the seen-messages ledger")
+            return
+        self._seen = {(str(pair[0]), str(pair[1])) for pair in data}
+
+    def _save(self) -> None:
+        if self.path is None:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(sorted(self._seen)))
+        except OSError:
+            logger.exception("could not persist the seen-messages ledger")
 
 
 @dataclass(frozen=True)
@@ -101,6 +171,12 @@ class OwnerDoor:
     outages:
         The outage registry, consulted for the one question that decides
         whether "fix it" means the reliability half: is anything failing?
+    seen:
+        :class:`SeenMessages`. A redelivered update — Telegram's own retry,
+        not a second thing the owner typed — must not create a second
+        FeatureRequest. Defaults to an in-memory-only instance, which still
+        protects within one process's lifetime; give it a path to also
+        survive a restart.
     """
 
     commands: Any = None
@@ -108,11 +184,16 @@ class OwnerDoor:
     allowed_chat_ids: Any = ""
     outages: Any = None
     persona: bool = True
+    seen: "SeenMessages" = field(default_factory=lambda: SeenMessages())
 
-    def receive(self, *, chat_id: Any, text: str, sender: str = "") -> OwnerReply:
+    def receive(
+        self, *, chat_id: Any, text: str, sender: str = "", message_id: Any = ""
+    ) -> OwnerReply:
         """Handle one inbound message. Never raises."""
         try:
-            return self._receive(chat_id=chat_id, text=text, sender=sender)
+            return self._receive(
+                chat_id=chat_id, text=text, sender=sender, message_id=message_id
+            )
         except Exception:  # noqa: BLE001 - an inbound message must not be able
             logger.exception("owner message handling failed")  # ...to stop Wiz.
             return OwnerReply(
@@ -122,7 +203,9 @@ class OwnerDoor:
 
     # -- routing -----------------------------------------------------------
 
-    def _receive(self, *, chat_id: Any, text: str, sender: str) -> OwnerReply:
+    def _receive(
+        self, *, chat_id: Any, text: str, sender: str, message_id: Any = ""
+    ) -> OwnerReply:
         from openjarvis.reliability.owner_commands import authorized_chat
 
         if not authorized_chat(chat_id, self.allowed_chat_ids):
@@ -135,6 +218,18 @@ class OwnerDoor:
         message = str(text or "").strip()
         if not message:
             return OwnerReply(route="", authorized=True)
+
+        if self.seen.already_handled(chat_id, message_id):
+            # A redelivery of something already acted on. Silent — the owner
+            # already got their answer the first time, and answering twice
+            # is indistinguishable from Wiz not remembering what it did.
+            logger.info(
+                "ignored a redelivered message (chat=%s, message_id=%s)",
+                (str(chat_id)[:8] + "…") if chat_id else "<empty>",
+                message_id,
+            )
+            return OwnerReply(route="duplicate", authorized=True)
+        self.seen.record(chat_id, message_id)
 
         if self._is_live_reliability_instruction(message):
             return self._reliability(chat_id=chat_id, text=message)
@@ -297,6 +392,7 @@ class TelegramOwnerDoor:
             chat_id=chat_id,
             text=getattr(message, "content", ""),
             sender=str(getattr(message, "sender", "") or ""),
+            message_id=str(getattr(message, "message_id", "") or ""),
         )
         if not reply.text:
             return
@@ -348,10 +444,15 @@ def build_owner_door(
             journal=getattr(runtime, "journal", None),
         )
 
+    from openjarvis.wiz.runtime import wiz_home
+
     return OwnerDoor(
         commands=commands,
         intake=intake,
         allowed_chat_ids=allowed_chat_ids,
         outages=outages,
         persona=bool(getattr(notify, "persona", True)),
+        # On disk, not just in memory: a redelivery that lands after the
+        # watcher restarts must still be recognised as the same message.
+        seen=SeenMessages(path=wiz_home() / "telegram_seen.json"),
     )
