@@ -34,6 +34,12 @@ _STATE_STYLE = {
 }
 
 
+class _DummyNotifier:
+    """Bridge TelegramChannel to TelegramOwnerDoor.channel expectation."""
+    def __init__(self, channel):
+        self.channel = channel
+
+
 def _load_config() -> Any:
     """Load the user config (imported lazily to keep CLI startup fast)."""
     from openjarvis.core.config import load_config
@@ -779,35 +785,54 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
             f"({len(monitor.checks)} check(s))."
         )
 
-        # Try to use TelegramOwnerDoor if Wiz is available (handles both Wiz and reliability)
-        # Otherwise fall back to OwnerCommandListener (reliability only)
-        try:
-            from openjarvis.wiz.owner_channel import TelegramOwnerDoor, build_owner_door
-            from openjarvis.wiz.runtime import build_wiz
+        # Single Telegram channel for receiving (shared by reliability + Wiz)
+        from openjarvis.channels import TelegramChannel
 
-            wiz_runtime = build_wiz(config=config)
-            door = build_owner_door(config, runtime=wiz_runtime)
-            if door is not None:
-                notifier = getattr(supervisor, "notifier", None)
-                if notifier is not None:
-                    owner_door = TelegramOwnerDoor(door=door, notifier=notifier)
+        telegram_channel = None
+        if (rc.notify.enabled and
+            getattr(rc.notify, "accept_owner_commands", False) and
+            rc.notify.channel == "telegram"):
+
+            telegram_channel = TelegramChannel(
+                bot_token=config.channel.telegram.bot_token,
+                allowed_chat_ids=config.channel.telegram.allowed_chat_ids,
+            )
+            telegram_channel.connect()
+
+        # Wiz owner door (if Wiz available and channel ready)
+        owner_door = None
+        if telegram_channel is not None:
+            try:
+                from openjarvis.wiz.owner_channel import TelegramOwnerDoor, build_owner_door
+                from openjarvis.wiz.runtime import build_wiz
+
+                wiz_runtime = build_wiz(config=config)
+                door = build_owner_door(config, runtime=wiz_runtime)
+                if door is not None:
+                    owner_door = TelegramOwnerDoor(door=door, notifier=_DummyNotifier(telegram_channel))
                     if owner_door.start():
                         console.print(
                             "Listening for owner on Telegram "
-                            "(both 'Fix it' and feature requests are understood)."
+                            "(both 'Fix it' and feature requests understood)."
                         )
-        except (ImportError, AttributeError, Exception) as exc:
-            logger.warning("Could not start TelegramOwnerDoor: %s: %s", type(exc).__name__, exc)
-            logger.debug("Full traceback:", exc_info=True)
+                    else:
+                        owner_door = None
+            except (ImportError, Exception) as exc:
+                logger.warning("Could not start TelegramOwnerDoor: %s", exc)
 
-        # Fall back to reliability-only if owner door wasn't started
-        if owner_door is None:
+        # Reliability owner commands on same channel (if Wiz didn't start)
+        if owner_door is None and telegram_channel is not None:
             owner_commands = _build_owner_commands(config, store, supervisor)
-            if owner_commands is not None and owner_commands.start():
+            if owner_commands is not None:
+                telegram_channel.on_message(owner_commands._on_message)
                 console.print(
                     "Listening for owner replies on Telegram "
-                    '(only "Fix it" and a status question are understood).'
+                    '(only "Fix it" and a status question understood).'
                 )
+            else:
+                telegram_channel = None  # No listener registered
+        else:
+            owner_commands = None
 
         # Crash recovery: park anything that was mid-repair when we last
         # stopped. Nothing is resumed automatically.
@@ -838,10 +863,8 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
             f"repairs deferred: {stats['repairs_deferred']}"
         )
     finally:
-        if owner_door is not None:
-            owner_door.stop()
-        elif owner_commands is not None:
-            owner_commands.stop()
+        if telegram_channel is not None:
+            telegram_channel.disconnect()
         store.close()
 
 
