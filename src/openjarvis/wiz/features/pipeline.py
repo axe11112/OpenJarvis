@@ -901,10 +901,20 @@ class FeaturePipeline:
                 kind="feature.no_verifier",
             )
 
+        # Exact SHA gate: fail closed if Preview doesn't match expected commit
+        sha_gate_result = self._verify_preview_sha(feature, attempt)
+        if sha_gate_result is not None:
+            return sha_gate_result
+
+        # Get deployment_id from preview observation
+        preview_obs = attempt.verification.get("preview") or {}
+        deployment_id = preview_obs.get("deployment_id") or ""
+
         verification = self.verifier.verify(
             contract,
             preview_url=feature.preview_url,
             commit_sha=attempt.commit_sha,
+            deployment_id=deployment_id,
             attempt=attempt.number,
             gate_outcomes=self._gate_outcomes(attempt),
         )
@@ -1242,6 +1252,48 @@ class FeaturePipeline:
         if not proposed:
             return ()
         return criteria_from_mapping(proposed)
+
+    def _verify_preview_sha(
+        self, feature: FeatureRequest, attempt: FeatureAttempt
+    ) -> Optional[StepResult]:
+        """Exact SHA gate: fail closed if Preview SHA != expected SHA.
+
+        Returns None if SHA matches (proceed with verification).
+        Returns StepResult with failure if SHA mismatch or missing (stop).
+        """
+        expected_sha = attempt.commit_sha or ""
+        if not expected_sha:
+            return self._retry_or_stop(
+                feature,
+                attempt,
+                "No commit SHA recorded for verification; cannot gate browser acceptance.",
+            )
+
+        # Get the deployment SHA from preview observation
+        preview_obs = attempt.verification.get("preview") or {}
+        actual_sha = preview_obs.get("commit_sha") or ""
+
+        if not actual_sha:
+            return self._retry_or_stop(
+                feature,
+                attempt,
+                "Preview deployment Git SHA is not available; cannot verify against feature commit.",
+            )
+
+        # Exact SHA match required
+        expected_short = expected_sha[:12]
+        actual_short = actual_sha[:12]
+
+        if expected_sha != actual_sha:
+            message = (
+                f"Exact SHA mismatch: expected {expected_short}, "
+                f"but Preview deployed {actual_short}. "
+                "This prevents browser acceptance against unverified code."
+            )
+            return self._retry_or_stop(feature, attempt, message)
+
+        # SHA matches — proceed
+        return None
 
     @staticmethod
     def _gate_outcomes(attempt: FeatureAttempt) -> List[CriterionOutcome]:

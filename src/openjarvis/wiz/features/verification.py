@@ -90,6 +90,7 @@ class FeatureVerification:
     feature_id: str
     preview_url: str = ""
     commit_sha: str = ""
+    deployment_id: str = ""
 
     outcomes: List[CriterionOutcome] = field(default_factory=list)
     probe_results: List[ProbeResult] = field(default_factory=list)
@@ -98,6 +99,10 @@ class FeatureVerification:
     #: attached to the pull request.
     screenshots: Dict[str, List[str]] = field(default_factory=dict)
     traces: List[str] = field(default_factory=list)
+
+    #: Browser acceptance results, bound to exact feature SHA and deployment.
+    #: Format: {criterion_name: {sha, deployment_id, passed, evidence}}
+    browser_acceptance: Dict[str, Any] = field(default_factory=dict)
 
     #: Criteria that need a person. Never counted as passed.
     awaiting_a_person: List[str] = field(default_factory=list)
@@ -216,12 +221,14 @@ class FeatureVerification:
             "feature_id": self.feature_id,
             "preview_url": self.preview_url,
             "commit_sha": self.commit_sha,
+            "deployment_id": self.deployment_id,
             "passed": self.passed,
             "complete": self.complete,
             "summary": self.summary(),
             "outcomes": [o.to_dict() for o in self.outcomes],
             "screenshots": {k: list(v) for k, v in self.screenshots.items()},
             "traces": list(self.traces),
+            "browser_acceptance": dict(self.browser_acceptance),
             "awaiting_a_person": list(self.awaiting_a_person),
             "registered_probes": list(self.registered_probes),
             "error": self.error,
@@ -253,6 +260,7 @@ class FeatureVerifier:
         *,
         preview_url: str,
         commit_sha: str = "",
+        deployment_id: str = "",
         attempt: int = 1,
         gate_outcomes: Sequence[CriterionOutcome] = (),
     ) -> FeatureVerification:
@@ -267,6 +275,7 @@ class FeatureVerifier:
             feature_id=contract.feature_id,
             preview_url=preview_url,
             commit_sha=commit_sha,
+            deployment_id=deployment_id,
         )
 
         if not preview_url:
