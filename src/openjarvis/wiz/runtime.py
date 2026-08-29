@@ -183,12 +183,14 @@ class WizRuntime:
         ledger: Any = None,
         voice_probe: Optional[Callable[[], Any]] = None,
         scheduler: Any = None,
+        browser_verbs: Any = None,
     ) -> None:
         self.policy = policy
         self.registry = registry
         self.journal = journal
         self.config = config
         self.product = product
+        self.browser_verbs = browser_verbs
         self._store_factory = store_factory
         # Every one of these is optional, and is used only by ``wiz.health``
         # (§8 — Wiz's own health, kept apart from the product's). ``None`` is
@@ -232,6 +234,12 @@ class WizRuntime:
             # that a machine without it says "not built here" rather than
             # declaring a verb with no handler behind it.
             handlers.update(self.product.handlers())
+        if self.browser_verbs is not None:
+            # Browser capabilities are registered when configured, following
+            # the same principle: a machine without Playwright says "not
+            # configured here" rather than declaring capabilities with no
+            # handlers.
+            handlers.update(self.browser_verbs.handlers())
         return handlers
 
     # -- handlers ----------------------------------------------------------
@@ -520,10 +528,14 @@ def build_wiz(
             return IncidentStore(path)
 
     from openjarvis.wiz.product import product_capabilities
+    from openjarvis.wiz.browser import browser_capabilities
 
     specs = default_capabilities(
         config, incident_probe=incident_probe_for(store_factory)
     )
+    # Add browser capabilities (safe read-only interaction with real Preview/production)
+    specs.extend(browser_capabilities())
+
     if product is not None:
         # One journal for the whole assistant. A feature pipeline writing to a
         # second, unchained file would give the audit trail a hole exactly where
@@ -558,6 +570,24 @@ def build_wiz(
         )
     )
 
+    # Build browser capability handler
+    from openjarvis.wiz.browser import BrowserVerbs
+    from openjarvis.wiz.browser.url_safety import URLValidator
+
+    browser_base_url = getattr(
+        getattr(config, "reliability", None), "site", None
+    )
+    browser_base_url = getattr(browser_base_url, "base_url", "")
+    browser_verbs = None
+    if browser_base_url:
+        # Only create browser verbs if production URL is configured
+        screenshot_dir = wiz_home() / "browser" / "screenshots"
+        browser_verbs = BrowserVerbs(
+            validator=URLValidator(production_base_url=browser_base_url or ""),
+            screenshot_dir=screenshot_dir,
+            max_screenshots=10,
+        )
+
     return WizRuntime(
         policy=resolved_policy,
         registry=CapabilityRegistry(specs),
@@ -569,6 +599,7 @@ def build_wiz(
         ledger=ledger,
         voice_probe=voice_probe,
         scheduler=scheduler,
+        browser_verbs=browser_verbs,
     )
 
 

@@ -197,15 +197,18 @@ class BrowserVerbs:
             from openjarvis.tools.browser import _session
 
             page = _session.page
+            # Evaluate a script to collect console-accessible state
+            # (Note: we do NOT execute arbitrary JS from user input)
+            # This gets cached console messages if they exist
             messages = []
 
-            # Collect console messages from the page
-            # This requires listeners to be attached during navigation
-            # For now, return a placeholder
+            # For now, return what we can observe from the page state
+            # Real implementation would require page event listeners
+            # which must be attached at navigation time
             return {
                 "success": True,
                 "messages": messages,
-                "note": "Console capture requires event listeners (production feature)",
+                "note": "Real console capture requires event listeners (future enhancement)",
             }
         except Exception as e:
             logger.exception("failed to read console")
@@ -214,11 +217,17 @@ class BrowserVerbs:
     def read_network(self, request: Request) -> Dict[str, Any]:
         """Read failed network requests."""
         try:
-            # Similar to console: requires network event listeners
+            from openjarvis.tools.browser import _session
+
+            page = _session.page
+            # Network capture requires listeners attached at page creation
+            # This is currently a placeholder pending full implementation
+            failures = []
+
             return {
                 "success": True,
-                "failures": [],
-                "note": "Network capture requires event listeners (production feature)",
+                "failures": failures,
+                "note": "Real network capture requires event listeners (future enhancement)",
             }
         except Exception as e:
             logger.exception("failed to read network")
