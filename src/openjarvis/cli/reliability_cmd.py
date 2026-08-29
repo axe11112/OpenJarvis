@@ -797,7 +797,8 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
                             "(both 'Fix it' and feature requests are understood)."
                         )
         except (ImportError, AttributeError, Exception) as exc:
-            logger.debug("Could not start TelegramOwnerDoor: %s", exc)
+            logger.warning("Could not start TelegramOwnerDoor: %s: %s", type(exc).__name__, exc)
+            logger.debug("Full traceback:", exc_info=True)
 
         # Fall back to reliability-only if owner door wasn't started
         if owner_door is None:
