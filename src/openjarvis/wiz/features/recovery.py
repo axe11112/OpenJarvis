@@ -45,8 +45,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from openjarvis.reliability.briefing import has_critical_secret
+from openjarvis.wiz.features.acceptance import AcceptanceContract
 from openjarvis.wiz.features.model import FeatureRequest, FeatureState
+from openjarvis.wiz.features.pipeline import _checks_record
 from openjarvis.wiz.features.store import FeatureStore
+from openjarvis.wiz.features.verification import FeatureVerification, FeatureVerifier, gate_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +152,27 @@ def _real_git_rev_parse_head(worktree: str) -> str:
     return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
+def _gate_outcomes_from_result(result: Any) -> List[Any]:
+    """The local check suite's verdicts, in the shape the browser verifier
+    expects — the same conversion :meth:`FeaturePipeline._gate_outcomes`
+    applies to a normal attempt's stored checks, applied here to a freshly
+    re-run check suite instead."""
+    checks = _checks_record(result)
+    entries = checks.get("results") or checks.get("checks") or []
+    outcomes = []
+    for item in entries:
+        if not isinstance(item, dict) or not item.get("ran", True):
+            continue
+        outcomes.append(
+            gate_outcome(
+                str(item.get("name", "check")),
+                bool(item.get("passed", False)),
+                str(item.get("summary", ""))[:500],
+            )
+        )
+    return outcomes
+
+
 def _real_git_diff(worktree: str, base_sha: str, head_sha: str) -> str:
     if not base_sha or not head_sha:
         return ""
@@ -183,6 +207,16 @@ class FeatureRecovery:
     required_status_contexts: Sequence[str] = ()
     git_rev_parse_head: Callable[[str], str] = _real_git_rev_parse_head
     git_diff: Callable[[str, str, str], str] = _real_git_diff
+
+    #: The same browser verifier the ordinary pipeline uses. Without it,
+    #: recovery re-checks local gates and preview reachability but never the
+    #: acceptance contract itself — leaving feature.metadata["verification"]
+    #: holding whatever an earlier, possibly-failed attempt last stored there,
+    #: even after recovery decides the feature genuinely belongs at READY.
+    #: None is a legitimate configuration (recovery still works; it simply
+    #: cannot refresh stale browser evidence), not a silent default to "skip
+    #: this check".
+    verifier: Optional[FeatureVerifier] = None
 
     def __post_init__(self) -> None:
         if self.clock is None:
@@ -417,10 +451,28 @@ class FeatureRecovery:
             )
             return refusals
 
+        verification: Optional[FeatureVerification] = None
+        contract = AcceptanceContract.from_dict(feature.metadata.get("contract") or {})
+        if self.verifier is not None and contract.browser_criteria:
+            verification = self.verifier.verify(
+                contract,
+                preview_url=observation.url,
+                commit_sha=head_sha,
+                deployment_id=observation.deployment_id,
+                attempt=feature.attempts_used or 1,
+                gate_outcomes=_gate_outcomes_from_result(result),
+            )
+            if not verification.passed:
+                refusals.append(
+                    RecoveryRefusal("acceptance_failed", verification.summary())
+                )
+                return refusals
+
         # Stash what the checks stage found so _advance can attach it to the
         # attempt without re-running anything.
         self._last_check_result = result
         self._last_observation = observation
+        self._last_verification = verification
         return refusals
 
     # -- applying the recovered state, through the real state machine ---
@@ -456,6 +508,20 @@ class FeatureRecovery:
         observation = getattr(self, "_last_observation", None)
         if observation is not None:
             feature.preview_url = observation.url
+
+        verification = getattr(self, "_last_verification", None)
+        if verification is not None:
+            # Bound to the exact deployment and commit just re-verified —
+            # supersedes whatever an earlier, possibly-failed attempt left in
+            # feature.metadata["verification"]. Only reached when
+            # verification.passed (see _gather_and_check_evidence, which
+            # refuses before _advance is ever called otherwise), so this can
+            # only replace stale evidence with fresher, better evidence,
+            # never the reverse. The stale result is not erased from history:
+            # it is still exactly what the journal recorded when it happened.
+            record = verification.to_dict()
+            attempt.verification["acceptance"] = record
+            feature.metadata["verification"] = record
 
         if feature.state is FeatureState.HUMAN_REQUIRED:
             self._resume(feature, reason)

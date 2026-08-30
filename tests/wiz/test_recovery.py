@@ -5,10 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from openjarvis.wiz.features.acceptance import CONTENT, AcceptanceContract, Criterion
 from openjarvis.wiz.features.model import FeatureAttempt, FeatureRequest, FeatureState
 from openjarvis.wiz.features.profile import EngineeringProfile
 from openjarvis.wiz.features.recovery import FeatureRecovery
 from openjarvis.wiz.features.store import FeatureStore
+from openjarvis.wiz.features.verification import CriterionOutcome, FeatureVerification
 from openjarvis.wiz.journal import WizJournal
 
 PROFILE = EngineeringProfile(
@@ -58,6 +60,7 @@ class FakeObservation:
     usable: bool = True
     url: str = "https://feature-preview.example.vercel.app/"
     reason: str = "the preview for this commit is ready"
+    deployment_id: str = "dpl_fake123"
 
 
 class FakePreview:
@@ -107,6 +110,57 @@ class FakeGitHub:
         return self.status
 
 
+class FakeVerifier:
+    """A browser verifier stand-in that hands back a scripted verdict."""
+
+    def __init__(self, *, passed: bool = True):
+        self._passed = passed
+        self.calls: List[Dict[str, Any]] = []
+
+    def verify(
+        self,
+        contract,
+        *,
+        preview_url: str,
+        commit_sha: str = "",
+        deployment_id: str = "",
+        attempt: int = 1,
+        gate_outcomes=(),
+    ) -> FeatureVerification:
+        self.calls.append(
+            {
+                "preview_url": preview_url,
+                "commit_sha": commit_sha,
+                "deployment_id": deployment_id,
+                "attempt": attempt,
+            }
+        )
+        criterion = contract.browser_criteria[0]
+        outcome = CriterionOutcome(
+            criterion=criterion,
+            passed=self._passed,
+            viewport="desktop",
+            detail="" if self._passed else "the expected text is missing",
+        )
+        return FeatureVerification(
+            feature_id=contract.feature_id,
+            preview_url=preview_url,
+            commit_sha=commit_sha,
+            deployment_id=deployment_id,
+            outcomes=[outcome],
+        )
+
+
+def _contract_with_content_check(feature_id: str = "FEAT-00001") -> Dict[str, Any]:
+    contract = AcceptanceContract(
+        feature_id=feature_id,
+        criteria=(
+            Criterion(kind=CONTENT, route="/", text="hello", description="says hello"),
+        ),
+    )
+    return contract.to_dict()
+
+
 def make_feature(
     *,
     state: FeatureState = FeatureState.BUILDING,
@@ -116,6 +170,8 @@ def make_feature(
     risk: str = "MEDIUM",
     worktree: str = "/tmp/does-not-matter",
     attempt_commit_sha: str = "",
+    contract: Optional[Dict[str, Any]] = None,
+    stale_verification: Optional[Dict[str, Any]] = None,
 ) -> FeatureRequest:
     feature = FeatureRequest(
         id="FEAT-00001",
@@ -135,6 +191,10 @@ def make_feature(
     feature.attempts.append(
         FeatureAttempt(number=1, started_at="t0", commit_sha=attempt_commit_sha)
     )
+    if contract is not None:
+        feature.metadata["contract"] = contract
+    if stale_verification is not None:
+        feature.metadata["verification"] = stale_verification
     return feature
 
 
@@ -145,6 +205,7 @@ def build_recovery(
     preview=None,
     suite_result=None,
     required_status_contexts=(),
+    verifier=None,
     git_rev_parse_head=None,
     git_diff=None,
 ):
@@ -159,6 +220,7 @@ def build_recovery(
         check_suite_factory=lambda profile: suite,
         journal=journal,
         required_status_contexts=required_status_contexts,
+        verifier=verifier,
         clock=lambda: "2026-08-24T09:00:00+00:00",
         git_rev_parse_head=git_rev_parse_head or (lambda worktree: HEAD_SHA),
         git_diff=git_diff or (lambda worktree, base, head: "+ nothing sensitive"),
@@ -305,6 +367,108 @@ class TestRecovery:
             "VERIFYING",
             "READY",
         ]
+
+
+class TestFreshBrowserVerification:
+    """Recovery must refresh feature.metadata["verification"] with a real,
+    fresh browser check bound to the exact commit/deployment being
+    recovered — not leave whatever an earlier, possibly-failed attempt last
+    stored there. Found on FEAT-00017: recovery reached READY off local
+    gates and preview reachability alone, while the stored acceptance
+    result was still the stale, contaminated one from before the verifier
+    bugs were fixed.
+    """
+
+    def test_a_fresh_passing_verification_replaces_stale_metadata(self, tmp_path):
+        verifier = FakeVerifier(passed=True)
+        recovery, store, _, _ = build_recovery(tmp_path, verifier=verifier)
+        store.create(
+            make_feature(
+                contract=_contract_with_content_check(),
+                stale_verification={
+                    "passed": False,
+                    "summary": "11 of 15 checks failed on the preview",
+                },
+            )
+        )
+
+        result = recovery.recover("FEAT-00001", reason="recovering")
+
+        assert result.recovered
+        saved = store.get("FEAT-00001")
+        assert saved.metadata["verification"]["passed"] is True
+        assert "11 of 15" not in saved.metadata["verification"].get("summary", "")
+
+    def test_verification_is_bound_to_the_exact_commit_and_deployment(self, tmp_path):
+        preview = FakePreview(
+            FakeObservation(url="https://exact-preview.example.vercel.app/")
+        )
+        verifier = FakeVerifier(passed=True)
+        recovery, store, _, _ = build_recovery(
+            tmp_path, preview=preview, verifier=verifier
+        )
+        store.create(make_feature(contract=_contract_with_content_check()))
+
+        recovery.recover("FEAT-00001", reason="recovering")
+
+        assert verifier.calls[0]["commit_sha"] == HEAD_SHA
+        assert verifier.calls[0]["preview_url"] == "https://exact-preview.example.vercel.app/"
+        saved = store.get("FEAT-00001")
+        assert saved.metadata["verification"]["commit_sha"] == HEAD_SHA
+
+    def test_a_failing_fresh_verification_refuses_and_does_not_touch_stored_evidence(
+        self, tmp_path
+    ):
+        verifier = FakeVerifier(passed=False)
+        recovery, store, _, _ = build_recovery(tmp_path, verifier=verifier)
+        original_verification = {"passed": True, "summary": "an earlier, real pass"}
+        store.create(
+            make_feature(
+                contract=_contract_with_content_check(),
+                stale_verification=original_verification,
+            )
+        )
+
+        result = recovery.recover("FEAT-00001", reason="recovering")
+
+        assert not result.recovered
+        assert result.refusals[0].code == "acceptance_failed"
+        # Refused before _advance ever runs: nothing was overwritten with the
+        # fresh failure, good or bad.
+        saved = store.get("FEAT-00001")
+        assert saved.metadata["verification"] == original_verification
+        assert saved.state is FeatureState.BUILDING
+
+    def test_no_verifier_configured_behaves_exactly_as_before(self, tmp_path):
+        # Backward compatible: a recovery instance with no verifier wired
+        # still recovers on local gates and preview reachability alone.
+        recovery, store, _, _ = build_recovery(tmp_path, verifier=None)
+        store.create(
+            make_feature(
+                contract=_contract_with_content_check(),
+                stale_verification={"passed": False, "summary": "stale"},
+            )
+        )
+
+        result = recovery.recover("FEAT-00001", reason="recovering")
+
+        assert result.recovered
+        # Untouched: with no verifier, recovery has no fresh evidence to
+        # replace the stale result with, so it correctly leaves it alone
+        # rather than inventing a verdict.
+        assert store.get("FEAT-00001").metadata["verification"]["summary"] == "stale"
+
+    def test_a_feature_with_no_browser_criteria_skips_the_browser_check(self, tmp_path):
+        # A backend-only feature has nothing for a browser to check; the
+        # verifier must not be asked to check nothing.
+        verifier = FakeVerifier(passed=True)
+        recovery, store, _, _ = build_recovery(tmp_path, verifier=verifier)
+        store.create(make_feature())  # no contract at all
+
+        result = recovery.recover("FEAT-00001", reason="recovering")
+
+        assert result.recovered
+        assert verifier.calls == []
 
 
 # ---------------------------------------------------------------------------
