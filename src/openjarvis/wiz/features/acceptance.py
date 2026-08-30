@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "AcceptanceContract",
     "Criterion",
+    "EXPECTED_VALUES",
     "KINDS",
     "Viewport",
     "DESKTOP",
@@ -85,6 +86,12 @@ ENDPOINT = "ENDPOINT"
 UNAUTHORIZED = "UNAUTHORIZED"
 PERFORMANCE = "PERFORMANCE"
 MANUAL = "MANUAL"
+
+#: The only two semantics :func:`Criterion.__post_init__` accepts for
+#: ``expected``. Not ``EQUAL``/``CHANGED``: those describe a relationship
+#: between two page states, and nothing here compares one preview against
+#: another — every browser check runs once, against one deployment.
+EXPECTED_VALUES = frozenset({"PRESENT", "ABSENT"})
 
 #: Every kind that exists. A criterion outside this set is a bug in whatever
 #: produced it, not a criterion to be tolerated.
@@ -155,6 +162,14 @@ class Criterion:
     #: (``INTERACTION``).
     text: str = ""
 
+    #: For ``CONTENT``: whether *text* must be ``PRESENT`` on the page or
+    #: ``ABSENT`` from it. A text-replacement change has both kinds to prove —
+    #: the new wording is there, the old wording is gone — and a single
+    #: PRESENT-only criterion can only ever check the first, silently reading
+    #: "prove the old text is gone" as "prove the old text is still there"
+    #: when a description says otherwise but only ``text`` is ever compiled.
+    expected: str = "PRESENT"
+
     #: For ``INTERACTION``: what must become true after the interaction.
     then_selector: str = ""
     then_text: str = ""
@@ -180,6 +195,11 @@ class Criterion:
                 f"unknown acceptance criterion kind {self.kind!r}; "
                 f"valid kinds: {', '.join(sorted(KINDS))}"
             )
+        if self.expected not in EXPECTED_VALUES:
+            raise ValueError(
+                f"unknown criterion expectation {self.expected!r}; "
+                f"valid: {', '.join(sorted(EXPECTED_VALUES))}"
+            )
         if not self.description.strip():
             raise ValueError("an acceptance criterion needs a description")
         if self.kind == PERFORMANCE and self.budget <= 0:
@@ -203,6 +223,7 @@ class Criterion:
             "route": self.route,
             "selector": self.selector,
             "text": self.text,
+            "expected": self.expected,
             "then_selector": self.then_selector,
             "then_text": self.then_text,
             "method": self.method,
@@ -221,6 +242,7 @@ class Criterion:
             route=str(raw.get("route", "")),
             selector=str(raw.get("selector", "")),
             text=str(raw.get("text", "")),
+            expected=str(raw.get("expected", "PRESENT")).upper() or "PRESENT",
             then_selector=str(raw.get("then_selector", "")),
             then_text=str(raw.get("then_text", "")),
             method=str(raw.get("method", "GET")).upper() or "GET",
@@ -363,20 +385,31 @@ class AcceptanceContract:
         expectations: List[ProbeExpectation] = []
         assertions = ProbeAssertions()
 
+        # Which criterion asked for each expectation/assertion, by position —
+        # so a result naming "expectation 2 failed" can be attributed back to
+        # the one criterion that owns it rather than to every criterion this
+        # route+viewport happens to share a browser run with. Keyed by
+        # `id(criterion)`, matching how AcceptanceContract.probe_specs()'s own
+        # caller already tracks criterion identity within one verification run.
+        expectation_owners: List[int] = []
+        assertion_owners: Dict[str, int] = {}
+
         for criterion in criteria:
             if criterion.kind == CONTENT:
                 if criterion.selector and not criterion.text:
                     expectations.append(
                         ProbeExpectation(kind="visible", selector=criterion.selector)
                     )
+                    expectation_owners.append(id(criterion))
                 elif criterion.text:
                     expectations.append(
                         ProbeExpectation(
-                            kind="text",
+                            kind="not_text" if criterion.expected == "ABSENT" else "text",
                             selector=criterion.selector,
                             value=criterion.text,
                         )
                     )
+                    expectation_owners.append(id(criterion))
             elif criterion.kind == INTERACTION:
                 if criterion.selector:
                     steps.append(
@@ -392,14 +425,16 @@ class AcceptanceContract:
                             kind="visible", selector=criterion.then_selector
                         )
                     )
+                    expectation_owners.append(id(criterion))
                 elif criterion.then_text:
                     expectations.append(
                         ProbeExpectation(
-                            kind="text",
+                            kind="not_text" if criterion.expected == "ABSENT" else "text",
                             selector=criterion.then_selector,
                             value=criterion.then_text,
                         )
                     )
+                    expectation_owners.append(id(criterion))
             elif criterion.kind == VIEWPORT:
                 # A layout criterion has nothing to assert beyond the page
                 # rendering at this size without error; the overflow check is
@@ -408,11 +443,15 @@ class AcceptanceContract:
                     expectations.append(
                         ProbeExpectation(kind="visible", selector=criterion.selector)
                     )
+                    expectation_owners.append(id(criterion))
             elif criterion.kind == CONSOLE:
                 assertions.no_console_errors = True
+                assertion_owners["console"] = id(criterion)
             elif criterion.kind == NETWORK:
                 assertions.no_failed_requests = True
                 assertions.max_http_status = 499
+                assertion_owners["network"] = id(criterion)
+                assertion_owners["http_status"] = id(criterion)
 
         # Last, so the picture is of the finished state rather than of the page
         # mid-interaction. Taken whether or not the run passes: the operator
@@ -461,6 +500,8 @@ class AcceptanceContract:
                 "feature_id": self.feature_id,
                 "viewport": viewport.name,
                 "temporary": True,
+                "expectation_owners": expectation_owners,
+                "assertion_owners": assertion_owners,
             },
         )
 

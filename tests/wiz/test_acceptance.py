@@ -14,6 +14,7 @@ from openjarvis.wiz.features.acceptance import (
     MOBILE,
     NETWORK,
     PERFORMANCE,
+    VIEWPORT,
     AcceptanceContract,
     Criterion,
     contract_for,
@@ -64,6 +65,38 @@ class TestCriterion:
             viewports=("desktop",),
         )
         assert Criterion.from_dict(original.to_dict()) == original
+
+    def test_content_defaults_to_expecting_the_text_present(self):
+        criterion = Criterion(kind=CONTENT, text="hello", description="says hello")
+        assert criterion.expected == "PRESENT"
+
+    def test_an_unknown_expectation_is_refused(self):
+        with pytest.raises(ValueError, match="unknown criterion expectation"):
+            Criterion(
+                kind=CONTENT,
+                text="hello",
+                expected="MAYBE",
+                description="says hello",
+            )
+
+    def test_an_absent_criterion_round_trips_through_a_dict(self):
+        original = Criterion(
+            kind=CONTENT,
+            route="/",
+            text="the old wording",
+            expected="ABSENT",
+            description="the old wording is gone",
+        )
+        restored = Criterion.from_dict(original.to_dict())
+        assert restored == original
+        assert restored.expected == "ABSENT"
+
+    def test_a_dict_with_no_expected_key_defaults_to_present(self):
+        # Old, already-persisted criteria (written before this field existed)
+        # must keep meaning what they always meant.
+        raw = Criterion(kind=CONTENT, text="hello", description="says hello").to_dict()
+        del raw["expected"]
+        assert Criterion.from_dict(raw).expected == "PRESENT"
 
 
 class TestSelfVerification:
@@ -284,6 +317,84 @@ class TestCompilation:
         )
         for _, spec in contract.probe_specs():
             assert spec.steps[-1].action == "screenshot"
+
+    def test_an_absent_content_criterion_compiles_to_not_text(self):
+        # Found on FEAT-00017: a criterion whose own description says text
+        # must no longer appear compiled to the one expectation kind that
+        # only ever means "must be present" — asserting the opposite of what
+        # it was for.
+        contract = AcceptanceContract(
+            feature_id="FEAT-00017",
+            criteria=(
+                Criterion(
+                    kind=CONTENT,
+                    route="/",
+                    text="the old wording",
+                    expected="ABSENT",
+                    description="the old wording is gone",
+                ),
+            ),
+        )
+        _, spec = contract.probe_specs()[0]
+        assert spec.expect[0].kind == "not_text"
+        assert spec.expect[0].value == "the old wording"
+
+    def test_a_present_content_criterion_still_compiles_to_text(self):
+        contract = AcceptanceContract(
+            feature_id="FEAT-00017",
+            criteria=(
+                Criterion(
+                    kind=CONTENT, route="/", text="the new wording", description="d"
+                ),
+            ),
+        )
+        _, spec = contract.probe_specs()[0]
+        assert spec.expect[0].kind == "text"
+        assert spec.expect[0].value == "the new wording"
+
+    def test_each_expectation_and_assertion_records_which_criterion_owns_it(self):
+        # Section 2's fix depends on this: without an owner recorded per
+        # expectation/assertion, a shared browser run has no way to say which
+        # criterion a given check actually belonged to.
+        present = Criterion(
+            kind=CONTENT, route="/", text="new text", description="new text shows"
+        )
+        absent = Criterion(
+            kind=CONTENT,
+            route="/",
+            text="old text",
+            expected="ABSENT",
+            description="old text is gone",
+        )
+        console = Criterion(kind=CONSOLE, route="/", description="no console errors")
+        network = Criterion(kind=NETWORK, route="/", description="no failed requests")
+        contract = AcceptanceContract(
+            feature_id="FEAT-00017", criteria=(present, absent, console, network)
+        )
+        _, spec = contract.probe_specs()[0]
+
+        owners = spec.metadata["expectation_owners"]
+        assert [id(present), id(absent)] == owners
+
+        assertion_owners = spec.metadata["assertion_owners"]
+        assert assertion_owners["console"] == id(console)
+        assert assertion_owners["network"] == id(network)
+        assert assertion_owners["http_status"] == id(network)
+
+    def test_a_selectorless_layout_criterion_owns_no_expectation(self):
+        # It asserts nothing a compiled probe can check (see the comment in
+        # _spec_for_route); it must not silently claim ownership of some
+        # other criterion's check either.
+        viewport_only = Criterion(
+            kind=VIEWPORT, route="/", description="renders without overflow"
+        )
+        console = Criterion(kind=CONSOLE, route="/", description="no console errors")
+        contract = AcceptanceContract(
+            feature_id="FEAT-00017", criteria=(viewport_only, console)
+        )
+        _, spec = contract.probe_specs()[0]
+        assert id(viewport_only) not in spec.metadata["expectation_owners"]
+        assert id(viewport_only) not in spec.metadata["assertion_owners"].values()
 
 
 class TestSerialisation:

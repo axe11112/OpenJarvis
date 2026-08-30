@@ -297,15 +297,25 @@ class ClaudeCodeEngineeringAgent:
             "[\n"
             '  {"kind": "CONTENT", "route": "/path", "text": "exact text", '
             '"description": "what this proves"},\n'
+            '  {"kind": "CONTENT", "route": "/path", "text": "old text being '
+            'replaced", "expected": "ABSENT", "description": "what this '
+            'proves"},\n'
             '  {"kind": "INTERACTION", "route": "/path", "selector": '
             '"button[name=save]", "then_text": "Saved", "description": '
             '"what this proves"}\n'
             "]\n"
             "```\n\n"
             "Valid kinds: CONTENT, INTERACTION, VIEWPORT, CONSOLE, NETWORK, "
-            "ENDPOINT, UNAUTHORIZED. This is additive only — it can make the "
-            "bar higher, never lower one already set. Omit the block entirely "
-            "rather than propose something vague; nothing here is required."
+            "ENDPOINT, UNAUTHORIZED. For CONTENT, \"expected\" defaults to "
+            "PRESENT (the page must contain \"text\"); set it to ABSENT to "
+            "assert the page no longer contains it. When a change replaces "
+            "one piece of text with another, propose both: PRESENT for the "
+            "new text, ABSENT for the exact old text it replaces — never a "
+            "single criterion trying to say both, and never PRESENT for text "
+            "the change itself removes. This is additive only — it can make "
+            "the bar higher, never lower one already set. Omit the block "
+            "entirely rather than propose something vague; nothing here is "
+            "required."
         )
 
     @staticmethod
