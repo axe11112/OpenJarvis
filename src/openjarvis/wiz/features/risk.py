@@ -111,6 +111,44 @@ MEDIUM_RISK_WORDS: List[Pattern[str]] = _patterns(
     r"\b(upload|download|import|export)\b",
 )
 
+#: Cues that mean the risky word right after them is being ruled *out*, not
+#: asked for: "do not change authentication" versus "change authentication".
+_NEGATION_CUES: Pattern[str] = re.compile(
+    r"\b(do\s+not|don'?t|never|without|avoid(?:ing)?|must\s+not|"
+    r"should\s*n'?t|won'?t|shall\s+not|cannot|can'?t|excluding|"
+    r"except\s+for|nor)\b",
+    re.IGNORECASE,
+)
+
+#: How far back a negation cue can sit and still be read as governing the
+#: matched word. Long enough for a list like "do not change functionality,
+#: authentication, data, APIs, or styling" — the cue is at the front and the
+#: risky word can be several items later — short enough that a negation in an
+#: earlier, unrelated sentence cannot reach forward and silence a real
+#: request later in the same text.
+_NEGATION_WINDOW = 80
+
+
+def _is_prohibited(text: str, match: "re.Match[str]") -> bool:
+    """Whether *match* sits inside an explicit prohibition, not a request.
+
+    A model cannot self-classify its own change (see the module docstring),
+    but an operator explicitly ruling something out is not the same signal as
+    an operator asking for it, and treating them alike means every request
+    that lists what must stay untouched — the safest possible request — reads
+    as the most dangerous one. Handled as a bounded window immediately before
+    the match, stopped at the nearest sentence boundary so a prohibition in
+    one sentence cannot reach into the next.
+    """
+    start = max(0, match.start() - _NEGATION_WINDOW)
+    window = text[start : match.start()]
+    for boundary in (".", "!", "?"):
+        idx = window.rfind(boundary)
+        if idx != -1:
+            window = window[idx + 1 :]
+    return bool(_NEGATION_CUES.search(window))
+
+
 _ORDER = {Risk.LOW: 0, Risk.MEDIUM: 1, Risk.HIGH: 2}
 
 
@@ -181,16 +219,20 @@ def classify_text(text: str) -> RiskAssessment:
     reasons: List[str] = []
     risk = Risk.LOW
     for pattern in HIGH_RISK_WORDS:
-        match = pattern.search(cleaned)
-        if match:
+        for match in pattern.finditer(cleaned):
+            if _is_prohibited(cleaned, match):
+                continue
             reasons.append(f"the request mentions '{match.group(0).strip()}'")
             risk = Risk.HIGH
+            break
     if risk is not Risk.HIGH:
         for pattern in MEDIUM_RISK_WORDS:
-            match = pattern.search(cleaned)
-            if match:
+            for match in pattern.finditer(cleaned):
+                if _is_prohibited(cleaned, match):
+                    continue
                 reasons.append(f"the request mentions '{match.group(0).strip()}'")
                 risk = _max(risk, Risk.MEDIUM)
+                break
     return RiskAssessment(risk=risk, reasons=tuple(dict.fromkeys(reasons)))
 
 

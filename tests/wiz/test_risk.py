@@ -156,6 +156,58 @@ class TestTheAgentCannotTalkItsWayDown:
         assert classify().risk is Risk.LOW
 
 
+class TestProhibitionIsNotARequest:
+    """"Do not touch X" must not raise risk the way "touch X" does.
+
+    Found on FEAT-00017: "Do not change functionality, authentication, data,
+    APIs, or styling." was classified HIGH purely because "authentication"
+    appeared in the sentence — even though the sentence explicitly rules it
+    out. A false HIGH here is worse than a missed one: it sends a genuinely
+    safe, text-only request to a human for no reason.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Do not change functionality, authentication, data, APIs, or "
+            "styling.",
+            "Change one small piece of text on the landing page to improve "
+            "clarity. Do not change functionality, authentication, data, "
+            "APIs, or styling.",
+            "Don't touch auth.",
+            "Fix the typo without modifying authentication.",
+            "Never change the login flow while doing this.",
+            "Improve the copy, excluding authentication and payments.",
+        ],
+    )
+    def test_explicitly_prohibited_scopes_stay_below_high(self, text):
+        assert classify_text(text).risk is not Risk.HIGH, text
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Change authentication so users stay logged in longer.",
+            "Add a new role system, but don't touch billing.",
+            "Update the payment flow.",
+        ],
+    )
+    def test_a_real_ask_elsewhere_in_the_text_still_raises_risk(self, text):
+        assert classify_text(text).risk is Risk.HIGH, text
+
+    def test_the_feat_00017_request_is_low_risk(self):
+        # The exact text that produced the false positive.
+        text = (
+            "The operator asked for this, in their words:\n"
+            "    Change one small piece of text on the Wize landing page to "
+            "improve clarity. Choose a safe LOW-risk text-only improvement "
+            "yourself. Build it, test it, verify the exact Preview with "
+            "browser acceptance, and ship it if all autonomous LOW-risk "
+            "gates pass. Do not change functionality, authentication, data, "
+            "APIs, or styling.\n\nTarget: wize"
+        )
+        assert classify_text(text).risk is Risk.LOW, text
+
+
 class TestApprovalGate:
     def test_high_risk_requires_approval(self):
         assert classify(paths=["src/lib/auth/x.ts"]).requires_approval
