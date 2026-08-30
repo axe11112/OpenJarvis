@@ -37,6 +37,7 @@ bounded number of attempts. Only when they run out does a person get involved.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -1541,12 +1542,52 @@ def _digest(text: str) -> str:
     return hashlib.sha256((text or "").encode()).hexdigest()[:16]
 
 
+_PATH_PATTERN = re.compile(r"[\w./-]+\.(?:ts|tsx|js|jsx|py|sql|json|ya?ml|css|scss)")
+
+#: A line that is *only* a markdown heading — "# Files" or "**Files**" — not a
+#: path mention inside an ordinary sentence that merely happens to use bold.
+_HEADING_LINE = re.compile(
+    r"^\s*(?:#{1,6}\s*(?P<hash>.+?)\s*#*|\*\*(?P<bold>[^*].*?[^*])\*\*)\s*$"
+)
+
+#: A heading naming the section that lists files the change will actually
+#: touch — the planning prompt asks for exactly this ("the files you expect
+#: to change"), so most plans that name a files section title it close to
+#: this wording. "unchang..." is filtered separately below, so a "files
+#: that stay unchanged" heading is not read as the opposite of what it says.
+_FILES_TO_CHANGE_HEADING = re.compile(r"\bfiles?\b.{0,20}\bchang", re.IGNORECASE)
+
+
 #: Paths a plan mentions, used to classify risk before anything is written.
 def _paths_mentioned(plan: str) -> List[str]:
-    import re
+    """Paths named in the plan's own "files expected to change" section.
 
-    pattern = re.compile(r"[\w./-]+\.(?:ts|tsx|js|jsx|py|sql|json|ya?ml|css|scss)")
-    return list(dict.fromkeys(pattern.findall(plan or "")))[:200]
+    Scoped to that section rather than the whole plan: a file cited only as
+    existing, unrelated context — "e2e/auth.spec.ts already covers this
+    page" — is not a file the change touches, and extracting every
+    path-shaped token in the prose read it as though it were, raising risk
+    on a plan that never proposed touching it. Falls back to scanning the
+    whole plan when no such section can be found, which keeps this
+    classifier's own conservative default: a plan that does not name its
+    files at all is read as though anything it mentions might be touched,
+    not as though nothing is.
+    """
+    text = plan or ""
+    lines = text.splitlines()
+    headings: List[tuple] = []
+    for i, line in enumerate(lines):
+        match = _HEADING_LINE.match(line)
+        if match:
+            headings.append((i, (match.group("hash") or match.group("bold") or "").strip()))
+
+    sections = [
+        "\n".join(lines[line_no + 1 : (headings[idx + 1][0] if idx + 1 < len(headings) else len(lines))])
+        for idx, (line_no, heading) in enumerate(headings)
+        if _FILES_TO_CHANGE_HEADING.search(heading) and "unchang" not in heading.lower()
+    ]
+
+    scope = "\n".join(sections) if sections else text
+    return list(dict.fromkeys(_PATH_PATTERN.findall(scope)))[:200]
 
 
 def _agent_risk_opinion(plan: str) -> Optional[Risk]:

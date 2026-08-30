@@ -547,6 +547,33 @@ class TestRiskIsRedecidedOnTheRealDiff:
         assert reloaded.risk == "HIGH"
         assert reloaded.metadata.get("risk_reasons")
 
+    def test_a_file_mentioned_only_as_existing_context_does_not_count_as_touched(
+        self, tmp_path, clock
+    ):
+        # Found on FEAT-00017: the plan mentioned "e2e/auth.spec.ts" only as
+        # an existing, unrelated test that happens to also load the page
+        # being edited — not a file the change touches — and the word "auth"
+        # in that filename raised risk to HIGH anyway, blocking a genuinely
+        # LOW/MEDIUM text-only change on an approval it did not need.
+        plan = (
+            "**What already exists**\n"
+            "Tests touching this page: e2e/landing.spec.ts, e2e/auth.spec.ts "
+            "and e2e/security-headers.spec.ts load '/' but assert unrelated "
+            "things.\n\n"
+            "**Files expected to change**\n"
+            "- src/lib/language.ts — one string value.\n\n"
+            "**Tests to prove it**\n"
+            "- npm run lint, npm test\n"
+        )
+        engineer = ScriptedEngineer(plan_claim=plan)
+        pipeline = build_pipeline(tmp_path, clock, engineer=engineer)
+        feature = pipeline.submit(
+            "improve the wording on the landing page", actor=operator_actor()
+        )
+        result = pipeline.run(feature.id)
+        assert result.risk != "HIGH", result.metadata.get("risk_reasons")
+        assert result.state is FeatureState.READY
+
     def test_an_approval_bound_to_this_plan_lets_it_build(self, tmp_path, clock):
         now = {"t": 0.0}
         approvals = ApprovalStore(clock=lambda: now["t"], ttl_seconds=900)
@@ -607,6 +634,51 @@ class TestRiskIsRedecidedOnTheRealDiff:
         assert result.state is FeatureState.PLANNING
         assert "not the action that was approved" in result.metadata["approval_error"]
 
+
+class TestPathsMentionedInAPlan:
+    """_paths_mentioned() decides what a plan will touch, feeding the
+    pre-build risk re-classification in _decide_to_build. Scoped to the
+    plan's "files expected to change" section rather than every path-shaped
+    token in the prose — see TestRiskIsRedecidedOnTheRealDiff for the
+    FEAT-00017 regression this exists for.
+    """
+
+    def test_a_file_named_only_as_existing_context_is_excluded(self):
+        from openjarvis.wiz.features.pipeline import _paths_mentioned
+
+        plan = (
+            "**What already exists**\n"
+            "e2e/auth.spec.ts already covers this page.\n\n"
+            "**Files expected to change**\n"
+            "- src/lib/language.ts\n"
+        )
+        assert _paths_mentioned(plan) == ["src/lib/language.ts"]
+
+    def test_a_heading_with_a_different_wording_is_matched_case_insensitively(self):
+        from openjarvis.wiz.features.pipeline import _paths_mentioned
+
+        plan = "## FILES EXPECTED TO CHANGE\n- src/lib/language.ts\n"
+        assert _paths_mentioned(plan) == ["src/lib/language.ts"]
+
+    def test_a_files_that_stay_unchanged_heading_is_not_read_as_the_opposite(self):
+        from openjarvis.wiz.features.pipeline import _paths_mentioned
+
+        plan = (
+            "**Files that stay unchanged**\n"
+            "- src/lib/auth/session.ts\n\n"
+            "**Files expected to change**\n"
+            "- src/lib/language.ts\n"
+        )
+        assert _paths_mentioned(plan) == ["src/lib/language.ts"]
+
+    def test_with_no_files_section_at_all_it_falls_back_to_the_whole_plan(self):
+        # The conservative default this classifier is built on: a plan that
+        # never names its files is read as though anything it mentions might
+        # be touched, not as though nothing is.
+        from openjarvis.wiz.features.pipeline import _paths_mentioned
+
+        plan = "I will edit src/lib/language.ts to fix the wording."
+        assert _paths_mentioned(plan) == ["src/lib/language.ts"]
 
 class TestTheIterativeLoop:
     def test_a_failing_gate_produces_another_attempt_rather_than_a_message(
