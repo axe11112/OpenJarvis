@@ -312,15 +312,7 @@ class FeatureVerifier:
                 for c in browser_criteria
                 if c.applies_to(viewport) and (c.route or "/") == (spec.steps[0].url)
             ]
-            for criterion in applicable:
-                covered.append(
-                    (
-                        criterion,
-                        viewport.name,
-                        result.success,
-                        "" if result.success else result.error,
-                    )
-                )
+            covered.extend(self._attribute(spec, result, applicable, viewport.name))
 
         if not verification.probe_results and not verification.error:
             verification.error = "no browser check could be run against the preview"
@@ -371,6 +363,86 @@ class FeatureVerifier:
             # keeps the feature out of READY.
             logger.warning("feature probe %s could not run: %s", spec.id, exc)
             return None
+
+    @staticmethod
+    def _attribute(
+        spec: Any,
+        result: ProbeResult,
+        applicable: Sequence[Criterion],
+        viewport_name: str,
+    ) -> List[Tuple[Criterion, str, bool, str]]:
+        """Which of *applicable* actually passed, failed, or was never checked.
+
+        A spec bundles every criterion sharing a route and viewport into one
+        browser run (:meth:`AcceptanceContract._spec_for_route`), so the run's
+        own single pass/fail is not one criterion's verdict — it is whether
+        *everything* in the bundle held. Reading it as though it were let one
+        real content mismatch report a healthy console and an untouched
+        viewport as failed for the exact same reason.
+
+        Per-criterion when the runner reported per-expectation/per-assertion
+        detail (see ``BrowserProbeRunner.run``'s ``expectation_outcomes`` /
+        ``assertion_outcomes`` metadata) and the compiled spec recorded which
+        criterion asked for each one (``expectation_owners`` /
+        ``assertion_owners``, set by :meth:`AcceptanceContract._spec_for_route`).
+        A criterion neither list mentions compiled to no actual check — a
+        selector-less layout criterion, say — and is left for the caller's own
+        "not in checked_criteria" pass to report as unchecked, not as passed
+        or failed by association.
+
+        Falls back to the run's single verdict, exactly as before, in the two
+        cases where per-criterion detail either does not exist or would be
+        wrong to invent: a runner with no per-check metadata at all (a test
+        double, or any runner predating this), and a hard navigation failure
+        (steps never completed, so nothing was individually evaluated — the
+        whole page failing to load is one real, shared cause, not several
+        checks contaminating each other).
+        """
+        metadata = result.metadata or {}
+        if metadata.get("navigation_error"):
+            return [
+                (criterion, viewport_name, False, metadata["navigation_error"])
+                for criterion in applicable
+            ]
+
+        expectation_outcomes = metadata.get("expectation_outcomes")
+        assertion_outcomes = metadata.get("assertion_outcomes")
+        if expectation_outcomes is None and assertion_outcomes is None:
+            return [
+                (
+                    criterion,
+                    viewport_name,
+                    result.success,
+                    "" if result.success else result.error,
+                )
+                for criterion in applicable
+            ]
+
+        expectation_owners = spec.metadata.get("expectation_owners", [])
+        assertion_owners = spec.metadata.get("assertion_owners", {})
+
+        by_owner: Dict[int, List[Tuple[bool, str]]] = {}
+        for owner_id, outcome in zip(expectation_owners, expectation_outcomes or []):
+            by_owner.setdefault(owner_id, []).append(
+                (bool(outcome["passed"]), str(outcome["detail"]))
+            )
+        for name, owner_id in assertion_owners.items():
+            outcome = (assertion_outcomes or {}).get(name)
+            if outcome is None:
+                continue
+            by_owner.setdefault(owner_id, []).append(
+                (bool(outcome["passed"]), str(outcome["detail"]))
+            )
+
+        attributed: List[Tuple[Criterion, str, bool, str]] = []
+        for criterion in applicable:
+            owned = by_owner.get(id(criterion))
+            if owned is None:
+                continue
+            ok = all(passed for passed, _ in owned)
+            detail = "; ".join(detail for passed, detail in owned if not passed and detail)
+            attributed.append((criterion, viewport_name, ok, detail))
+        return attributed
 
     def _evidence_dir(
         self, feature_id: str, attempt: int, viewport: Viewport

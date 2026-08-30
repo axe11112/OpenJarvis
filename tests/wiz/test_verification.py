@@ -11,8 +11,11 @@ from openjarvis.reliability.types import (
     TrustLevel,
 )
 from openjarvis.wiz.features.acceptance import (
+    CONSOLE,
     CONTENT,
+    DESKTOP,
     MANUAL,
+    NETWORK,
     AcceptanceContract,
     Criterion,
     contract_for,
@@ -44,6 +47,80 @@ class FakeRunner:
             error=self.error,
             evidence=list(self.evidence),
             metadata={"viewport": spec.metadata.get("viewport", "")},
+        )
+
+
+class PageStateRunner:
+    """A browser stand-in that evaluates a spec against a simulated page.
+
+    Mirrors ``BrowserProbeRunner.run``'s per-expectation/per-assertion
+    metadata (``expectation_outcomes``, ``assertion_outcomes``,
+    ``navigation_error``) closely enough to exercise
+    ``FeatureVerifier._attribute`` realistically, without a real browser.
+    ``FakeRunner`` above deliberately does *not* do this — it exists to test
+    the parts of verification that do not care about per-criterion
+    attribution, and its absence of this metadata is itself what proves the
+    fallback path still works.
+    """
+
+    def __init__(self, *, page_text="", console_ok=True, network_ok=True):
+        self.page_text = page_text
+        self.console_ok = console_ok
+        self.network_ok = network_ok
+        self.runs = []
+
+    def run(self, spec, *, base_url="", evidence_dir=None, **kwargs):
+        self.runs.append(spec)
+        expectation_outcomes = []
+        for expectation in spec.expect:
+            present = expectation.value in self.page_text
+            if expectation.kind == "text":
+                passed = present
+                detail = "" if passed else f"expected the page to contain {expectation.value!r}"
+            elif expectation.kind == "not_text":
+                passed = not present
+                detail = (
+                    ""
+                    if passed
+                    else f"expected the page not to contain {expectation.value!r}"
+                )
+            else:  # pragma: no cover - not exercised by these tests
+                passed, detail = True, ""
+            expectation_outcomes.append(
+                {
+                    "kind": expectation.kind,
+                    "selector": expectation.selector,
+                    "value": expectation.value,
+                    "passed": passed,
+                    "detail": detail,
+                }
+            )
+
+        assertion_outcomes = {}
+        if spec.assertions.no_console_errors:
+            assertion_outcomes["console"] = {
+                "passed": self.console_ok,
+                "detail": "" if self.console_ok else "1 JavaScript error(s) on the page",
+            }
+        if spec.assertions.no_failed_requests:
+            assertion_outcomes["network"] = {
+                "passed": self.network_ok,
+                "detail": "" if self.network_ok else "1 network request(s) failed",
+            }
+
+        failures = [o["detail"] for o in expectation_outcomes if not o["passed"]]
+        failures += [o["detail"] for o in assertion_outcomes.values() if not o["passed"]]
+
+        return ProbeResult(
+            probe_id=spec.id,
+            success=not failures,
+            error="; ".join(failures),
+            metadata={
+                "viewport": spec.metadata.get("viewport", ""),
+                "navigation_error": "",
+                "expectation_outcomes": expectation_outcomes,
+                "assertion_outcomes": assertion_outcomes,
+            },
         )
 
 
@@ -155,6 +232,159 @@ class TestUncheckedIsNotPassed:
         )
         assert not result.passed
         assert result.error or result.unchecked
+
+
+class TestPerCriterionAttribution:
+    """One shared browser run must not let one failing criterion contaminate
+    the others sharing its route and viewport — the FEAT-00017 bug: a content
+    mismatch reported console, network and an untouched viewport check as
+    failed too, all with the exact same detail text.
+    """
+
+    def _contract(self, *criteria):
+        return AcceptanceContract(feature_id="FEAT-X", criteria=criteria, viewports=(DESKTOP,))
+
+    def test_a_failed_content_check_does_not_fail_console_or_network(self):
+        content = Criterion(
+            kind=CONTENT, route="/", text="missing text", description="shows the text"
+        )
+        console = Criterion(kind=CONSOLE, route="/", description="no console errors")
+        network = Criterion(kind=NETWORK, route="/", description="no failed requests")
+        contract = self._contract(content, console, network)
+
+        result = verifier(PageStateRunner(page_text="something else entirely")).verify(
+            contract, preview_url="https://preview.app"
+        )
+
+        by_kind = {o.criterion.kind: o for o in result.outcomes}
+        assert by_kind[CONTENT].passed is False
+        assert by_kind[CONSOLE].passed is True
+        assert by_kind[NETWORK].passed is True
+        # Each outcome names only its own check, not the content mismatch.
+        assert "missing text" in by_kind[CONTENT].detail
+        assert by_kind[CONSOLE].detail == ""
+        assert by_kind[NETWORK].detail == ""
+
+    def test_a_failed_console_check_does_not_fail_a_passing_content_criterion(self):
+        content = Criterion(
+            kind=CONTENT, route="/", text="hello", description="shows hello"
+        )
+        console = Criterion(kind=CONSOLE, route="/", description="no console errors")
+        contract = self._contract(content, console)
+
+        result = verifier(
+            PageStateRunner(page_text="hello world", console_ok=False)
+        ).verify(contract, preview_url="https://preview.app")
+
+        by_kind = {o.criterion.kind: o for o in result.outcomes}
+        assert by_kind[CONTENT].passed is True
+        assert by_kind[CONTENT].detail == ""
+        assert by_kind[CONSOLE].passed is False
+        assert "JavaScript error" in by_kind[CONSOLE].detail
+
+    def test_replacement_does_not_require_old_and_new_text_simultaneously(self):
+        # The self-contradictory-acceptance bug: a rewording change used to
+        # need the page to contain BOTH the new text AND the exact old text
+        # it replaced, which no correct implementation could ever satisfy.
+        new_text = Criterion(
+            kind=CONTENT, route="/", text="the new wording", description="new wording shows"
+        )
+        old_text = Criterion(
+            kind=CONTENT,
+            route="/",
+            text="the old wording",
+            expected="ABSENT",
+            description="old wording is gone",
+        )
+        contract = self._contract(new_text, old_text)
+
+        result = verifier(PageStateRunner(page_text="...the new wording...")).verify(
+            contract, preview_url="https://preview.app"
+        )
+
+        assert result.passed, result.evidence()
+
+    def test_replacement_can_assert_old_absent_and_new_present_independently(self):
+        new_text = Criterion(
+            kind=CONTENT, route="/", text="the new wording", description="new wording shows"
+        )
+        old_text = Criterion(
+            kind=CONTENT,
+            route="/",
+            text="the old wording",
+            expected="ABSENT",
+            description="old wording is gone",
+        )
+        contract = self._contract(new_text, old_text)
+
+        # The old wording was never actually removed: ABSENT must catch it
+        # independently of whether the new text also happens to be there.
+        result = verifier(
+            PageStateRunner(page_text="the old wording, plus the new wording")
+        ).verify(contract, preview_url="https://preview.app")
+
+        by_text = {o.criterion.text: o for o in result.outcomes}
+        assert by_text["the new wording"].passed is True
+        assert by_text["the old wording"].passed is False
+
+    def test_unchanged_text_preservation_still_works_when_requested(self):
+        # A PRESENT criterion for text the change must leave alone still
+        # works exactly as it always did.
+        protected = Criterion(
+            kind=CONTENT,
+            route="/",
+            text="unrelated protected heading",
+            description="the protected heading is unchanged",
+        )
+        contract = self._contract(protected)
+
+        still_there = verifier(
+            PageStateRunner(page_text="unrelated protected heading, and more")
+        ).verify(contract, preview_url="https://preview.app")
+        assert still_there.passed
+
+        accidentally_removed = verifier(PageStateRunner(page_text="")).verify(
+            contract, preview_url="https://preview.app"
+        )
+        assert not accidentally_removed.passed
+
+    def test_a_criterion_with_nothing_compiled_is_unchecked_not_contaminated(self):
+        # A selector-less VIEWPORT criterion asserts nothing on its own (see
+        # AcceptanceContract._spec_for_route); sharing a run with a real
+        # failure must not turn "nothing checked" into "failed".
+        from openjarvis.wiz.features.acceptance import VIEWPORT
+
+        layout = Criterion(kind=VIEWPORT, route="/", description="renders without overflow")
+        content = Criterion(
+            kind=CONTENT, route="/", text="missing", description="shows missing text"
+        )
+        contract = self._contract(layout, content)
+
+        result = verifier(PageStateRunner(page_text="not present here")).verify(
+            contract, preview_url="https://preview.app"
+        )
+
+        by_kind = {o.criterion.kind: o for o in result.outcomes}
+        assert by_kind[CONTENT].passed is False
+        assert by_kind[VIEWPORT].passed is None
+        assert by_kind[VIEWPORT].checked is False
+
+    def test_a_runner_with_no_per_check_metadata_still_falls_back_correctly(self):
+        # FakeRunner (used throughout this file) reports no per-expectation
+        # detail at all -- older runners and every existing test double must
+        # keep working exactly as before.
+        content = Criterion(kind=CONTENT, route="/", text="x", description="d")
+        console = Criterion(kind=CONSOLE, route="/", description="no console errors")
+        contract = self._contract(content, console)
+
+        result = verifier(FakeRunner(success=False, error="whole run failed")).verify(
+            contract, preview_url="https://preview.app"
+        )
+        by_kind = {o.criterion.kind: o for o in result.outcomes}
+        assert by_kind[CONTENT].passed is False
+        assert by_kind[CONSOLE].passed is False
+        assert by_kind[CONTENT].detail == "whole run failed"
+        assert by_kind[CONSOLE].detail == "whole run failed"
 
 
 class TestBothScreenSizes:
