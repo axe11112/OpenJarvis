@@ -124,6 +124,46 @@ class TestResumingFromHumanRequired:
             feature.transition(FeatureState.BUILDING, at="t")
 
 
+class TestReopeningPlanningFromHumanRequired:
+    """resume_planning_from_human_required is the narrower sibling of
+    resume_from_human_required: for a feature that crashed before any code
+    was written, not one recovering real build progress. Also deliberately
+    not a LEGAL_TRANSITIONS entry, for the same reason.
+    """
+
+    def test_it_only_works_from_human_required(self):
+        feature = _feature(FeatureState.UNDERSTANDING)
+        with pytest.raises(InvalidFeatureTransition):
+            feature.resume_planning_from_human_required(at="t", reason="x")
+
+    def test_a_feature_with_an_attempt_already_used_is_refused(self):
+        feature = _feature(FeatureState.HUMAN_REQUIRED)
+        feature.next_attempt(at="t")
+        with pytest.raises(InvalidFeatureTransition):
+            feature.resume_planning_from_human_required(at="t", reason="x")
+
+    def test_a_feature_with_a_pull_request_already_open_is_refused(self):
+        feature = _feature(FeatureState.HUMAN_REQUIRED)
+        feature.pr_number = 42
+        with pytest.raises(InvalidFeatureTransition):
+            feature.resume_planning_from_human_required(at="t", reason="x")
+
+    def test_a_successful_reopen_lands_on_received_and_is_marked_in_history(self):
+        feature = _feature(FeatureState.HUMAN_REQUIRED)
+        feature.resume_planning_from_human_required(
+            at="t", reason="the usage limit that stopped this has since reset"
+        )
+        assert feature.state is FeatureState.RECEIVED
+        assert feature.history[-1]["resumed"] is True
+        assert feature.history[-1]["from"] == "HUMAN_REQUIRED"
+        assert feature.history[-1]["to"] == "RECEIVED"
+
+    def test_it_does_not_widen_check_transition(self):
+        feature = _feature(FeatureState.HUMAN_REQUIRED)
+        with pytest.raises(InvalidFeatureTransition):
+            feature.transition(FeatureState.RECEIVED, at="t")
+
+
 class TestTheIterativeLoop:
     def test_a_failed_check_sends_the_work_back_to_building(self):
         feature = _feature(FeatureState.TESTING)

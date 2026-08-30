@@ -18,7 +18,11 @@ from openjarvis.wiz.features.engineer import (
     CodingEngineUnavailable,
     EngineeringSession,
 )
-from openjarvis.wiz.features.model import FeatureState, Priority
+from openjarvis.wiz.features.model import (
+    FeatureState,
+    InvalidFeatureTransition,
+    Priority,
+)
 from openjarvis.wiz.features.notify import NEEDS_OWNER_KINDS
 from openjarvis.wiz.features.pipeline import FeaturePipeline
 from openjarvis.wiz.features.preview import PreviewObserver
@@ -777,6 +781,66 @@ class TestPlanTransientCapacityFailure:
         assert "could not work out how to build this: ambiguous request" in (
             result.history[-1]["reason"]
         )
+
+
+class TestReopenForPlanning:
+    """The narrow, explicit-operator-only path back from a planning-stage
+    HUMAN_REQUIRED — distinct from the build-crash recovery in
+    openjarvis.wiz.features.recovery, and distinct from resume_from_human_required.
+    """
+
+    def test_reopening_a_planning_failure_lets_it_reach_ready(self, tmp_path, clock):
+        engineer = ScriptedEngineer(
+            plans=[EngineeringSession(mode="plan", succeeded=False, error="ambiguous")]
+        )
+        pipeline = build_pipeline(tmp_path, clock, engineer=engineer)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        stopped = pipeline.run(feature.id)
+        assert stopped.state is FeatureState.HUMAN_REQUIRED
+        assert stopped.attempts_used == 0
+
+        reopened = pipeline.reopen_for_planning(feature.id, reason="fixed since")
+        assert reopened.state is FeatureState.RECEIVED
+
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+
+    def test_reopening_is_recorded_in_the_journal(self, tmp_path, clock):
+        engineer = ScriptedEngineer(
+            plans=[EngineeringSession(mode="plan", succeeded=False, error="ambiguous")]
+        )
+        pipeline = build_pipeline(tmp_path, clock, engineer=engineer)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        pipeline.reopen_for_planning(feature.id, reason="fixed since")
+
+        entries = [
+            e for e in pipeline.journal.tail(50) if e.detail.get("feature_id") == feature.id
+        ]
+        assert any(e.kind == "feature.reopened_for_planning" for e in entries)
+
+    def test_a_feature_that_already_used_an_attempt_cannot_reopen_this_way(
+        self, tmp_path, clock
+    ):
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            suite_results=[FakeCheckResult(passed=False, summary="still broken")],
+            max_attempts=1,
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        stopped = pipeline.run(feature.id)
+        assert stopped.state is FeatureState.HUMAN_REQUIRED
+        assert stopped.attempts_used == 1
+
+        with pytest.raises(InvalidFeatureTransition):
+            pipeline.reopen_for_planning(feature.id)
+
+    def test_a_feature_not_in_human_required_cannot_be_reopened(self, tmp_path, clock):
+        pipeline = build_pipeline(tmp_path, clock)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        with pytest.raises(InvalidFeatureTransition):
+            pipeline.reopen_for_planning(feature.id)
 
 
 class TestVerificationDecides:

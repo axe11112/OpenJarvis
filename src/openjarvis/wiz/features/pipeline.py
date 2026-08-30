@@ -273,6 +273,39 @@ class FeaturePipeline:
                 logger.exception("could not remove %s from the queue", feature.id)
         return feature
 
+    def reopen_for_planning(
+        self, feature_id: str, *, reason: str = ""
+    ) -> FeatureRequest:
+        """Give a feature that crashed before writing any code another run at planning.
+
+        Deliberately narrow, and deliberately not the crash-recovery path in
+        :mod:`openjarvis.wiz.features.recovery` — that one is for a feature
+        that reached ``BUILDING`` and re-verifies real evidence (a branch, a
+        pull request) before trusting it. A feature with zero attempts and no
+        pull request never got that far: there is nothing to re-verify, only
+        the original request, worth trying again now that whatever stopped
+        it — a transient Claude Code capacity limit, a classifier bug since
+        fixed — no longer applies. See
+        :meth:`FeatureRequest.resume_planning_from_human_required` for the
+        guard this relies on; ``InvalidFeatureTransition`` propagates as this
+        method's refusal for anything that does not qualify.
+
+        An explicit operator action, not something the pipeline reaches on
+        its own — the same reason :meth:`cancel` is its own verb rather than
+        a state :meth:`run` can enter unprompted.
+        """
+        feature = self._load(feature_id)
+        feature.resume_planning_from_human_required(
+            at=self.clock(), reason=(reason or "reopened by the operator")[:300]
+        )
+        self.store.save(feature)
+        self._record(
+            feature, "feature.reopened_for_planning", reason or "reopened by the operator"
+        )
+        if self.queue is not None:
+            self.queue.submit(feature)
+        return feature
+
     def ship(
         self, feature_id: str, *, operator_approved: bool = False
     ) -> FeatureRequest:

@@ -403,6 +403,51 @@ class FeatureRequest:
         self.state = target
         self.updated_at = at
 
+    def resume_planning_from_human_required(self, *, at: str, reason: str) -> None:
+        """Reopen a ``HUMAN_REQUIRED`` feature that never left planning.
+
+        Distinct from :meth:`resume_from_human_required`, which is for crash
+        recovery of *real build progress* and is gated on external evidence
+        (a branch, a PR) to re-check. This is the narrower, strictly safer
+        case: a feature that stopped before any code was written at all —
+        zero attempts, no pull request — so there is nothing to verify,
+        because nothing was ever done. There is only the original request,
+        to be planned again from the top exactly as a fresh submission would
+        be, through :data:`FeatureState.RECEIVED` so ``_understand`` re-runs
+        and re-derives risk rather than carrying forward a stale
+        classification from the attempt that crashed.
+
+        A separate, audited method rather than a :data:`LEGAL_TRANSITIONS`
+        entry for the same reason :meth:`resume_from_human_required` is: that
+        table backs a test asserting every terminal state — including this
+        one — progresses nowhere *on its own*. Every history entry this
+        writes carries ``"resumed": True``, matching that method's
+        convention, so the audit trail can tell a reopened hop apart from an
+        ordinary one at a glance.
+        """
+        if self.state is not FeatureState.HUMAN_REQUIRED:
+            raise InvalidFeatureTransition(
+                "resume_planning_from_human_required called from "
+                f"{self.state.value}, not HUMAN_REQUIRED"
+            )
+        if self.attempts_used or self.pr_number:
+            raise InvalidFeatureTransition(
+                "only a feature with zero attempts and no pull request may "
+                "reopen into planning; anything further along needs "
+                "resume_from_human_required's evidence-gated recovery instead"
+            )
+        self.history.append(
+            {
+                "at": at,
+                "from": self.state.value,
+                "to": FeatureState.RECEIVED.value,
+                "reason": reason,
+                "resumed": True,
+            }
+        )
+        self.state = FeatureState.RECEIVED
+        self.updated_at = at
+
     def next_attempt(self, *, at: str, hypothesis: str = "") -> FeatureAttempt:
         attempt = FeatureAttempt(
             number=len(self.attempts) + 1, started_at=at, hypothesis=hypothesis
