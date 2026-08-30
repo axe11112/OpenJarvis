@@ -1808,6 +1808,145 @@ class TestShip:
         assert github.merge_calls == []
 
 
+class TestMediumRiskOneOffShipApproval:
+    """The full, real path: a redeemed approval token, bound to this feature
+    and this exact head SHA, is the only thing that lets a MEDIUM-risk
+    feature ship while merge_medium_risk stays False.
+    """
+
+    def _shipper(self, github):
+        from openjarvis.wiz.features.shipping import (
+            FeatureShipper,
+            FeatureShippingPolicy,
+        )
+
+        return FeatureShipper(
+            # merge_medium_risk stays False on purpose: the standing policy
+            # never changes here, only a per-feature approval does.
+            policy=FeatureShippingPolicy(merge_medium_risk=False),
+            github=github,
+            authority=AuthorityPolicy(
+                grants={
+                    Channel.CONTROL_CENTER: frozenset(
+                        {Authority.PR_WRITE, Authority.PRODUCTION_CHANGE}
+                    )
+                }
+            ),
+        )
+
+    def _ready(self, tmp_path, clock, approvals):
+        github = TestShip.FakeGitHub()
+        pipeline = build_pipeline(tmp_path, clock, approvals=approvals)
+        pipeline.shipper = self._shipper(github)
+        pipeline.postship = TestShip.FakePostShip(verified=True)
+        submitted = pipeline.submit(REQUEST, actor=operator_actor())
+        feature = pipeline.run(submitted.id)
+        assert feature.risk == "MEDIUM", "the fixture request should classify MEDIUM"
+        return pipeline, feature, github
+
+    def _approvals(self):
+        from openjarvis.wiz.approvals import ApprovalStore
+
+        return ApprovalStore(clock=lambda: 0.0, ttl_seconds=900)
+
+    def test_medium_without_any_approval_is_refused(self, tmp_path, clock):
+        pipeline, feature, github = self._ready(tmp_path, clock, self._approvals())
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.READY
+        assert not github.merge_calls
+
+    def test_a_valid_approval_for_this_feature_and_head_ships(self, tmp_path, clock):
+        approvals = self._approvals()
+        pipeline, feature, github = self._ready(tmp_path, clock, approvals)
+        approval = approvals.issue(
+            capability="feature.ship",
+            subject=feature.id,
+            parameters={"risk": feature.risk, "head_sha": TestShip.HEAD_SHA},
+        )
+        feature.metadata["ship_approval_token"] = approval.token
+        pipeline.store.save(feature)
+
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.COMPLETE
+        assert github.merge_calls
+        assert shipped.metadata["ship_approved_head_sha"] == TestShip.HEAD_SHA
+        assert "ship_approval_token" not in shipped.metadata
+
+    def test_an_approval_for_a_different_feature_does_not_transfer(
+        self, tmp_path, clock
+    ):
+        approvals = self._approvals()
+        pipeline, feature, github = self._ready(tmp_path, clock, approvals)
+        approval = approvals.issue(
+            capability="feature.ship",
+            subject="FEAT-SOMEONE-ELSE",
+            parameters={"risk": feature.risk, "head_sha": TestShip.HEAD_SHA},
+        )
+        feature.metadata["ship_approval_token"] = approval.token
+        pipeline.store.save(feature)
+
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.READY
+        assert not github.merge_calls
+
+    def test_a_stale_approval_after_the_head_changes_is_refused(self, tmp_path, clock):
+        approvals = self._approvals()
+        pipeline, feature, github = self._ready(tmp_path, clock, approvals)
+        approval = approvals.issue(
+            capability="feature.ship",
+            subject=feature.id,
+            parameters={"risk": feature.risk, "head_sha": "a-superseded-sha"},
+        )
+        feature.metadata["ship_approval_token"] = approval.token
+        pipeline.store.save(feature)
+
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.READY
+        assert not github.merge_calls
+        assert "not the action that was approved" in shipped.metadata.get(
+            "ship_approval_error", ""
+        )
+
+    def test_the_approval_is_single_use(self, tmp_path, clock):
+        from openjarvis.wiz.approvals import ApprovalError
+
+        approvals = self._approvals()
+        pipeline, feature, github = self._ready(tmp_path, clock, approvals)
+        approval = approvals.issue(
+            capability="feature.ship",
+            subject=feature.id,
+            parameters={"risk": feature.risk, "head_sha": TestShip.HEAD_SHA},
+        )
+        approvals.redeem(
+            approval.token,
+            capability="feature.ship",
+            subject=feature.id,
+            parameters={"risk": feature.risk, "head_sha": TestShip.HEAD_SHA},
+        )
+        with pytest.raises(ApprovalError):
+            approvals.redeem(
+                approval.token,
+                capability="feature.ship",
+                subject=feature.id,
+                parameters={"risk": feature.risk, "head_sha": TestShip.HEAD_SHA},
+            )
+
+    def test_merge_medium_risk_default_is_unaffected_by_a_granted_approval(
+        self, tmp_path, clock
+    ):
+        approvals = self._approvals()
+        pipeline, feature, github = self._ready(tmp_path, clock, approvals)
+        approval = approvals.issue(
+            capability="feature.ship",
+            subject=feature.id,
+            parameters={"risk": feature.risk, "head_sha": TestShip.HEAD_SHA},
+        )
+        feature.metadata["ship_approval_token"] = approval.token
+        pipeline.store.save(feature)
+        pipeline.ship(feature.id)
+        assert pipeline.shipper.policy.merge_medium_risk is False
+
+
 class TestAutoShipIfEligible:
     """`auto_ship_if_eligible`: the only caller allowed to reach `ship` on its
     own, and only for LOW risk with `merge_low_risk` on.

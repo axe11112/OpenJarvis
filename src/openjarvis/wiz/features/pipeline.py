@@ -393,6 +393,10 @@ class FeaturePipeline:
                 logger.warning("could not read CI status for %s: %s", feature.id, exc)
                 status = {"state": "unreadable", "contexts": {}}
 
+        medium_risk_approved = self._medium_ship_approved(
+            feature, head_sha=str(pr.get("head_sha", ""))
+        )
+
         merge_result = self.shipper.merge_feature(
             feature,
             pull_request=pr,
@@ -400,6 +404,7 @@ class FeaturePipeline:
             base_sha_at_verification=feature.base_sha,
             observed_base_sha=pr.get("base_sha", ""),
             operator_approved=operator_approved,
+            medium_risk_approved=medium_risk_approved,
         )
         if not merge_result.get("merged"):
             if pr.get("merged"):
@@ -1313,6 +1318,38 @@ class FeaturePipeline:
             return False
         feature.approved_plan_hash = _digest(feature.plan)
         feature.metadata.pop("approval_token", None)
+        return True
+
+    def _medium_ship_approved(self, feature: FeatureRequest, *, head_sha: str) -> bool:
+        """Whether a live, redeemed approval authorises shipping this exact
+        MEDIUM-risk feature at this exact head SHA.
+
+        A one-off yes, never a policy change: it never touches
+        ``merge_medium_risk`` (that switch is unaffected either way), it
+        names this feature and this head SHA specifically — the same
+        fingerprint-and-redeem shape :meth:`_approved_for` already uses for a
+        HIGH-risk plan, applied here to a MEDIUM-risk merge instead of a
+        build — and it is consumed the moment it is used. A feature whose
+        head SHA has moved since the approval was issued gets a fingerprint
+        mismatch, not a stale yes: see ``approvals.py``'s module docstring.
+        """
+        if (feature.risk or "").strip().upper() != Risk.MEDIUM.value:
+            return False
+        token = str(feature.metadata.get("ship_approval_token", ""))
+        if not token or self.approvals is None:
+            return False
+        try:
+            self.approvals.redeem(
+                token,
+                capability="feature.ship",
+                subject=feature.id,
+                parameters={"risk": feature.risk, "head_sha": head_sha},
+            )
+        except ApprovalError as exc:
+            feature.metadata["ship_approval_error"] = str(exc)
+            return False
+        feature.metadata["ship_approved_head_sha"] = head_sha
+        feature.metadata.pop("ship_approval_token", None)
         return True
 
     def _proposed_criteria(self, feature: FeatureRequest) -> Sequence[Criterion]:

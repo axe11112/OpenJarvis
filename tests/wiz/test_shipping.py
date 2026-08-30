@@ -120,6 +120,64 @@ class TestItIsNotReliabilitysSwitch:
         assert not decision.allowed
 
 
+class TestMediumRiskOneOffApproval:
+    """A one-off owner yes for one specific MEDIUM-risk feature — distinct
+    from merge_medium_risk, which stays off by default either way. See
+    FeaturePipeline._medium_ship_approved for where the "yes" actually gets
+    verified as a redeemed, fingerprint-bound approval; this only tests that
+    evaluate_shipping's gate correctly reacts to the resulting bool.
+    """
+
+    def test_medium_without_approval_or_policy_is_refused(self):
+        decision = evaluate_shipping(
+            ready_feature(risk="MEDIUM"),
+            policy=FeatureShippingPolicy(),
+            pull_request=open_pr(),
+        )
+        assert not decision.allowed
+        assert any(g.name == "risk_level_shippable" for g in decision.refusals)
+
+    def test_medium_with_a_one_off_approval_passes_without_the_policy(self):
+        decision = evaluate_shipping(
+            ready_feature(risk="MEDIUM"),
+            policy=FeatureShippingPolicy(),  # merge_medium_risk stays False
+            pull_request=open_pr(),
+            medium_risk_approved=True,
+        )
+        assert all(g.passed for g in decision.gates if g.name == "risk_level_shippable")
+
+    def test_a_medium_approval_does_not_widen_high(self):
+        decision = evaluate_shipping(
+            ready_feature(risk="HIGH"),
+            policy=FeatureShippingPolicy(),
+            pull_request=open_pr(),
+            medium_risk_approved=True,
+        )
+        assert not decision.allowed
+        assert "needs your approval" in decision.explain()
+
+    def test_the_standing_policy_default_is_unaffected_by_a_one_off_approval(self):
+        policy = FeatureShippingPolicy()
+        evaluate_shipping(
+            ready_feature(risk="MEDIUM"),
+            policy=policy,
+            pull_request=open_pr(),
+            medium_risk_approved=True,
+        )
+        assert not policy.merge_medium_risk
+
+    def test_low_risk_is_unaffected_by_a_medium_approval_flag(self):
+        # medium_risk_approved names MEDIUM specifically; it must not leak
+        # into LOW's own (separate) policy-driven gate.
+        decision = evaluate_shipping(
+            ready_feature(risk="LOW"),
+            policy=FeatureShippingPolicy(),  # merge_low_risk stays False too
+            pull_request=open_pr(),
+            medium_risk_approved=True,
+        )
+        assert not decision.allowed
+
+
 class TestOnlyTheVerifiedCommit:
     def test_a_branch_that_moved_since_verification_does_not_merge(self):
         # The whole reason for pinning the SHA: a push between verification and

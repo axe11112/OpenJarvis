@@ -191,6 +191,7 @@ def evaluate_shipping(
     base_sha_at_verification: str = "",
     observed_base_sha: str = "",
     operator_approved: bool = False,
+    medium_risk_approved: bool = False,
 ) -> ShipDecision:
     """Decide whether *feature* may be merged.
 
@@ -199,6 +200,17 @@ def evaluate_shipping(
     reachable from a test. The same discipline the reliability merge decision
     uses, for the same reason: a merge decision that cannot be reproduced
     offline cannot be reviewed.
+
+    ``medium_risk_approved`` is a one-off, per-feature yes for a MEDIUM-risk
+    feature the standing ``merge_medium_risk`` policy would otherwise refuse —
+    the caller's job, not this function's, to have verified that "yes" is a
+    redeemed, fingerprint-bound approval naming this exact feature and head
+    SHA (see :meth:`FeaturePipeline._medium_ship_approved`), never a bare
+    flag. It changes nothing about HIGH, which keeps its own, separate
+    ``operator_approved`` gate exactly as it was; the two are not the same
+    knob; and it changes nothing about the standing policy default, which
+    stays whatever ``merge_medium_risk`` says regardless of any one feature's
+    approval.
     """
     gates: List[ShipGate] = []
 
@@ -217,18 +229,20 @@ def evaluate_shipping(
             else "you approved this high-risk feature",
         )
     else:
-        allowed = policy.merge_allowed_for(risk)
-        gate(
-            "risk_level_shippable",
-            allowed,
-            f"automatic merging of {risk or 'unclassified'}-risk features is on"
-            if allowed
-            else (
+        policy_allows = policy.merge_allowed_for(risk)
+        one_off_approved = risk == Risk.MEDIUM.value and medium_risk_approved
+        allowed = policy_allows or one_off_approved
+        if policy_allows:
+            detail = f"automatic merging of {risk or 'unclassified'}-risk features is on"
+        elif one_off_approved:
+            detail = "the owner explicitly approved shipping this specific MEDIUM-risk feature"
+        else:
+            detail = (
                 f"automatic merging of {risk or 'unclassified'}-risk features "
                 "is off. Turning on automatic repair of production did not turn "
                 "this on; it is a separate setting."
-            ),
-        )
+            )
+        gate("risk_level_shippable", allowed, detail)
 
     # -- 2. the feature actually finished ---------------------------------
     gate(
@@ -464,6 +478,7 @@ class FeatureShipper:
         base_sha_at_verification: str = "",
         observed_base_sha: str = "",
         operator_approved: bool = False,
+        medium_risk_approved: bool = False,
     ) -> Dict[str, Any]:
         """Merge the feature's pull request, if every gate and authority agree.
 
@@ -498,6 +513,7 @@ class FeatureShipper:
             base_sha_at_verification=base_sha_at_verification,
             observed_base_sha=observed_base_sha,
             operator_approved=operator_approved,
+            medium_risk_approved=medium_risk_approved,
         )
         if not decision.allowed:
             return {
