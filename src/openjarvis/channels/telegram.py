@@ -64,6 +64,18 @@ class TelegramChannel(BaseChannel):
             self._status = ChannelStatus.ERROR
             return
 
+        if self._listener_thread is not None and self._listener_thread.is_alive():
+            # A caller that connects an already-connected channel is not
+            # asking for a second listener — reliability's watch loop and the
+            # Wiz owner door both call connect() on the one channel they
+            # share, and calling it twice used to start two long-polls
+            # against the same bot token. Telegram allows only one; the loser
+            # gets killed with a Conflict error and immediately restarts,
+            # over and over. Idempotent instead: the listener already running
+            # does everything a second one would.
+            logger.debug("Telegram channel already connected; not starting a second listener")
+            return
+
         self._stop_event.clear()
         self._status = ChannelStatus.CONNECTING
 

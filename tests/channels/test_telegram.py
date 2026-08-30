@@ -148,6 +148,50 @@ class TestStatus:
         assert ch.status() == ChannelStatus.ERROR
 
 
+class TestConnectIsIdempotent:
+    """Two callers sharing one channel must not open two long-polls.
+
+    Found live: ``jarvis reliability watch`` calls ``connect()`` once for
+    itself and once more inside ``TelegramOwnerDoor.start()`` on the exact
+    same channel object. Telegram allows only one getUpdates consumer per bot
+    token; the second connect used to start a second listener thread, and the
+    two then fought forever with "Conflict: terminated by other getUpdates
+    request", each restart re-triggering the same fight.
+
+    ``_poll_loop`` is stubbed out here so these tests exercise the threading
+    guard in ``connect()`` without opening a real long-poll against Telegram.
+    """
+
+    @staticmethod
+    def _fake_poll_loop(self):
+        self._stop_event.wait()
+
+    def test_a_second_connect_does_not_start_a_second_listener_thread(self):
+        with patch.object(TelegramChannel, "_poll_loop", self._fake_poll_loop):
+            ch = TelegramChannel(bot_token="123:ABC")
+            ch.connect()
+            first_thread = ch._listener_thread
+            assert first_thread is not None and first_thread.is_alive()
+
+            ch.connect()
+
+            assert ch._listener_thread is first_thread
+            ch.disconnect()
+
+    def test_connect_after_disconnect_does_start_a_new_listener(self):
+        with patch.object(TelegramChannel, "_poll_loop", self._fake_poll_loop):
+            ch = TelegramChannel(bot_token="123:ABC")
+            ch.connect()
+            first_thread = ch._listener_thread
+            ch.disconnect()
+
+            ch.connect()
+
+            assert ch._listener_thread is not None
+            assert ch._listener_thread is not first_thread
+            ch.disconnect()
+
+
 class TestAllowedChatIds:
     """Tests for the allowed_chat_ids enforcement in _poll_loop."""
 
