@@ -119,21 +119,42 @@ class FeatureVerification:
 
     @property
     def unchecked(self) -> List[CriterionOutcome]:
-        return [o for o in self.outcomes if o.passed is None]
+        """Nothing in the compiled probe covered this, and it genuinely
+        could have. Excludes a VIEWPORT criterion with no selector (see
+        :attr:`~.acceptance.Criterion.is_an_unmeasured_layout_check`): that
+        one is not a probe that failed to cover something it should have —
+        it is exactly what :func:`~.acceptance.contract_for` generates on
+        purpose, with no automatic overflow measurement yet to give it
+        something to assert — and is reported through
+        :attr:`awaiting_a_person` instead, exactly like a MANUAL criterion.
+        Every other uncompilable shape (a CONTENT criterion with neither
+        text nor selector, say) still counts here: that criterion has
+        nothing wrong with the *system*, only with *it*, which is a real gap
+        worth reporting as a failure, not forgiving.
+        """
+        return [
+            o
+            for o in self.outcomes
+            if o.passed is None and not o.criterion.is_an_unmeasured_layout_check
+        ]
 
     @property
     def passed(self) -> bool:
-        """Whether every criterion was checked and every check passed.
+        """Whether every criterion this system can check, checked out.
 
-        Unchecked counts against. "No probe covered this" is not evidence that
-        the criterion holds, and a verifier that treats it as such succeeds most
-        reliably when it is broken.
+        A genuinely unchecked criterion still counts against this: "no probe
+        covered this" is not evidence that the criterion holds, and a
+        verifier that treats it as such succeeds most reliably when it is
+        broken. A structurally uncheckable one does not — see
+        :attr:`unchecked` — because "cannot be checked" was never "does not
+        hold" to begin with; :attr:`complete` is what still gates it behind a
+        person via :attr:`awaiting_a_person`.
         """
         if self.error:
             return False
         if not self.outcomes:
             return False
-        return all(o.passed is True for o in self.outcomes)
+        return not self.failed and not self.unchecked
 
     @property
     def complete(self) -> bool:
@@ -330,6 +351,13 @@ class FeatureVerifier:
         for criterion in browser_criteria:
             if id(criterion) not in checked_criteria:
                 verification.outcomes.append(CriterionOutcome(criterion=criterion))
+                if criterion.is_an_unmeasured_layout_check:
+                    # Not a probe that missed its coverage — this specific,
+                    # deliberately-generated shape has no automatic overflow
+                    # measurement yet. Reported the same way a MANUAL
+                    # criterion is, so it gates completion without reading
+                    # as a failure.
+                    verification.awaiting_a_person.append(criterion.description)
 
         return verification
 

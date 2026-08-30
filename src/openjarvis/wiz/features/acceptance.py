@@ -213,6 +213,40 @@ class Criterion:
         """Whether anything in this system can decide this criterion."""
         return self.kind not in UNCHECKABLE_KINDS
 
+    @property
+    def compiles_to_a_browser_check(self) -> bool:
+        """Whether :meth:`AcceptanceContract._spec_for_route` can turn this
+        criterion into an actual browser expectation or assertion."""
+        if self.kind == CONTENT:
+            return bool(self.selector or self.text)
+        if self.kind == INTERACTION:
+            return bool(self.selector or self.then_selector or self.then_text)
+        if self.kind == VIEWPORT:
+            return bool(self.selector)
+        if self.kind in (CONSOLE, NETWORK):
+            return True
+        return False
+
+    @property
+    def is_an_unmeasured_layout_check(self) -> bool:
+        """A VIEWPORT criterion with no selector — not malformed, just not
+        automatable yet.
+
+        Distinct from :attr:`compiles_to_a_browser_check`, which is also
+        ``False`` for e.g. a CONTENT criterion with neither ``text`` nor
+        ``selector`` — but that shape means the criterion itself has nothing
+        in it, a real defect worth reporting as a failure. This one instead
+        is exactly what :func:`contract_for` generates on purpose whenever a
+        request names no specific element to check, because there is
+        currently no automatic overflow measurement to give it something to
+        assert (see ``_spec_for_route``'s own comment on this). Only this
+        specific, deliberately-generated shape should be treated as a limit
+        of what this system can automate — reported through
+        :attr:`~openjarvis.wiz.features.verification.FeatureVerification.awaiting_a_person`
+        rather than as a failure — not every uncompilable criterion.
+        """
+        return self.kind == VIEWPORT and not self.selector
+
     def applies_to(self, viewport: Viewport) -> bool:
         return not self.viewports or viewport.name in self.viewports
 

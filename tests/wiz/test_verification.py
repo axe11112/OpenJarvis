@@ -16,6 +16,7 @@ from openjarvis.wiz.features.acceptance import (
     DESKTOP,
     MANUAL,
     NETWORK,
+    VIEWPORT,
     AcceptanceContract,
     Criterion,
     contract_for,
@@ -232,6 +233,69 @@ class TestUncheckedIsNotPassed:
         )
         assert not result.passed
         assert result.error or result.unchecked
+
+
+class TestUnmeasuredLayoutChecksDoNotFailAlone:
+    """A VIEWPORT criterion with no selector — exactly what contract_for()
+    generates whenever a request names no specific element — has no
+    automatic overflow measurement yet. It must gate completion like a
+    MANUAL criterion, not read as a failed check: found on FEAT-00017, where
+    every real, checkable criterion passed but the feature still reported
+    as failed because of these two.
+    """
+
+    #: Request text with no quoted label, so contract_for() falls back to
+    #: the selector-less VIEWPORT criteria rather than CONTENT ones.
+    NO_LABEL_REQUEST = "Change one small piece of text on the landing page"
+
+    def test_passing_checks_alongside_unmeasured_layout_criteria_still_pass(self):
+        contract = contract_for(feature_id="FEAT-5", request=self.NO_LABEL_REQUEST)
+        assert any(c.kind == VIEWPORT and not c.selector for c in contract.criteria)
+
+        # PageStateRunner, not FakeRunner: it reports the same per-check
+        # detail the real browser runner does, which is what lets an
+        # unattributed VIEWPORT criterion fall through as genuinely
+        # unchecked rather than inheriting a blanket pass/fail.
+        result = verifier(PageStateRunner()).verify(
+            contract, preview_url="https://preview.app"
+        )
+
+        assert result.passed, result.summary()
+
+    def test_it_still_gates_completion_like_a_manual_criterion(self):
+        contract = contract_for(feature_id="FEAT-5", request=self.NO_LABEL_REQUEST)
+        result = verifier(PageStateRunner()).verify(
+            contract, preview_url="https://preview.app"
+        )
+        assert result.passed
+        assert not result.complete
+        assert result.awaiting_a_person
+
+    def test_a_genuine_content_failure_still_fails_alongside_it(self):
+        # The forgiveness is narrow: a real, checkable failure right next to
+        # an unmeasured layout criterion still fails the feature.
+        contract = contract_for(feature_id="FEAT-5", request=self.NO_LABEL_REQUEST)
+        result = verifier(PageStateRunner(console_ok=False)).verify(
+            contract, preview_url="https://preview.app"
+        )
+        assert not result.passed
+
+    def test_an_empty_content_criterion_is_not_forgiven_the_same_way(self):
+        # Narrower than "anything uncompilable": a CONTENT criterion with
+        # neither text nor selector has nothing wrong with the system, only
+        # with itself, and must still count as a real, reportable gap.
+        contract = AcceptanceContract(
+            feature_id="FEAT-6",
+            criteria=(
+                Criterion(kind=CONTENT, route="/b", description="/b looks right"),
+            ),
+        )
+        result = verifier(FakeRunner()).verify(
+            contract, preview_url="https://preview.app"
+        )
+        assert not result.passed
+        assert result.unchecked
+        assert not result.awaiting_a_person
 
 
 class TestPerCriterionAttribution:
