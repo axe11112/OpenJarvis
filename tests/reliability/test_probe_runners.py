@@ -934,6 +934,35 @@ class TestProbeHeaders:
         result = runner.run(spec, base_url=site.base_url)
         assert result.success, result.error
 
+    def test_accept_language_defaults_to_english(self, site):
+        """A probe must check the same language every time.
+
+        Found via FEAT-00017: a target that reads Accept-Language to pick a
+        language (rather than a cookie or query param) falls back to
+        whatever it considers "no preference" otherwise — a bilingual site
+        under test silently checked in a different language than every
+        content assertion was written against.
+        """
+        pytest.importorskip("playwright.sync_api")
+        runner = BrowserProbeRunner(headless=True)
+        spec = _browser_spec(
+            steps=[{"action": "goto", "url": "/echo-headers"}],
+            expect=[{"kind": "text", "value": "accept-language: en-US"}],
+        )
+        result = runner.run(spec, base_url=site.base_url)
+        assert result.success, result.error
+
+    def test_a_spec_level_accept_language_still_wins(self, site):
+        pytest.importorskip("playwright.sync_api")
+        runner = BrowserProbeRunner(headless=True)
+        spec = _browser_spec(
+            steps=[{"action": "goto", "url": "/echo-headers"}],
+            headers={"accept-language": "sv-SE"},
+            expect=[{"kind": "text", "value": "accept-language: sv-SE"}],
+        )
+        result = runner.run(spec, base_url=site.base_url)
+        assert result.success, result.error
+
 
 # ---------------------------------------------------------------------------
 # Access profiles (Vercel preview protection)

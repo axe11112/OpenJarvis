@@ -188,6 +188,18 @@ class BrowserProbeRunner(BaseProbeRunner):
         and then to Playwright's bundled browser.
     viewport:
         ``(width, height)``.
+    locale:
+        Browser locale, and the default ``Accept-Language`` sent with every
+        request. Deliberately not the machine's own locale: a probe run
+        against a multi-language site must check the same language every
+        time regardless of what happens to be installed on whichever host
+        runs it, and a target that reads ``Accept-Language`` (rather than a
+        cookie or query param) to pick a language falls back to whatever it
+        considers a "no preference" default otherwise — silently checking a
+        different page than the one every other assertion was written
+        against. A spec's own ``headers``/``headers_from_env`` still wins:
+        this only fills in ``Accept-Language`` when the spec did not ask for
+        a particular one itself.
     """
 
     runner_id = "browser"
@@ -198,12 +210,14 @@ class BrowserProbeRunner(BaseProbeRunner):
         headless: bool = True,
         executable_path: str = "",
         viewport: tuple[int, int] = (1280, 720),
+        locale: str = "en-US",
     ) -> None:
         self._headless = headless
         self._executable_path = executable_path or os.environ.get(
             BROWSER_EXECUTABLE_ENV, ""
         )
         self._viewport = viewport
+        self._locale = locale
 
     # -- entry point ------------------------------------------------------
 
@@ -233,6 +247,17 @@ class BrowserProbeRunner(BaseProbeRunner):
         )
         headers.update(access_headers)
         header_secrets.update(access_secrets)
+        # Chromium's own locale-driven Accept-Language wins over
+        # set_extra_http_headers for this specific header on navigation
+        # requests, so the two must never both apply: pass `locale` to the
+        # context only when the spec left Accept-Language unset, and let an
+        # explicit spec header carry the whole thing otherwise.
+        spec_set_language = any(k.lower() == "accept-language" for k in headers)
+        if self._locale and not spec_set_language:
+            base = self._locale.split("-")[0]
+            headers["Accept-Language"] = (
+                f"{self._locale},{base};q=0.9" if base != self._locale else self._locale
+            )
         # Header secrets go into the redactor alongside credentials: a bypass
         # token travels on every request, so it is the value most likely to be
         # echoed back in an error page or a captured URL.
@@ -280,6 +305,7 @@ class BrowserProbeRunner(BaseProbeRunner):
             context = browser.new_context(
                 viewport={"width": self._viewport[0], "height": self._viewport[1]},
                 ignore_https_errors=False,
+                locale=None if spec_set_language else (self._locale or None),
             )
             context.set_default_timeout(spec.timeout_ms)
             if headers:
