@@ -192,6 +192,7 @@ def evaluate_shipping(
     observed_base_sha: str = "",
     operator_approved: bool = False,
     medium_risk_approved: bool = False,
+    awaiting_items_approved: bool = False,
 ) -> ShipDecision:
     """Decide whether *feature* may be merged.
 
@@ -211,6 +212,14 @@ def evaluate_shipping(
     knob; and it changes nothing about the standing policy default, which
     stays whatever ``merge_medium_risk`` says regardless of any one feature's
     approval.
+
+    ``awaiting_items_approved`` is the same shape, for a different gate: a
+    person confirming the specific outstanding item(s) a MANUAL criterion —
+    or a criterion this system cannot automate yet, such as an unmeasured
+    layout check — leaves open. See
+    :meth:`FeaturePipeline._awaiting_items_approved`; the caller's job again
+    is to have verified a redeemed approval naming this feature, this head
+    SHA, and this exact set of outstanding items, not to pass a bare flag.
     """
     gates: List[ShipGate] = []
 
@@ -274,10 +283,16 @@ def evaluate_shipping(
         bool(acceptance.get("passed")),
         acceptance.get("summary", "the acceptance checks did not pass"),
     )
+    outstanding = list(acceptance.get("awaiting_a_person") or [])
     gate(
         "nothing_awaiting_a_person",
-        not acceptance.get("awaiting_a_person"),
-        "; ".join(acceptance.get("awaiting_a_person") or []) or "nothing outstanding",
+        not outstanding or awaiting_items_approved,
+        (
+            "the owner explicitly confirmed the outstanding item(s): "
+            + "; ".join(outstanding)
+            if outstanding and awaiting_items_approved
+            else "; ".join(outstanding) or "nothing outstanding"
+        ),
     )
 
     # -- 3. the thing being merged is the thing that was verified ---------
@@ -479,6 +494,7 @@ class FeatureShipper:
         observed_base_sha: str = "",
         operator_approved: bool = False,
         medium_risk_approved: bool = False,
+        awaiting_items_approved: bool = False,
     ) -> Dict[str, Any]:
         """Merge the feature's pull request, if every gate and authority agree.
 
@@ -514,6 +530,7 @@ class FeatureShipper:
             observed_base_sha=observed_base_sha,
             operator_approved=operator_approved,
             medium_risk_approved=medium_risk_approved,
+            awaiting_items_approved=awaiting_items_approved,
         )
         if not decision.allowed:
             return {

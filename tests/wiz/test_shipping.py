@@ -178,6 +178,60 @@ class TestMediumRiskOneOffApproval:
         assert not decision.allowed
 
 
+class TestAwaitingAPersonOneOffApproval:
+    """A confirmed-outstanding-items approval, for the separate
+    nothing_awaiting_a_person gate — distinct from risk entirely. A feature
+    can be LOW risk and still have something a person needs to look at (an
+    unmeasured layout check, an explicit MANUAL criterion).
+    """
+
+    def _feature_with_outstanding(self, items):
+        feature = ready_feature(risk="LOW")
+        feature.metadata["verification"]["awaiting_a_person"] = list(items)
+        return feature
+
+    def test_outstanding_items_without_approval_are_refused(self):
+        decision = evaluate_shipping(
+            self._feature_with_outstanding(["/ renders without layout overflow"]),
+            policy=FeatureShippingPolicy(merge_low_risk=True),
+            pull_request=open_pr(),
+        )
+        assert not decision.allowed
+        assert any(g.name == "nothing_awaiting_a_person" for g in decision.refusals)
+
+    def test_a_one_off_approval_passes_the_gate(self):
+        decision = evaluate_shipping(
+            self._feature_with_outstanding(["/ renders without layout overflow"]),
+            policy=FeatureShippingPolicy(merge_low_risk=True),
+            pull_request=open_pr(),
+            awaiting_items_approved=True,
+        )
+        assert all(
+            g.passed for g in decision.gates if g.name == "nothing_awaiting_a_person"
+        )
+
+    def test_nothing_outstanding_needs_no_approval(self):
+        decision = evaluate_shipping(
+            ready_feature(risk="LOW"),  # verification.awaiting_a_person == []
+            policy=FeatureShippingPolicy(merge_low_risk=True),
+            pull_request=open_pr(),
+        )
+        assert all(
+            g.passed for g in decision.gates if g.name == "nothing_awaiting_a_person"
+        )
+
+    def test_a_manual_approval_does_not_widen_the_risk_gate(self):
+        decision = evaluate_shipping(
+            self._feature_with_outstanding(["needs a look"]),
+            policy=FeatureShippingPolicy(),
+            pull_request=open_pr(),
+            awaiting_items_approved=True,
+        )
+        # ready_feature() defaults to LOW with merge_low_risk off by default
+        assert not decision.allowed
+        assert any(g.name == "risk_level_shippable" for g in decision.refusals)
+
+
 class TestOnlyTheVerifiedCommit:
     def test_a_branch_that_moved_since_verification_does_not_merge(self):
         # The whole reason for pinning the SHA: a push between verification and

@@ -1947,6 +1947,129 @@ class TestMediumRiskOneOffShipApproval:
         assert pipeline.shipper.policy.merge_medium_risk is False
 
 
+class TestAwaitingItemsOneOffShipApproval:
+    """The full, real path for the separate nothing_awaiting_a_person gate:
+    a redeemed approval bound to this feature, this exact head SHA, and this
+    exact set of outstanding items is the only thing that lets a feature
+    with something a person needs to look at still ship.
+    """
+
+    def _shipper(self, github):
+        from openjarvis.wiz.features.shipping import (
+            FeatureShipper,
+            FeatureShippingPolicy,
+        )
+
+        return FeatureShipper(
+            # merge_medium_risk on, so this test isolates the awaiting-items
+            # gate rather than also needing a risk approval.
+            policy=FeatureShippingPolicy(merge_medium_risk=True),
+            github=github,
+            authority=AuthorityPolicy(
+                grants={
+                    Channel.CONTROL_CENTER: frozenset(
+                        {Authority.PR_WRITE, Authority.PRODUCTION_CHANGE}
+                    )
+                }
+            ),
+        )
+
+    def _ready_with_outstanding_item(self, tmp_path, clock, approvals):
+        github = TestShip.FakeGitHub()
+        pipeline = build_pipeline(tmp_path, clock, approvals=approvals)
+        pipeline.shipper = self._shipper(github)
+        pipeline.postship = TestShip.FakePostShip(verified=True)
+        submitted = pipeline.submit(REQUEST, actor=operator_actor())
+        feature = pipeline.run(submitted.id)
+        assert feature.state is FeatureState.READY
+        feature.metadata["verification"]["awaiting_a_person"] = [
+            "/ renders without layout overflow"
+        ]
+        pipeline.store.save(feature)
+        return pipeline, feature, github
+
+    def _approvals(self):
+        from openjarvis.wiz.approvals import ApprovalStore
+
+        return ApprovalStore(clock=lambda: 0.0, ttl_seconds=900)
+
+    def test_an_outstanding_item_without_approval_is_refused(self, tmp_path, clock):
+        pipeline, feature, github = self._ready_with_outstanding_item(
+            tmp_path, clock, self._approvals()
+        )
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.READY
+        assert not github.merge_calls
+
+    def test_a_valid_approval_for_this_feature_head_and_items_ships(
+        self, tmp_path, clock
+    ):
+        approvals = self._approvals()
+        pipeline, feature, github = self._ready_with_outstanding_item(
+            tmp_path, clock, approvals
+        )
+        approval = approvals.issue(
+            capability="feature.ship_manual_items",
+            subject=feature.id,
+            parameters={
+                "head_sha": TestShip.HEAD_SHA,
+                "outstanding": ["/ renders without layout overflow"],
+            },
+        )
+        feature.metadata["ship_manual_approval_token"] = approval.token
+        pipeline.store.save(feature)
+
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.COMPLETE
+        assert github.merge_calls
+        assert (
+            shipped.metadata["ship_manual_approved_head_sha"] == TestShip.HEAD_SHA
+        )
+        assert "ship_manual_approval_token" not in shipped.metadata
+
+    def test_approval_for_a_different_set_of_items_is_refused(self, tmp_path, clock):
+        # A new outstanding item appearing changes the fingerprint, exactly
+        # like a moved head SHA.
+        approvals = self._approvals()
+        pipeline, feature, github = self._ready_with_outstanding_item(
+            tmp_path, clock, approvals
+        )
+        approval = approvals.issue(
+            capability="feature.ship_manual_items",
+            subject=feature.id,
+            parameters={
+                "head_sha": TestShip.HEAD_SHA,
+                "outstanding": ["a different outstanding item entirely"],
+            },
+        )
+        feature.metadata["ship_manual_approval_token"] = approval.token
+        pipeline.store.save(feature)
+
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.READY
+        assert not github.merge_calls
+
+    def test_approval_for_a_different_feature_does_not_transfer(self, tmp_path, clock):
+        approvals = self._approvals()
+        pipeline, feature, github = self._ready_with_outstanding_item(
+            tmp_path, clock, approvals
+        )
+        approval = approvals.issue(
+            capability="feature.ship_manual_items",
+            subject="FEAT-SOMEONE-ELSE",
+            parameters={
+                "head_sha": TestShip.HEAD_SHA,
+                "outstanding": ["/ renders without layout overflow"],
+            },
+        )
+        feature.metadata["ship_manual_approval_token"] = approval.token
+        pipeline.store.save(feature)
+
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.READY
+        assert not github.merge_calls
+
+
 class TestAutoShipIfEligible:
     """`auto_ship_if_eligible`: the only caller allowed to reach `ship` on its
     own, and only for LOW risk with `merge_low_risk` on.

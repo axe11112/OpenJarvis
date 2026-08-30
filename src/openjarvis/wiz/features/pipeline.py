@@ -393,8 +393,10 @@ class FeaturePipeline:
                 logger.warning("could not read CI status for %s: %s", feature.id, exc)
                 status = {"state": "unreadable", "contexts": {}}
 
-        medium_risk_approved = self._medium_ship_approved(
-            feature, head_sha=str(pr.get("head_sha", ""))
+        head_sha = str(pr.get("head_sha", ""))
+        medium_risk_approved = self._medium_ship_approved(feature, head_sha=head_sha)
+        awaiting_items_approved = self._awaiting_items_approved(
+            feature, head_sha=head_sha
         )
 
         merge_result = self.shipper.merge_feature(
@@ -405,6 +407,7 @@ class FeaturePipeline:
             observed_base_sha=pr.get("base_sha", ""),
             operator_approved=operator_approved,
             medium_risk_approved=medium_risk_approved,
+            awaiting_items_approved=awaiting_items_approved,
         )
         if not merge_result.get("merged"):
             if pr.get("merged"):
@@ -1350,6 +1353,43 @@ class FeaturePipeline:
             return False
         feature.metadata["ship_approved_head_sha"] = head_sha
         feature.metadata.pop("ship_approval_token", None)
+        return True
+
+    def _awaiting_items_approved(
+        self, feature: FeatureRequest, *, head_sha: str
+    ) -> bool:
+        """Whether a live, redeemed approval confirms this exact feature's
+        current outstanding "needs a person" items at this exact head SHA.
+
+        Same shape as :meth:`_medium_ship_approved`, for the
+        ``nothing_awaiting_a_person`` gate instead of the risk gate: bound to
+        the feature, the head SHA, and the exact *set* of outstanding
+        descriptions currently stored — not just their count, and not "any
+        approval this feature has ever gotten". A new manual criterion
+        appearing, or the diff changing what a criterion could not measure,
+        changes the fingerprint and the approval no longer matches, the same
+        way a moved head SHA already does not.
+        """
+        token = str(feature.metadata.get("ship_manual_approval_token", ""))
+        if not token or self.approvals is None:
+            return False
+        outstanding = sorted(
+            (feature.metadata.get("verification") or {}).get("awaiting_a_person") or []
+        )
+        if not outstanding:
+            return False
+        try:
+            self.approvals.redeem(
+                token,
+                capability="feature.ship_manual_items",
+                subject=feature.id,
+                parameters={"head_sha": head_sha, "outstanding": outstanding},
+            )
+        except ApprovalError as exc:
+            feature.metadata["ship_manual_approval_error"] = str(exc)
+            return False
+        feature.metadata["ship_manual_approved_head_sha"] = head_sha
+        feature.metadata.pop("ship_manual_approval_token", None)
         return True
 
     def _proposed_criteria(self, feature: FeatureRequest) -> Sequence[Criterion]:
