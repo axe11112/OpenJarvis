@@ -23,6 +23,7 @@ independent verification decides whether a repair worked.
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import subprocess
 from abc import ABC, abstractmethod
@@ -38,6 +39,7 @@ __all__ = [
     "CodeAgentResult",
     "ClaudeCliAgent",
     "FakeCodeAgent",
+    "TRANSIENT_CAPACITY_PATTERN",
     "changed_files",
     "diff_stat",
 ]
@@ -45,6 +47,32 @@ __all__ = [
 
 class CodeAgentError(RuntimeError):
     """Raised when the coding agent cannot be run at all."""
+
+
+#: Claude Code being out of capacity for now, not the session failing to
+#: understand or accomplish the task. Matched across stdout *and* stderr: in
+#: ``--output-format text`` mode this message is the CLI's own final assistant
+#: text and lands on stdout, so a check that only looked at stderr (or only at
+#: the exit code) would silently turn a known, transient capacity limit into
+#: an opaque "exit code 1" — which is exactly what happened to FEAT-00017.
+TRANSIENT_CAPACITY_PATTERN = re.compile(
+    r"(session|usage) limit|rate limit exceeded", re.IGNORECASE
+)
+
+
+def _transient_capacity_message(stdout: str, stderr: str) -> Optional[str]:
+    """The line describing a known transient-capacity failure, if present.
+
+    stderr is checked first: if the CLI ever does put this on stderr, that is
+    the more deliberate signal. Falls back to stdout for the headless
+    text-output case where it is the last thing Claude said, not an error
+    stream write.
+    """
+    for text in (stderr, stdout):
+        for line in text.splitlines():
+            if TRANSIENT_CAPACITY_PATTERN.search(line):
+                return line.strip()
+    return None
 
 
 @dataclass(slots=True)
@@ -283,12 +311,20 @@ class ClaudeCliAgent(CodeAgent):
         stderr = getattr(proc, "stderr", "") or ""
 
         if returncode != 0:
+            transient = _transient_capacity_message(stdout, stderr)
+            metadata: dict = {}
+            if transient is not None:
+                error_text = transient
+                metadata["transient_reason"] = "usage_limit"
+            else:
+                error_text = stderr.strip() or f"exit code {returncode}"
             return CodeAgentResult(
                 claim=stdout.strip(),
                 succeeded=False,
-                error=(stderr.strip() or f"exit code {returncode}")[:2000],
+                error=error_text[:2000],
                 changed_files=files,
                 diff_stat=stat,
+                metadata=metadata,
             )
 
         return CodeAgentResult(

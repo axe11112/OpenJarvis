@@ -639,6 +639,8 @@ class FeaturePipeline:
         session = self.engineer.plan(pack, workspace=worktree.path)
 
         if not session.succeeded:
+            if session.metadata.get("transient_reason") == "usage_limit":
+                return self._retry_transient_plan_failure(feature, session)
             return self._stop(
                 feature,
                 f"I could not work out how to build this: {session.error}",
@@ -1087,6 +1089,39 @@ class FeaturePipeline:
         return feature
 
     # -- the iterative loop -------------------------------------------------
+
+    def _retry_transient_plan_failure(
+        self, feature: FeatureRequest, session: Any
+    ) -> StepResult:
+        """Claude Code was out of capacity, not unable to understand the task.
+
+        A usage-limit exit is not evidence the request is hard to build — it
+        is evidence the machine ran out of runway. Treating it like an
+        ordinary plan failure sent a fine, unread request to a human with a
+        message ("could not work out how to build this: exit code 1") that
+        did not even say what actually happened, which is exactly what
+        FEAT-00017 hit.
+
+        Reuses the same bounded-attempts policy and the same shape
+        :meth:`_retry_or_stop` already applies to build failures: state stays
+        at ``UNDERSTANDING`` — ``UNDERSTANDING -> UNDERSTANDING`` is not a
+        transition, and pretending it is would put a step in the history that
+        never happened — and :meth:`StepResult.progressed` defaults to
+        ``True``, so :meth:`run`'s own loop is what retries, immediately,
+        with no new scheduler and no worktree torn down. Only once the bound
+        is spent does this give up, and even then with the real reason.
+        """
+        attempts = int(feature.metadata.get("plan_transient_attempts", 0)) + 1
+        feature.metadata["plan_transient_attempts"] = attempts
+        feature.updated_at = self.clock()
+        self.store.save(feature)
+        reason = f"Claude Code usage/session limit: {session.error}"
+        self._record(feature, "feature.plan_transient_capacity", reason)
+
+        if attempts > self.max_attempts:
+            return self._stop(feature, reason, kind="feature.plan_capacity_exhausted")
+
+        return StepResult(feature, message="Claude Code is at its usage limit; retrying...")
 
     def _retry_or_stop(
         self, feature: FeatureRequest, attempt: FeatureAttempt, evidence: str

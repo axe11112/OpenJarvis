@@ -100,9 +100,10 @@ class ScriptedEngineer(ClaudeCodeEngineeringAgent):
     the operator's machine runs.
     """
 
-    def __init__(self, *, plan_claim="I would edit Summary.tsx", builds=None):
+    def __init__(self, *, plan_claim="I would edit Summary.tsx", plans=None, builds=None):
         super().__init__(agent_factory=self._never_called)
         self.plan_claim = plan_claim
+        self.plans = list(plans or [])
         self.builds = list(builds or [])
         self.plan_calls = []
         self.build_calls = []
@@ -116,6 +117,8 @@ class ScriptedEngineer(ClaudeCodeEngineeringAgent):
 
     def plan(self, pack, *, workspace):
         self.plan_calls.append((pack, workspace))
+        if self.plans:
+            return self.plans.pop(0)
         return EngineeringSession(mode="plan", succeeded=True, claim=self.plan_claim)
 
     def build(self, pack, *, workspace):
@@ -685,6 +688,95 @@ class TestTheIterativeLoop:
         sir_messages = [m for m in messages if m.startswith("Sir,")]
         assert len(sir_messages) == 1
         assert "could not get" in sir_messages[0]
+
+
+class TestPlanTransientCapacityFailure:
+    """A Claude Code usage-limit exit during planning is not a understanding failure.
+
+    Found on FEAT-00017: the planning session hit "You've hit your session
+    limit" mid-investigation, and the pipeline reported it to the operator as
+    "I could not work out how to build this: exit code 1" — losing the real
+    reason and treating a capacity limit as if the request were too hard to
+    plan.
+    """
+
+    def test_a_transient_failure_is_retried_automatically(self, tmp_path, clock):
+        engineer = ScriptedEngineer(
+            plans=[
+                EngineeringSession(
+                    mode="plan",
+                    succeeded=False,
+                    error="You've hit your session limit · resets 6:30pm",
+                    metadata={"transient_reason": "usage_limit"},
+                )
+            ]
+        )
+        pipeline = build_pipeline(tmp_path, clock, engineer=engineer)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert len(engineer.plan_calls) == 2
+
+    def test_the_operator_is_not_told_about_the_first_transient_failure(
+        self, tmp_path, clock
+    ):
+        engineer = ScriptedEngineer(
+            plans=[
+                EngineeringSession(
+                    mode="plan",
+                    succeeded=False,
+                    error="You've hit your session limit · resets 6:30pm",
+                    metadata={"transient_reason": "usage_limit"},
+                )
+            ]
+        )
+        pipeline = build_pipeline(tmp_path, clock, engineer=engineer)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        messages = []
+        for _ in range(20):
+            if feature.terminal or feature.state is FeatureState.READY:
+                break
+            step = pipeline.advance(feature)
+            feature = step.feature
+            messages.append(step.message)
+        # "Sir, ... is ready" is the legitimate success notice once the retry
+        # works; what must not appear is a failure notice about it.
+        assert not any("tried" in m or "usage limit" in m for m in messages if m.startswith("Sir,"))
+
+    def test_exhausting_the_bound_stops_with_the_real_reason(self, tmp_path, clock):
+        transient = EngineeringSession(
+            mode="plan",
+            succeeded=False,
+            error="You've hit your session limit · resets 6:30pm",
+            metadata={"transient_reason": "usage_limit"},
+        )
+        engineer = ScriptedEngineer(plans=[transient, transient, transient])
+        pipeline = build_pipeline(tmp_path, clock, engineer=engineer, max_attempts=2)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert len(engineer.plan_calls) == 3
+        reason = result.history[-1]["reason"]
+        assert "Claude Code usage/session limit" in reason
+        assert "session limit" in reason
+        assert "could not work out how to build this" not in reason
+
+    def test_a_non_transient_plan_failure_still_stops_immediately(self, tmp_path, clock):
+        engineer = ScriptedEngineer(
+            plans=[
+                EngineeringSession(
+                    mode="plan", succeeded=False, error="ambiguous request"
+                )
+            ]
+        )
+        pipeline = build_pipeline(tmp_path, clock, engineer=engineer)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert len(engineer.plan_calls) == 1
+        assert "could not work out how to build this: ambiguous request" in (
+            result.history[-1]["reason"]
+        )
 
 
 class TestVerificationDecides:
