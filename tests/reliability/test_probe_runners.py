@@ -355,6 +355,45 @@ class TestBrowserRunner:
         assert console
         assert "notAFunction" in console[0].content
 
+    def test_present_and_absent_text_expectations_are_reported_independently(
+        self, runner, site
+    ):
+        spec = _browser_spec(
+            steps=[{"action": "goto", "url": "/dashboard"}],
+            expect=[
+                {"kind": "text", "value": "Welcome back."},
+                {"kind": "not_text", "value": "Sign in"},
+            ],
+        )
+        result = runner.run(spec, base_url=site.base_url)
+        assert result.success, result.error
+        outcomes = result.metadata["expectation_outcomes"]
+        assert outcomes[0]["kind"] == "text"
+        assert outcomes[0]["passed"] is True
+        assert outcomes[1]["kind"] == "not_text"
+        assert outcomes[1]["passed"] is True
+
+    def test_a_failing_console_assertion_does_not_contaminate_a_passing_expectation(
+        self, runner, site
+    ):
+        # The page's own heading is genuinely present; its own script also
+        # genuinely throws. One must not blur into the other's result.
+        spec = _browser_spec(
+            steps=[{"action": "goto", "url": "/js-error"}],
+            expect=[{"kind": "text", "value": "Broken"}],
+            assertions={"no_console_errors": True},
+        )
+        result = runner.run(spec, base_url=site.base_url)
+        assert not result.success
+
+        outcomes = result.metadata["expectation_outcomes"]
+        assert outcomes[0]["passed"] is True
+        assert outcomes[0]["detail"] == ""
+
+        console = result.metadata["assertion_outcomes"]["console"]
+        assert console["passed"] is False
+        assert "JavaScript error" in console["detail"]
+
     def test_failed_xhr_is_captured_as_http_error(self, runner, site):
         spec = _browser_spec(
             steps=[

@@ -317,48 +317,91 @@ class BrowserProbeRunner(BaseProbeRunner):
                     page_title = page.title()
 
             failures: List[str] = []
+            # Per-expectation/per-assertion outcomes, additive to `failures`
+            # (which stays the single joined string every existing caller —
+            # including production reliability probes with nothing to do with
+            # feature acceptance — already reads). A spec bundles several
+            # declared expectations and cross-cutting assertions into one
+            # browser run; without this, a caller attributing results back to
+            # the thing that asked for each check (see
+            # ``openjarvis.wiz.features.verification``) has only the whole
+            # run's pass/fail and one merged error string to work with, and
+            # ends up reporting every check in the bundle as failed for
+            # whichever one actually failed. Left empty when steps never
+            # completed (`error` below) — nothing was evaluated, so there is
+            # nothing per-check to report; the whole run failing for that
+            # reason is not attribution, it is one real, shared cause.
+            expectation_outcomes: List[Dict[str, Any]] = []
+            assertion_outcomes: Dict[str, Dict[str, Any]] = {}
             if error:
                 failures.append(error)
             else:
                 for expectation in spec.expect:
                     problem = self._check(page, expectation, final_url, page_title)
+                    detail = redactor.redact(problem) if problem else ""
                     if problem:
-                        failures.append(redactor.redact(problem))
+                        failures.append(detail)
+                    expectation_outcomes.append(
+                        {
+                            "kind": expectation.kind,
+                            "selector": expectation.selector,
+                            "value": expectation.value,
+                            "matches": expectation.matches,
+                            "passed": not problem,
+                            "detail": detail,
+                        }
+                    )
                 if failures:
                     failure_kind = "assertion"
 
             duration = time.monotonic() - started
 
             # Cross-cutting assertions
-            if spec.assertions.no_console_errors and (
-                capture.console_errors or capture.page_errors
-            ):
+            if spec.assertions.no_console_errors:
                 count = len(capture.console_errors) + len(capture.page_errors)
-                failures.append(f"{count} JavaScript error(s) on the page")
-                failure_kind = failure_kind or "console_error"
-            if spec.assertions.no_failed_requests and capture.failed_requests:
-                failures.append(
-                    f"{len(capture.failed_requests)} network request(s) failed"
+                ok = count == 0
+                detail = "" if ok else f"{count} JavaScript error(s) on the page"
+                if not ok:
+                    failures.append(detail)
+                    failure_kind = failure_kind or "console_error"
+                assertion_outcomes["console"] = {"passed": ok, "detail": detail}
+            if spec.assertions.no_failed_requests:
+                ok = not capture.failed_requests
+                detail = (
+                    ""
+                    if ok
+                    else f"{len(capture.failed_requests)} network request(s) failed"
                 )
-                failure_kind = failure_kind or "network_failure"
+                if not ok:
+                    failures.append(detail)
+                    failure_kind = failure_kind or "network_failure"
+                assertion_outcomes["network"] = {"passed": ok, "detail": detail}
             ceiling = spec.assertions.max_http_status
             if ceiling:
                 over = [e for e in capture.http_errors if e["status"] > ceiling]
-                if over:
-                    failures.append(
-                        f"{len(over)} response(s) exceeded HTTP {ceiling} "
-                        f"(worst: {max(e['status'] for e in over)})"
-                    )
+                ok = not over
+                detail = (
+                    ""
+                    if ok
+                    else f"{len(over)} response(s) exceeded HTTP {ceiling} "
+                    f"(worst: {max(e['status'] for e in over)})"
+                )
+                if not ok:
+                    failures.append(detail)
                     failure_kind = failure_kind or "http_error"
-            if (
-                spec.assertions.max_duration_seconds
-                and duration > spec.assertions.max_duration_seconds
-            ):
-                failures.append(
-                    f"took {duration:.2f}s, over the "
+                assertion_outcomes["http_status"] = {"passed": ok, "detail": detail}
+            if spec.assertions.max_duration_seconds:
+                ok = duration <= spec.assertions.max_duration_seconds
+                detail = (
+                    ""
+                    if ok
+                    else f"took {duration:.2f}s, over the "
                     f"{spec.assertions.max_duration_seconds:.2f}s budget"
                 )
-                failure_kind = failure_kind or "slow"
+                if not ok:
+                    failures.append(detail)
+                    failure_kind = failure_kind or "slow"
+                assertion_outcomes["duration"] = {"passed": ok, "detail": detail}
 
             success = not failures
             evidence = self._build_evidence(
@@ -431,6 +474,9 @@ class BrowserProbeRunner(BaseProbeRunner):
                 "failed_request_count": len(capture.failed_requests),
                 "suppressed_request_count": capture.suppressed_requests,
                 "http_error_count": len(capture.http_errors),
+                "navigation_error": error,
+                "expectation_outcomes": expectation_outcomes,
+                "assertion_outcomes": assertion_outcomes,
             },
         )
 
