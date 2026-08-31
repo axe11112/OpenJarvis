@@ -18,7 +18,15 @@ expensive one making it, and to give Wiz a plan it can check against the
 authority and risk rules *before* anything is modified.
 
 **Building** runs write-enabled inside an isolated worktree, and only after the
-plan has been checked.
+plan has been checked — write-enabled for source files, not for execution.
+``Bash`` is absent here too, since FEAT-00030: a building session's own shell
+ran ``gh pr merge`` against the real repository, reaching production outside
+every gate this package otherwise enforces. The model may change what the
+repository contains; it may not run anything. Every command that touches the
+result — lint, typecheck, tests, the build, git, the pull request — is run by
+this package's own deterministic code, after the session returns, against
+what git actually shows changed rather than what the session claims. See
+``BUILDING_TOOLS``'s own docstring for what that costs and does not cost.
 
 Neither session is trusted. What Claude says it did is recorded as a claim; what
 actually changed is read from git. That distinction is already the reliability
@@ -61,7 +69,30 @@ PLANNING_TOOLS: Sequence[str] = ("Read", "Grep", "Glob")
 #: A building session works in an isolated worktree. ``WebFetch`` and
 #: ``WebSearch`` remain refused by the underlying wrapper, so nothing the agent
 #: reads in the repository can talk it into fetching an attacker-controlled URL.
-BUILDING_TOOLS: Sequence[str] = ("Read", "Edit", "Write", "Grep", "Glob", "Bash")
+#:
+#: No ``Bash``. Found on FEAT-00030: a building session's own shell ran
+#: ``gh pr create`` and then ``gh pr merge`` against the real repository,
+#: reaching production entirely outside this pipeline. The command-level
+#: guard added afterward (see :mod:`openjarvis.reliability.engineer_guard`)
+#: stays on as defense-in-depth for whatever still runs Claude with a shell —
+#: the reliability repair loop still does, deliberately, a separate decision
+#: — but that guard was never going to be a hard boundary on its own: a
+#: script written with ``Write`` and executed by an already-permitted
+#: interpreter is invisible to it. The actual fix is that a building session
+#: was never using Bash for anything the pipeline does not already do
+#: itself, deterministically, after the session returns: this same package
+#: runs lint, typecheck, tests and the build (``CheckSuite``, via
+#: ``FeaturePipeline._deploy_preview``), reads the real diff from git rather
+#: than from what Claude claims (``FeatureWorkspace.changed_files``), commits
+#: and pushes only the feature branch (with its own structural prefix guard,
+#: :meth:`~openjarvis.reliability.workspace.RepairWorkspace.push`), and opens
+#: the pull request. A building session self-running those checks was always
+#: a convenience — faster feedback within one session than waiting for the
+#: next retry's gate failure — never a capability nothing else could
+#: provide. Losing that convenience costs, at worst, an extra retry attempt
+#: when a change does not compile; that is a real, accepted cost, not a free
+#: change — see the module docstring above for the full trade.
+BUILDING_TOOLS: Sequence[str] = ("Read", "Edit", "Write", "Grep", "Glob")
 
 
 class CodingEngineUnavailable(CodeAgentError):
@@ -219,8 +250,22 @@ class ClaudeCodeEngineeringAgent:
         self._building_timeout = building_timeout
 
     def _default_factory(self, *, allowed_tools: Sequence[str]) -> CodeAgent:
+        # Omitting a tool from --allowedTools is not the same as refusing it —
+        # confirmed against the real CLI: a planning session with Bash absent
+        # from its allowed list still ran it, and only declined a write
+        # command because the *prompt* said "read-only", a judgement call the
+        # model made rather than a boundary it met. --disallowedTools is the
+        # one that is actually enforced (also confirmed live: with Bash
+        # explicitly disallowed, the session reports no such tool exists at
+        # all). So this always states outright what is missing from the
+        # allowed set, rather than trusting the absence to speak for itself.
+        disallowed = list(ClaudeCliAgent.DEFAULT_DISALLOWED_TOOLS)
+        if "Bash" not in allowed_tools:
+            disallowed.append("Bash")
         return ClaudeCliAgent(
-            executable=self._executable, allowed_tools=list(allowed_tools)
+            executable=self._executable,
+            allowed_tools=list(allowed_tools),
+            disallowed_tools=disallowed,
         )
 
     # -- availability ------------------------------------------------------

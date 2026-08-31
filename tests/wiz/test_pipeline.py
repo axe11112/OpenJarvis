@@ -446,7 +446,11 @@ class TestClaudeCodeIsTheOnlyAuthor:
         from openjarvis.wiz.features.engineer import BUILDING_TOOLS, PLANNING_TOOLS
 
         assert set(PLANNING_TOOLS).isdisjoint({"Edit", "Write", "Bash"})
-        assert "Bash" in BUILDING_TOOLS
+        # Building may change source files (that is the point) but, since
+        # FEAT-00030, may not execute anything — Bash is what let a building
+        # session merge its own pull request. It still gets Edit/Write.
+        assert {"Edit", "Write"} <= set(BUILDING_TOOLS)
+        assert "Bash" not in BUILDING_TOOLS
 
 
 class TestTheDiffIsReadFromGit:

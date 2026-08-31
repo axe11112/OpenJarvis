@@ -8,6 +8,7 @@ import pytest
 
 from openjarvis.reliability.code_agent import CodeAgentResult
 from openjarvis.wiz.features.engineer import (
+    BUILDING_TOOLS,
     PLANNING_TOOLS,
     ClaudeCodeEngineeringAgent,
     CodingEngineUnavailable,
@@ -77,6 +78,77 @@ class TestBuilding:
         engineer, made = _agent()
         engineer.build(_pack(), workspace="/tmp/wt")
         assert {"Edit", "Write"} <= set(made[-1].allowed_tools)
+
+    def test_a_building_session_has_no_shell(self):
+        # FEAT-00030: a building session's own Bash ran `gh pr merge` against
+        # the real repository. The model may change what the repository
+        # contains; it may not execute anything — see BUILDING_TOOLS's own
+        # docstring for why nothing legitimate is lost by this.
+        assert "Bash" not in BUILDING_TOOLS
+
+    def test_a_building_session_has_no_shell_at_the_agent_call_either(self):
+        engineer, made = _agent()
+        engineer.build(_pack(), workspace="/tmp/wt")
+        assert "Bash" not in made[-1].allowed_tools
+
+    def test_a_building_session_can_still_investigate_and_edit(self):
+        assert {"Read", "Edit", "Write", "Grep", "Glob"} <= set(BUILDING_TOOLS)
+
+
+class TestOmittingAToolIsNotEnoughDisallowingItIs:
+    """Confirmed against the real claude CLI, not assumed: a session with
+    Bash simply absent from --allowedTools still ran it — only a prompt
+    instruction ("this is read-only") made a planning session decline, which
+    is a model judgement call, not a boundary. --disallowedTools is what
+    actually removes the tool ("no shell tool is available in this session
+    at all"). ClaudeCodeEngineeringAgent._default_factory must state Bash's
+    absence explicitly rather than relying on omission from allowed_tools to
+    be enough — for both sessions, since planning had exactly this same gap.
+    """
+
+    def _constructed_agent(self, allowed_tools):
+        engineer = ClaudeCodeEngineeringAgent()
+        return engineer._default_factory(allowed_tools=allowed_tools)
+
+    def _captured_command(self, agent):
+        captured = {}
+
+        def runner(command, **kwargs):
+            captured["command"] = command
+
+            class _P:
+                returncode = 0
+                stdout = "done"
+                stderr = ""
+
+            return _P()
+
+        agent._runner = runner
+        agent.run("task", workspace=".")
+        return captured["command"]
+
+    def test_building_explicitly_disallows_bash_in_the_real_command(self):
+        agent = self._constructed_agent(BUILDING_TOOLS)
+        command = self._captured_command(agent)
+        idx = command.index("--disallowedTools")
+        disallowed = command[idx + 1].split(",")
+        assert "Bash" in disallowed
+
+    def test_planning_explicitly_disallows_bash_in_the_real_command(self):
+        agent = self._constructed_agent(PLANNING_TOOLS)
+        command = self._captured_command(agent)
+        idx = command.index("--disallowedTools")
+        disallowed = command[idx + 1].split(",")
+        assert "Bash" in disallowed
+
+    def test_a_session_that_is_allowed_bash_is_not_also_disallowed_it(self):
+        # If a future caller deliberately grants Bash, this factory must not
+        # silently take it back — the guard tracks "not allowed", not "always".
+        agent = self._constructed_agent(["Read", "Bash"])
+        command = self._captured_command(agent)
+        idx = command.index("--disallowedTools")
+        disallowed = command[idx + 1].split(",")
+        assert "Bash" not in disallowed
 
     def test_the_build_runs_in_the_workspace_it_was_given(self):
         engineer, made = _agent()
