@@ -31,12 +31,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from openjarvis.wiz.features.acceptance import AcceptanceContract
 from openjarvis.wiz.features.model import FeatureRequest, FeatureState
 from openjarvis.wiz.features.preview import PreviewObservation, PreviewObserver
+from openjarvis.wiz.features.store import FeatureStore
 from openjarvis.wiz.features.verification import FeatureVerification, FeatureVerifier
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids the real cycle
+    from openjarvis.wiz.features.recovery import RecoveryResult
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +49,7 @@ __all__ = [
     "PostShipVerifier",
     "ProductionFailure",
     "handoff_to_reliability",
+    "reverify_production",
 ]
 
 
@@ -440,7 +445,236 @@ def complete(feature: FeatureRequest, result: PostShipResult, *, at: str) -> Non
     """
     if feature.state is not FeatureState.PRODUCTION_VERIFYING:
         return
+    feature.production_result = result.summary()
+    if result.verification is not None:
+        # Bound to the exact deployment/commit result.verification carries —
+        # not persisted anywhere before this, so a feature that shipped and
+        # a feature whose production check nobody could ever look at again
+        # were indistinguishable a moment after the journal line scrolled by.
+        feature.metadata["production_verification"] = result.verification.to_dict()
     if result.verified:
         feature.transition(FeatureState.COMPLETE, at=at, reason=result.summary())
     else:
         feature.transition(FeatureState.HUMAN_REQUIRED, at=at, reason=result.summary())
+
+
+def reverify_production(
+    feature_id: str,
+    *,
+    store: FeatureStore,
+    github: Any,
+    postship: "PostShipVerifier",
+    journal: Any = None,
+    clock: Callable[[], str] = lambda: "",
+    reason: str = "",
+    incident_store: Any = None,
+    incident_resolution_reason: str = "",
+    owner_notifier: Any = None,
+) -> "RecoveryResult":
+    """Re-check an already-merged feature's production state, and complete
+    it if production now agrees.
+
+    The narrow gap :class:`~.recovery.FeatureRecovery` deliberately does not
+    cover: recovery's furthest reach is ``READY``, and merging is a
+    different authority it never exercises — see its own module docstring.
+    A feature whose merge already happened and whose post-ship check did
+    not agree (a real regression, or a flake that has since cleared) is
+    stuck past that boundary, with no way back in. This is that way back in,
+    and it is exactly as narrow: it never merges anything, never touches
+    application code, and never trusts a cached SHA — the pull request is
+    re-read fresh, and only a ``merged: true`` answer carrying a real
+    ``merge_commit_sha`` is treated as evidence there is a production
+    deployment to compare against at all. The check itself is not special-
+    cased: it is the same :meth:`PostShipVerifier.verify` an ordinary
+    :meth:`~.pipeline.FeaturePipeline.ship` call already runs, against
+    whatever the contract and the (possibly since-fixed) verifier currently
+    say — so a confirmed benign flake clearing on retry, and a genuine
+    regression continuing to fail, are told apart by rerunning the real
+    check, not by asserting the answer.
+
+    Idempotent: an already-``COMPLETE`` feature is reported as recovered
+    without touching anything, the same way :meth:`FeatureRecovery.recover`
+    treats an already-``READY`` one. Every other terminal or in-flight state
+    refuses outright — this narrows the *very* wide "any state" a generic
+    override would accept down to the one shape a real, stalled post-ship
+    check can leave a feature in.
+    """
+    # Imported here, not at module level: recovery.py imports pipeline.py,
+    # which imports this module for `complete` — a real cycle at import
+    # time, not just an inconvenient one. By the time this function actually
+    # runs, every module involved has finished loading.
+    from openjarvis.wiz.features.recovery import RecoveryRefusal, RecoveryResult
+
+    feature = store.get(feature_id)
+    if feature is None:
+        return RecoveryResult(
+            feature_id, False, "UNKNOWN", [RecoveryRefusal("not_found", f"no feature {feature_id!r}")]
+        )
+
+    if feature.state is FeatureState.COMPLETE:
+        return RecoveryResult(feature.id, True, feature.state.value, [])
+
+    if feature.state is not FeatureState.HUMAN_REQUIRED:
+        return RecoveryResult(
+            feature.id,
+            False,
+            feature.state.value,
+            [
+                RecoveryRefusal(
+                    "wrong_state",
+                    f"{feature.state.value} is not a state a post-ship "
+                    "reverification can act on",
+                )
+            ],
+        )
+
+    if not feature.pr_number:
+        return RecoveryResult(
+            feature.id,
+            False,
+            feature.state.value,
+            [RecoveryRefusal("no_pull_request", "feature has no recorded pull request")],
+        )
+
+    try:
+        pr = github.get_pull_request(feature.pr_number)
+    except Exception as exc:
+        return RecoveryResult(
+            feature.id,
+            False,
+            feature.state.value,
+            [RecoveryRefusal("pull_request_unreadable", str(exc))],
+        )
+
+    if not pr.get("merged"):
+        return RecoveryResult(
+            feature.id,
+            False,
+            feature.state.value,
+            [
+                RecoveryRefusal(
+                    "pull_request_not_merged",
+                    f"PR #{feature.pr_number} is not merged "
+                    f"(state={pr.get('state', 'unknown')!r}); nothing to "
+                    "re-verify in production",
+                )
+            ],
+        )
+
+    merge_commit_sha = str(pr.get("merge_commit_sha") or "")
+    if not merge_commit_sha:
+        return RecoveryResult(
+            feature.id,
+            False,
+            feature.state.value,
+            [
+                RecoveryRefusal(
+                    "no_merge_commit_sha",
+                    f"PR #{feature.pr_number} is merged but GitHub reports "
+                    "no merge commit SHA",
+                )
+            ],
+        )
+
+    feature.resume_production_reverification_from_human_required(
+        at=clock(), reason=reason or "re-verifying production after a merge"
+    )
+    store.save(feature)
+    _record_journal(
+        journal,
+        feature,
+        clock,
+        kind="feature.production_reverify_started",
+        reason=f"re-checking production at merge commit {merge_commit_sha[:12]}",
+    )
+
+    result = postship.verify(feature, merge_commit_sha=merge_commit_sha)
+    complete(feature, result, at=clock())
+    store.save(feature)
+    outcome_kind = "feature.shipped" if result.verified else "feature.production_unverified"
+    _record_journal(journal, feature, clock, kind=outcome_kind, reason=result.summary())
+
+    # Same call the canonical ship() path makes from FeaturePipeline._record:
+    # unconditional, cheap when nothing is configured, and it is
+    # FeatureOwnerNotifier's own job (and its on-disk ledger) to decide
+    # whether this kind is worth a message and to never say the same one
+    # twice.
+    if owner_notifier is not None:
+        try:
+            owner_notifier.notify(feature, kind=outcome_kind, reason=result.summary())
+        except Exception:
+            logger.exception("owner notification failed for %s", feature.id)
+
+    if result.verified and incident_store is not None:
+        _resolve_associated_incident(
+            feature,
+            incident_store,
+            reason=incident_resolution_reason
+            or f"Production verification passed on reverify: {result.summary()}",
+        )
+
+    return RecoveryResult(feature.id, bool(result.verified), feature.state.value, [])
+
+
+def _resolve_associated_incident(
+    feature: FeatureRequest, incident_store: Any, *, reason: str
+) -> None:
+    """Close the incident a failed post-ship check opened for *feature*, now
+    that a fresh check agrees with production.
+
+    Only ever called after :func:`reverify_production` has just proven
+    ``result.verified`` against fresh evidence — this never resolves an
+    incident on the strength of anything else. The incident's own evidence
+    and transition history are untouched; this appends one more transition
+    to them, the same as any other resolution the reliability system
+    records. A failed reverification never reaches here at all: the
+    incident stays open, and a genuinely recurring failure re-uses it
+    rather than opening a duplicate (see :func:`handoff_to_reliability`'s
+    fingerprint).
+    """
+    try:
+        from openjarvis.reliability.fingerprint import fingerprint
+        from openjarvis.reliability.types import IncidentState
+    except ImportError:  # pragma: no cover - reliability always present
+        return
+
+    fp = fingerprint(component="feature", failure_kind="post_merge", extra=[feature.id])
+    try:
+        incident = incident_store.find_by_fingerprint(fp)
+        if incident is None:
+            return
+        if not incident.can_transition_to(IncidentState.RESOLVED):
+            logger.warning(
+                "incident %s for %s cannot move to RESOLVED from %s",
+                incident.id,
+                feature.id,
+                incident.state.value,
+            )
+            return
+        # store.transition(), not incident.transition_to() + save(): the
+        # latter would update the state column but skip appending to the
+        # hash-chained, tamper-evident transition log — the whole reason
+        # this is "the audited incident lifecycle" and not a bare field
+        # update.
+        incident_store.transition(incident, IncidentState.RESOLVED, actor="wiz", reason=reason)
+    except Exception:  # noqa: BLE001 - resolving is best-effort
+        logger.exception("could not resolve the incident for %s", feature.id)
+
+
+def _record_journal(
+    journal: Any, feature: FeatureRequest, clock: Callable[[], str], *, kind: str, reason: str
+) -> None:
+    if journal is None:
+        return
+    try:
+        journal.record(
+            at=clock(),
+            kind=kind,
+            capability="feature.ship",
+            actor_id=feature.actor_id,
+            channel=feature.source,
+            reason=reason[:1000],
+            detail={"feature_id": feature.id, "state": feature.state.value},
+        )
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("could not journal a post-ship reverification event for %s", feature.id)

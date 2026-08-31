@@ -381,6 +381,28 @@ class TestCompilation:
         assert assertion_owners["network"] == id(network)
         assert assertion_owners["http_status"] == id(network)
 
+    def test_a_network_criterion_opts_into_the_nextjs_rsc_noise_profile(self):
+        # Found live on FEAT-00017: a genuinely benign Next.js speculative
+        # prefetch abort failed production verification because the
+        # compiled NETWORK assertion never named the existing, already-
+        # tested reliability noise profile that covers exactly this.
+        contract = AcceptanceContract(
+            feature_id="FEAT-00017",
+            criteria=(Criterion(kind=NETWORK, route="/", description="d"),),
+        )
+        _, spec = contract.probe_specs()[0]
+        assert "nextjs_rsc_prefetch" in spec.assertions.ignore_known_noise
+
+    def test_the_noise_profile_is_named_not_restated(self):
+        # The pattern itself lives in exactly one place (reliability's own
+        # noise.py); the compiler only ever references it by name.
+        contract = AcceptanceContract(
+            feature_id="FEAT-00017",
+            criteria=(Criterion(kind=NETWORK, route="/", description="d"),),
+        )
+        _, spec = contract.probe_specs()[0]
+        assert spec.assertions.ignore_request_patterns == []
+
     def test_a_selectorless_layout_criterion_owns_no_expectation(self):
         # It asserts nothing a compiled probe can check (see the comment in
         # _spec_for_route); it must not silently claim ownership of some

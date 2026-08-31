@@ -448,6 +448,46 @@ class FeatureRequest:
         self.state = FeatureState.RECEIVED
         self.updated_at = at
 
+    def resume_production_reverification_from_human_required(
+        self, *, at: str, reason: str
+    ) -> None:
+        """Reopen a ``HUMAN_REQUIRED`` feature for a fresh post-ship check.
+
+        The third and narrowest of the ``resume_*`` siblings: a feature
+        lands here when a real merge happened but production verification
+        did not agree (or could not run at all) — see
+        :mod:`openjarvis.wiz.features.postship`. There is nothing to
+        rebuild and nothing to re-plan; the code is already live. This exists
+        only so a fresh :class:`~.postship.PostShipVerifier` run has a
+        legal state to land its verdict on, the same way
+        :meth:`resume_from_human_required` always lands on ``BUILDING`` so
+        the ordinary attempt loop's own gates run again rather than being
+        skipped.
+
+        Always targets ``PRODUCTION_VERIFYING``. It is the caller's job —
+        see :func:`~.postship.reverify_production` — to have already proven
+        this feature actually has a merge to re-check (a real, currently-
+        merged pull request; a production deployment that still matches
+        that merge's exact commit) before calling this; this method only
+        enforces the state machine, exactly like its two siblings.
+        """
+        if self.state is not FeatureState.HUMAN_REQUIRED:
+            raise InvalidFeatureTransition(
+                "resume_production_reverification_from_human_required called "
+                f"from {self.state.value}, not HUMAN_REQUIRED"
+            )
+        self.history.append(
+            {
+                "at": at,
+                "from": self.state.value,
+                "to": FeatureState.PRODUCTION_VERIFYING.value,
+                "reason": reason,
+                "resumed": True,
+            }
+        )
+        self.state = FeatureState.PRODUCTION_VERIFYING
+        self.updated_at = at
+
     def next_attempt(self, *, at: str, hypothesis: str = "") -> FeatureAttempt:
         attempt = FeatureAttempt(
             number=len(self.attempts) + 1, started_at=at, hypothesis=hypothesis

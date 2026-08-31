@@ -10,8 +10,10 @@ from openjarvis.wiz.features.postship import (
     ProductionFailure,
     complete,
     handoff_to_reliability,
+    reverify_production,
 )
 from openjarvis.wiz.features.preview import PreviewObserver
+from openjarvis.wiz.features.store import FeatureStore
 from openjarvis.wiz.features.verification import FeatureVerifier
 
 MERGE_SHA = "abc1234def5678901234567890abcdef12345678"
@@ -304,3 +306,337 @@ class TestCompletion:
         feature = shipped_feature(state=FeatureState.READY)
         complete(feature, PostShipResult(verified=True), at="t")
         assert feature.state is FeatureState.READY
+
+
+class FakeGitHub:
+    def __init__(self, *, merged=True, merge_commit_sha=MERGE_SHA, state="closed"):
+        self.merged = merged
+        self.merge_commit_sha = merge_commit_sha
+        self.state = state
+        self.calls = []
+
+    def get_pull_request(self, number):
+        self.calls.append(number)
+        return {
+            "number": number,
+            "state": self.state,
+            "merged": self.merged,
+            "merge_commit_sha": self.merge_commit_sha,
+        }
+
+
+class BrokenGitHub:
+    def get_pull_request(self, number):
+        raise RuntimeError("github is down")
+
+
+class FakeIncident:
+    def __init__(self):
+        from openjarvis.reliability.types import IncidentState
+
+        self.id = "INC-1"
+        self.state = IncidentState.DETECTED
+
+    def can_transition_to(self, state):
+        return True
+
+
+class FakeIncidentStore:
+    """Mirrors IncidentStore's contract: resolving goes through
+    ``transition()``, the one audited, persisting call — never through
+    ``incident.transition_to()`` plus a bare ``save()``, which would skip
+    the hash-chained transition log.
+    """
+
+    def __init__(self, incident=None):
+        self.incident = incident
+        self.transitioned = []
+
+    def find_by_fingerprint(self, fp):
+        return self.incident
+
+    def transition(self, incident, state, *, actor="", reason=""):
+        incident.state = state
+        self.transitioned.append((incident, state, actor, reason))
+        return incident
+
+
+class FakeJournal:
+    def __init__(self):
+        self.entries = []
+
+    def record(self, **kwargs):
+        self.entries.append(kwargs)
+
+
+class FakeOwnerNotifier:
+    def __init__(self):
+        self.calls = []
+
+    def notify(self, feature, *, kind, reason):
+        self.calls.append((feature.id, kind, reason))
+        return True
+
+
+def human_required_shipped_feature(*, pr_number=7):
+    feature = shipped_feature(state=FeatureState.HUMAN_REQUIRED)
+    feature.pr_number = pr_number
+    return feature
+
+
+class TestReverifyProduction:
+    """The narrow way back in for a feature whose real merge landed but whose
+    post-ship check did not agree — never merges, never touches application
+    code, always re-reads the pull request fresh.
+    """
+
+    def _store(self, tmp_path, feature):
+        store = FeatureStore(tmp_path / "features.db")
+        store.create(feature)
+        return store
+
+    def _postship(self, *, success=True):
+        return PostShipVerifier(
+            deployments=observer(FakeVercel()),
+            verifier=verifier(FakeBrowser(success=success)),
+            handler=lambda f: "reliability (test)",
+        )
+
+    def test_requires_a_recorded_pull_request(self, tmp_path):
+        feature = human_required_shipped_feature(pr_number=0)
+        store = self._store(tmp_path, feature)
+        result = reverify_production(
+            feature.id, store=store, github=FakeGitHub(), postship=self._postship()
+        )
+        assert not result.recovered
+        assert result.refusals[0].code == "no_pull_request"
+
+    def test_requires_the_pull_request_to_actually_be_merged(self, tmp_path):
+        feature = human_required_shipped_feature()
+        store = self._store(tmp_path, feature)
+        github = FakeGitHub(merged=False, state="open")
+        result = reverify_production(
+            feature.id, store=store, github=github, postship=self._postship()
+        )
+        assert not result.recovered
+        assert result.refusals[0].code == "pull_request_not_merged"
+        saved = store.get(feature.id)
+        assert saved.state is FeatureState.HUMAN_REQUIRED
+
+    def test_requires_a_merge_commit_sha(self, tmp_path):
+        feature = human_required_shipped_feature()
+        store = self._store(tmp_path, feature)
+        github = FakeGitHub(merge_commit_sha="")
+        result = reverify_production(
+            feature.id, store=store, github=github, postship=self._postship()
+        )
+        assert not result.recovered
+        assert result.refusals[0].code == "no_merge_commit_sha"
+
+    def test_an_unreadable_pull_request_is_refused_not_raised(self, tmp_path):
+        feature = human_required_shipped_feature()
+        store = self._store(tmp_path, feature)
+        result = reverify_production(
+            feature.id, store=store, github=BrokenGitHub(), postship=self._postship()
+        )
+        assert not result.recovered
+        assert result.refusals[0].code == "pull_request_unreadable"
+
+    def test_a_feature_not_stuck_in_human_required_is_refused(self, tmp_path):
+        feature = shipped_feature(state=FeatureState.READY)
+        feature.pr_number = 7
+        store = self._store(tmp_path, feature)
+        result = reverify_production(
+            feature.id, store=store, github=FakeGitHub(), postship=self._postship()
+        )
+        assert not result.recovered
+        assert result.refusals[0].code == "wrong_state"
+
+    def test_an_already_complete_feature_is_idempotent(self, tmp_path):
+        feature = shipped_feature(state=FeatureState.COMPLETE)
+        feature.pr_number = 7
+        store = self._store(tmp_path, feature)
+        github = FakeGitHub()
+        result = reverify_production(
+            feature.id, store=store, github=github, postship=self._postship()
+        )
+        assert result.recovered
+        # Idempotent means genuinely inert, not just "reports success" —
+        # it never even reads the pull request.
+        assert github.calls == []
+
+    def test_an_unknown_feature_is_refused(self, tmp_path):
+        store = FeatureStore(tmp_path / "features.db")
+        result = reverify_production(
+            "FEAT-NOPE", store=store, github=FakeGitHub(), postship=self._postship()
+        )
+        assert not result.recovered
+        assert result.refusals[0].code == "not_found"
+
+    def test_a_successful_reverify_completes_the_feature(self, tmp_path):
+        feature = human_required_shipped_feature()
+        store = self._store(tmp_path, feature)
+        journal = FakeJournal()
+        result = reverify_production(
+            feature.id,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(success=True),
+            journal=journal,
+            clock=lambda: "t2",
+        )
+        assert result.recovered
+        assert result.state == "COMPLETE"
+        saved = store.get(feature.id)
+        assert saved.state is FeatureState.COMPLETE
+        assert saved.metadata["production_verification"]
+        kinds = [entry["kind"] for entry in journal.entries]
+        assert kinds.count("feature.shipped") == 1
+        assert "feature.production_reverify_started" in kinds
+
+    def test_a_failed_reverify_stays_human_required(self, tmp_path):
+        feature = human_required_shipped_feature()
+        store = self._store(tmp_path, feature)
+        journal = FakeJournal()
+        result = reverify_production(
+            feature.id,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(success=False),
+            journal=journal,
+        )
+        assert not result.recovered
+        assert result.state == "HUMAN_REQUIRED"
+        saved = store.get(feature.id)
+        assert saved.state is FeatureState.HUMAN_REQUIRED
+        kinds = [entry["kind"] for entry in journal.entries]
+        assert "feature.shipped" not in kinds
+        assert "feature.production_unverified" in kinds
+
+    def test_a_stale_deployment_cannot_complete(self, tmp_path):
+        feature = human_required_shipped_feature()
+        store = self._store(tmp_path, feature)
+        postship = PostShipVerifier(
+            deployments=observer(FakeVercel(state="BUILDING")),
+            verifier=verifier(FakeBrowser()),
+            handler=lambda f: "reliability (test)",
+        )
+        result = reverify_production(
+            feature.id, store=store, github=FakeGitHub(), postship=postship
+        )
+        assert not result.recovered
+        saved = store.get(feature.id)
+        assert saved.state is FeatureState.HUMAN_REQUIRED
+
+    def test_success_resolves_the_associated_incident(self, tmp_path):
+        from openjarvis.reliability.types import IncidentState
+
+        feature = human_required_shipped_feature()
+        store = self._store(tmp_path, feature)
+        incident = FakeIncident()
+        incident_store = FakeIncidentStore(incident)
+        reverify_production(
+            feature.id,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(success=True),
+            incident_store=incident_store,
+        )
+        assert incident.state is IncidentState.RESOLVED
+        assert incident_store.transitioned
+        assert incident_store.transitioned[0][0] is incident
+        assert incident_store.transitioned[0][1] is IncidentState.RESOLVED
+
+    def test_a_failed_reverify_leaves_the_incident_open(self, tmp_path):
+        from openjarvis.reliability.types import IncidentState
+
+        feature = human_required_shipped_feature()
+        store = self._store(tmp_path, feature)
+        incident = FakeIncident()
+        incident_store = FakeIncidentStore(incident)
+        reverify_production(
+            feature.id,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(success=False),
+            incident_store=incident_store,
+        )
+        assert incident.state is not IncidentState.RESOLVED
+        assert incident_store.transitioned == []
+
+    def test_with_no_incident_store_a_success_still_completes(self, tmp_path):
+        # incident_store is optional: a feature reverified outside the
+        # reliability system entirely must still be able to reach COMPLETE.
+        feature = human_required_shipped_feature()
+        store = self._store(tmp_path, feature)
+        result = reverify_production(
+            feature.id, store=store, github=FakeGitHub(), postship=self._postship(success=True)
+        )
+        assert result.recovered
+        assert store.get(feature.id).state is FeatureState.COMPLETE
+
+    def test_a_successful_reverify_notifies_the_owner_exactly_once(self, tmp_path):
+        feature = human_required_shipped_feature()
+        store = self._store(tmp_path, feature)
+        notifier = FakeOwnerNotifier()
+        reverify_production(
+            feature.id,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(success=True),
+            owner_notifier=notifier,
+        )
+        assert len(notifier.calls) == 1
+        feature_id, kind, _ = notifier.calls[0]
+        assert feature_id == feature.id
+        assert kind == "feature.shipped"
+
+    def test_a_failed_reverify_still_tells_the_owner_it_needs_them(self, tmp_path):
+        feature = human_required_shipped_feature()
+        store = self._store(tmp_path, feature)
+        notifier = FakeOwnerNotifier()
+        reverify_production(
+            feature.id,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(success=False),
+            owner_notifier=notifier,
+        )
+        assert len(notifier.calls) == 1
+        assert notifier.calls[0][1] == "feature.production_unverified"
+
+    def test_an_idempotent_already_complete_reverify_does_not_notify_again(self, tmp_path):
+        feature = shipped_feature(state=FeatureState.COMPLETE)
+        feature.pr_number = 7
+        store = self._store(tmp_path, feature)
+        notifier = FakeOwnerNotifier()
+        reverify_production(
+            feature.id,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(success=True),
+            owner_notifier=notifier,
+        )
+        assert notifier.calls == []
+
+    def test_a_refusal_before_verification_does_not_notify(self, tmp_path):
+        feature = human_required_shipped_feature(pr_number=0)
+        store = self._store(tmp_path, feature)
+        notifier = FakeOwnerNotifier()
+        reverify_production(
+            feature.id,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(),
+            owner_notifier=notifier,
+        )
+        assert notifier.calls == []
+
+    def test_it_never_merges_or_touches_the_pull_request(self):
+        import inspect
+
+        from openjarvis.wiz.features import postship
+
+        source = inspect.getsource(postship.reverify_production)
+        for word in ("merge_pull_request", "create_pull_request", "push"):
+            assert word not in source

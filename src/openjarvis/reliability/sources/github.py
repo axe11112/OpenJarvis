@@ -554,6 +554,11 @@ class GitHubSource(BaseSignalSource):
             "mergeable": raw.get("mergeable"),
             "mergeable_state": raw.get("mergeable_state", ""),
             "merged": bool(raw.get("merged", False)),
+            # Only meaningful once `merged` is true; GitHub returns null
+            # otherwise. The one SHA a post-merge re-verification can trust:
+            # the commit the merge actually produced, not the branch head
+            # that was true before it.
+            "merge_commit_sha": raw.get("merge_commit_sha") or "",
             "author": (raw.get("user") or {}).get("login", ""),
             "url": raw.get("html_url", ""),
         }

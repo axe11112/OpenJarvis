@@ -484,6 +484,24 @@ class AcceptanceContract:
             elif criterion.kind == NETWORK:
                 assertions.no_failed_requests = True
                 assertions.max_http_status = 499
+                # A router that speculatively prefetches a link and cancels
+                # the fetch when the visitor goes elsewhere first is not a
+                # broken request — see
+                # openjarvis.reliability.probes.noise's own module docstring
+                # and the "nextjs_rsc_prefetch" profile it defines. Named
+                # here, not restated: the pattern is reviewed and tested
+                # once, in reliability, and every failed-requests assertion
+                # this compiler produces opts into it rather than risking a
+                # second, looser regex. Narrow by construction — it matches
+                # only a `?_rsc=` request failing with exactly
+                # `net::ERR_ABORTED` — so a genuinely broken API call, a
+                # dead asset host, or any other failed request still fails
+                # this criterion.
+                if "nextjs_rsc_prefetch" not in assertions.ignore_known_noise:
+                    assertions.ignore_known_noise = [
+                        *assertions.ignore_known_noise,
+                        "nextjs_rsc_prefetch",
+                    ]
                 assertion_owners["network"] = id(criterion)
                 assertion_owners["http_status"] = id(criterion)
 

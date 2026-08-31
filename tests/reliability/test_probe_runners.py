@@ -805,6 +805,38 @@ class TestNoiseProfileEndToEnd:
         errors = [e for e in result.evidence if e.kind is EvidenceKind.HTTP_ERROR]
         assert any("/api/broken" in e.summary for e in errors)
 
+    def test_a_feature_verification_network_criterion_opts_in_by_default(
+        self, runner, site
+    ):
+        """Found live on FEAT-00017: a feature's NETWORK criterion, compiled
+        by wiz's own contract_for(), failed production verification on
+        exactly this benign pattern because the compiler never named the
+        profile. Proves the real, wiz-compiled spec — not a hand-built one —
+        survives it, through the same real browser every other test in this
+        class uses.
+        """
+        from openjarvis.reliability.probes.spec import ProbeStep
+        from openjarvis.wiz.features.acceptance import (
+            DESKTOP,
+            NETWORK,
+            AcceptanceContract,
+            Criterion,
+        )
+
+        contract = AcceptanceContract(
+            feature_id="FEAT-X",
+            criteria=(
+                Criterion(kind=NETWORK, route="/rsc-prefetch-abort", description="d"),
+            ),
+            viewports=(DESKTOP,),
+        )
+        _, spec = contract.probe_specs()[0]
+        spec.steps.insert(1, ProbeStep(action="wait_for_timeout", timeout_ms=800))
+
+        result = runner.run(spec, base_url=site.base_url)
+        assert result.success, result.error
+        assert result.metadata["suppressed_request_count"] >= 1
+
 
 # ---------------------------------------------------------------------------
 # Request headers
