@@ -162,6 +162,32 @@ class _Capture:
         )
 
 
+def _normalize_rendered_text(text: str) -> str:
+    """Collapse incidental whitespace formatting, the way a reader would.
+
+    ``page.inner_text()`` is already the right primitive for "what text is
+    actually visible" — confirmed against a real browser: it excludes
+    ``display:none`` and ``visibility:hidden`` content, and correctly
+    *includes* ``aria-hidden`` content that is still rendered (``aria-hidden``
+    is an accessibility-tree signal, not a visual one, so a "visible text"
+    check is right to still see it). What it does not do is agree with a
+    hand-written expected string on how many spaces or line breaks sit
+    between words: a heading split across sibling elements by an
+    absolutely-positioned ``sr-only`` spacer — a legitimate, common pattern
+    for exactly the missing-space accessibility bug FEAT-00030's own second
+    attempt fixed — comes back from ``inner_text()`` with a line break where
+    the DOM had a plain space, purely because the browser's own line-box
+    computation treats the out-of-flow spacer as splitting the line, not
+    because any text is missing or hidden. Collapsing runs of whitespace
+    (including line breaks) to a single space, on both sides of the
+    comparison, matches how :meth:`Page.get_by_text`'s own default matching
+    already behaves, and is exactly and only a whitespace normalization —
+    it changes nothing about which *words* are present, their order, or
+    whether they are visible at all.
+    """
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _first_target_url(spec: ProbeSpec, base_url: str) -> str:
     """The URL this run will actually open.
 
@@ -620,7 +646,23 @@ class BrowserProbeRunner(BaseProbeRunner):
                     if expectation.selector
                     else page.inner_text("body")
                 )
-                present = expectation.value in content
+                # FEAT-00030: a heading split across sibling <span>s by an
+                # absolutely-positioned sr-only spacer (a legitimate,
+                # correct pattern — see _normalize_rendered_text's own
+                # docstring) came back from inner_text() with a newline
+                # where the DOM had a plain space, so a criterion written
+                # as one line never matched — even though the text was
+                # exactly right on screen, in both viewports, before and
+                # after. inner_text() already excludes display:none and
+                # visibility:hidden content and includes aria-hidden
+                # content correctly (both are genuinely visible-text
+                # questions, not whitespace ones) — this only collapses
+                # incidental line-break/whitespace formatting the way a
+                # person reading the rendered page would, not what counts
+                # as visible at all.
+                present = _normalize_rendered_text(
+                    expectation.value
+                ) in _normalize_rendered_text(content)
                 if kind == "text" and not present:
                     return (
                         f"expected {expectation.selector or 'the page'} to contain "
