@@ -252,7 +252,11 @@ class TestBrowserFailurePreventsFEATUREREADY:
 
         verification.outcomes.append(
             CriterionOutcome(
-                criterion=Criterion(kind="UI", name="submit", description="form submission works"),
+                # "UI" was never a valid kind (see acceptance.py's KINDS);
+                # INTERACTION is the real kind for a click/submit check.
+                criterion=Criterion(
+                    kind="INTERACTION", name="submit", description="form submission works"
+                ),
                 passed=False,
                 detail="Button not found",
             )
@@ -284,7 +288,11 @@ class TestBrowserFailureFeedbackToClaudeRetry:
 
         feedback = result.evidence_for_retry()
 
-        assert "submit_form" in feedback
+        # evidence_for_retry() is deliberately natural-language feedback for
+        # a coding agent, not a machine dump — it renders criterion_description
+        # ("Form submission should work"), never the internal criterion_name
+        # slug ("submit_form"), which never appears in the rendered text.
+        assert "Form submission should work" in feedback
         assert "button[type=submit]" in feedback
         assert "expected" in feedback.lower() or "Expected" in feedback
         assert "actual" in feedback.lower() or "Actual" in feedback

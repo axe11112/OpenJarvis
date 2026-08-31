@@ -185,6 +185,31 @@ def _explain_unconfigured() -> None:
     raise SystemExit(1)
 
 
+def _build_owner_door_for_watch(config: Any, telegram_channel: Any) -> Any:
+    """Build the shared Telegram owner door for ``jarvis reliability watch``.
+
+    Registered into reliability_cmd below rather than that module importing
+    wiz itself: reliability must survive a bug in this optional convenience
+    feature, and a static import would not (see test_dependency_direction.py).
+    Returns ``None`` when Wiz has no owner door to offer.
+    """
+    from openjarvis.cli.reliability_cmd import _DummyNotifier
+    from openjarvis.wiz.assemble import assemble
+    from openjarvis.wiz.owner_channel import TelegramOwnerDoor, build_owner_door
+    from openjarvis.wiz.runtime import build_wiz
+
+    wiz_runtime = build_wiz(config=config, product=assemble(config=config))
+    door = build_owner_door(config, runtime=wiz_runtime)
+    if door is None:
+        return None
+    return TelegramOwnerDoor(door=door, notifier=_DummyNotifier(telegram_channel))
+
+
+from openjarvis.cli.reliability_cmd import register_owner_door_factory  # noqa: E402
+
+register_owner_door_factory(_build_owner_door_for_watch)
+
+
 @click.group(help="Ask Wiz to build things, and see what it has built.")
 def wiz() -> None:
     """Wiz — the product-development half of JARVIS."""

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import shutil
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import click
 from rich.console import Console
@@ -38,6 +38,29 @@ class _DummyNotifier:
     """Bridge TelegramChannel to TelegramOwnerDoor.channel expectation."""
     def __init__(self, channel):
         self.channel = channel
+
+
+#: Optional factory set by openjarvis.cli.wiz_cmd (which is allowed to import
+#: both packages — see test_dependency_direction.py) so that `jarvis
+#: reliability watch` can share one Telegram listener with Wiz's owner
+#: commands without this module ever importing wiz itself. A bug in an
+#: optional convenience feature must never be able to take down the thing
+#: that notices the site is down, which is exactly what a static import of
+#: wiz here would risk.
+_owner_door_factory: Optional[Callable[[Any, Any], Any]] = None
+
+
+def register_owner_door_factory(factory: Callable[[Any, Any], Any]) -> None:
+    """Let the Wiz side supply how to build the shared Telegram owner door.
+
+    ``factory(config, telegram_channel)`` returns an object with a
+    ``.start()`` method (returning whether it actually attached), or
+    ``None`` when Wiz has nothing to offer right now. Called once, at CLI
+    import time, by ``openjarvis.cli.wiz_cmd`` — never directly by anything
+    in this module.
+    """
+    global _owner_door_factory
+    _owner_door_factory = factory
 
 
 def _load_config() -> Any:
@@ -800,18 +823,14 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
             )
             telegram_channel.connect()
 
-        # Wiz owner door (if Wiz available and channel ready)
+        # Wiz owner door (if Wiz available and channel ready). Built through
+        # _owner_door_factory rather than importing wiz here directly — see
+        # register_owner_door_factory's docstring.
         owner_door = None
-        if telegram_channel is not None:
+        if telegram_channel is not None and _owner_door_factory is not None:
             try:
-                from openjarvis.wiz.owner_channel import TelegramOwnerDoor, build_owner_door
-                from openjarvis.wiz.runtime import build_wiz
-                from openjarvis.wiz.assemble import assemble
-
-                wiz_runtime = build_wiz(config=config, product=assemble(config=config))
-                door = build_owner_door(config, runtime=wiz_runtime)
-                if door is not None:
-                    owner_door = TelegramOwnerDoor(door=door, notifier=_DummyNotifier(telegram_channel))
+                owner_door = _owner_door_factory(config, telegram_channel)
+                if owner_door is not None:
                     if owner_door.start():
                         console.print(
                             "Listening for owner on Telegram "
@@ -819,8 +838,9 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
                         )
                     else:
                         owner_door = None
-            except (ImportError, Exception) as exc:
+            except Exception as exc:
                 logger.warning("Could not start TelegramOwnerDoor: %s", exc)
+                owner_door = None
 
         # Reliability owner commands on same channel (if Wiz didn't start)
         if owner_door is None and telegram_channel is not None:
