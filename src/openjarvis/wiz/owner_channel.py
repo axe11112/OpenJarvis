@@ -307,8 +307,12 @@ class OwnerDoor:
                 capability = "feature.request+build"
                 reply = f"{reply} Starting work now."
             else:
-                # Auto-build failed; include reason in reply
-                detail = build_result.get("detail", "could not start building")
+                # Auto-build failed; include reason in reply. `or`, not
+                # dict.get's default: a present-but-empty detail (any read
+                # capability's result, which has no "say" key at all) must
+                # still fall back to something the owner can see, not a
+                # reply that looks identical to a clean success.
+                detail = build_result.get("detail") or "could not start building"
                 reply = f"{reply} {detail}"
 
         if not reply and getattr(result, "accepted", False):
@@ -336,8 +340,25 @@ class OwnerDoor:
     def _auto_build_feature(self, feature_id: str, sender: str, chat_id: Any) -> Dict[str, Any]:
         """Automatically start building a just-recorded feature.
 
-        Called after feature.request succeeds to seamlessly transition to execution.
-        Uses the same authority path as explicit feature.build calls.
+        Called after feature.request succeeds to seamlessly transition to
+        execution. Uses the same authority path as explicit feature.build
+        calls — same actor, same channel, same policy check.
+
+        Dispatched with the capability named explicitly
+        (``wiz.handle(request, capability="feature.build")``) rather than by
+        classifying the synthetic ``"build {feature_id}"`` text: there is no
+        intent rule for ``feature.build`` at all, and any text containing a
+        feature id — this synthetic text always does — is outranked by
+        ``feature.status``'s ``\\bFEAT-\\d+\\b`` pattern (weight 15, against
+        ``feature.request``'s weight 12, the only other candidate). So every
+        synthetic auto-build request was silently misrouted to a read-only
+        status lookup instead of ever reaching the build handler — no
+        exception, no journal entry, nothing but an unremarkable Telegram
+        reply, because ``feature.status``'s result has no ``"started"`` or
+        ``"say"`` key for this method to notice was missing. ``Wiz.handle``'s
+        ``capability`` parameter exists for exactly this — a caller that
+        already knows the verb, the same mechanism the Control Center's own
+        buttons use — and this is exactly that caller.
         """
         if self.intake is None or not hasattr(self.intake, "wiz"):
             return {"started": False, "detail": "build system not configured"}
@@ -359,21 +380,63 @@ class OwnerDoor:
                 arguments={"feature_id": feature_id},
             )
 
-            outcome = self.intake.wiz.handle(request)
+            outcome = self.intake.wiz.handle(request, capability="feature.build")
             if not outcome.handled:
-                return {
-                    "started": False,
-                    "detail": str(outcome.message or "not authorized to build"),
-                }
+                reason = str(outcome.message or "not authorized to build")
+                self._journal_auto_build_outcome(
+                    feature_id, kind="feature.auto_build_refused", reason=reason
+                )
+                return {"started": False, "detail": reason}
 
             result = outcome.result if isinstance(outcome.result, dict) else {}
-            return {
-                "started": bool(result.get("started", False)),
-                "detail": str(result.get("say", "")),
-            }
+            started = bool(result.get("started", False))
+            detail = str(result.get("say", ""))
+            if not started:
+                self._journal_auto_build_outcome(
+                    feature_id,
+                    kind="feature.auto_build_refused",
+                    reason=detail or "did not start",
+                )
+            return {"started": started, "detail": detail}
         except Exception as exc:
             logger.exception("auto-build failed for %s", feature_id)
+            self._journal_auto_build_outcome(
+                feature_id, kind="feature.auto_build_failed", reason=str(exc)[:500]
+            )
             return {"started": False, "detail": str(exc)}
+
+    def _journal_auto_build_outcome(
+        self, feature_id: str, *, kind: str, reason: str
+    ) -> None:
+        """Make an auto-build refusal or failure survive past the Telegram
+        reply that carried it.
+
+        Independent of whatever caused it: a Telegram reply is not durable
+        evidence — it rotates out of the transport's own history, and
+        nothing here re-reads it — so future diagnosis of "why didn't this
+        build" must not depend on it. Bounded and secret-free: *reason*
+        comes from ``outcome.message`` (fixed, human-authored refusal text)
+        or a caught exception's ``str()``, truncated, never from anything an
+        attacker controls or that could carry a credential.
+        """
+        journal = getattr(self.intake, "journal", None)
+        if journal is None:
+            return
+        try:
+            clock = getattr(self.intake, "clock", None)
+            journal.record(
+                at=clock() if clock else "",
+                kind=kind,
+                capability="feature.build",
+                actor_id="telegram",
+                channel="telegram",
+                reason=reason[:500],
+                detail={"feature_id": feature_id},
+            )
+        except Exception:  # pragma: no cover - defensive
+            logger.exception(
+                "could not journal an auto-build outcome for %s", feature_id
+            )
 
     def _say(self, text: str) -> str:
         return f"Sir, {text}" if self.persona else text[:1].upper() + text[1:]

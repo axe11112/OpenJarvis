@@ -15,10 +15,14 @@ from openjarvis.reliability.outage import OutageRegistry
 from openjarvis.reliability.owner_commands import OwnerCommands
 from openjarvis.reliability.types import Correlation, Incident, Severity
 from openjarvis.wiz.authority import Authority, AuthorityPolicy, Channel
+from openjarvis.wiz.features.model import FeatureState
 from openjarvis.wiz.intake import TelegramIntake
 from openjarvis.wiz.journal import WizJournal
+from openjarvis.wiz.memory import ProductMemory
 from openjarvis.wiz.owner_channel import OwnerDoor, TelegramOwnerDoor, build_owner_door
+from openjarvis.wiz.product import ProductVerbs
 from openjarvis.wiz.runtime import build_wiz
+from tests.wiz.test_product import FakePipeline
 
 OWNER = "555"
 STRANGER = "999"
@@ -366,3 +370,259 @@ def test_a_malformed_message_never_escapes_into_the_polling_thread(door):
 def test_a_transport_that_cannot_receive_is_reported_not_crashed(door):
     listener = TelegramOwnerDoor(door=door, notifier=object())
     assert listener.start() is False
+
+
+# ---------------------------------------------------------------------------
+# The auto-build handoff: feature.request -> feature.build, in one message
+# ---------------------------------------------------------------------------
+
+
+def _complete_profile(tmp_path):
+    from openjarvis.wiz.features.profile import EngineeringProfile
+
+    return EngineeringProfile(
+        name="test-target", checkout=str(tmp_path / "checkout"), test_command="npm test"
+    )
+
+
+@pytest.fixture
+def buildable_runtime(tmp_path, incidents):
+    """A runtime with a working pipeline and CODE_WRITE, for the handoff."""
+    pipeline = FakePipeline(profile=_complete_profile(tmp_path))
+
+    def runner(feature_id):
+        # FakePipeline.run() jumps straight to READY, which is legal from
+        # everywhere else it is used but not from RECEIVED — real
+        # FeatureRequest.transition() only allows RECEIVED -> UNDERSTANDING
+        # (or CANCELLED/HUMAN_REQUIRED). UNDERSTANDING is also the more
+        # honest thing to prove here: it is _understand()'s own real target,
+        # the step that ran unconditionally in every earlier trace of this
+        # bug and is the one FEAT-00030 itself never reached.
+        feature = pipeline.store.get(feature_id)
+        if feature is not None and feature.state is FeatureState.RECEIVED:
+            feature.transition(
+                FeatureState.UNDERSTANDING,
+                at="2026-08-19T10:05:00+00:00",
+                reason="auto-build reached the real pipeline",
+            )
+            pipeline.store.save(feature)
+        return feature
+
+    product = ProductVerbs(
+        pipeline=pipeline,
+        memory=ProductMemory(tmp_path / "memory.db"),
+        runner=runner,
+    )
+    runtime = build_wiz(
+        home=tmp_path,
+        policy=AuthorityPolicy(
+            grants={
+                Channel.TELEGRAM: frozenset(
+                    {Authority.READ, Authority.SAFE_ACTION, Authority.CODE_WRITE}
+                )
+            }
+        ),
+        journal=WizJournal(tmp_path / "journal.jsonl"),
+        config=JarvisConfig(),
+        store_factory=incidents,
+        product=product,
+    )
+    runtime.pipeline = pipeline  # convenience for assertions below
+    return runtime
+
+
+@pytest.fixture
+def buildable_door(buildable_runtime, outages):
+    return OwnerDoor(
+        commands=OwnerCommands(allowed_chat_ids=OWNER, outages=outages, gate=Gate()),
+        intake=TelegramIntake(
+            wiz=buildable_runtime.wiz,
+            owner_chat_ids=[OWNER],
+            journal=buildable_runtime.journal,
+        ),
+        allowed_chat_ids=OWNER,
+        outages=outages,
+    )
+
+
+class TestTheClassifierNeverReachesFeatureBuild:
+    """Documents the actual bug: no rule names feature.build, and any text
+    containing a feature id is always won by feature.status. This is why the
+    fix dispatches with an explicit capability rather than free text — this
+    test pins the classifier's real behaviour so nobody "fixes" the routing
+    instead and reintroduces the same silent misroute.
+    """
+
+    def test_synthetic_build_text_would_misroute_to_status(self):
+        from openjarvis.wiz.intents import RuleClassifier, default_rules
+        from openjarvis.wiz.product import product_intent_rules
+
+        rules = list(default_rules()) + list(product_intent_rules())
+        classifier = RuleClassifier(rules)
+        assert classifier.classify_text("build FEAT-00030") == "feature.status"
+
+    def test_no_rule_names_feature_build_at_all(self):
+        from openjarvis.wiz.product import product_intent_rules
+
+        assert all(r.capability != "feature.build" for r in product_intent_rules())
+
+
+class TestTheHandoffActuallyBuilds:
+    def test_a_request_leaves_received_in_the_same_message(self, buildable_door):
+        reply = buildable_door.receive(chat_id=OWNER, text="Add a small badge")
+        assert reply.capability == "feature.request+build"
+        assert "Starting work now." in reply.text
+
+    def test_the_pipelines_run_is_actually_called(self, buildable_door, buildable_runtime):
+        buildable_door.receive(chat_id=OWNER, text="Add a small badge")
+        [feature] = buildable_runtime.pipeline.store.list()
+        # FakePipeline.run() moves RECEIVED -> READY; the point here is only
+        # that it moved at all, proving pipeline.run() was really invoked
+        # rather than misrouted to a read-only status lookup.
+        assert feature.state is not FeatureState.RECEIVED
+
+    def test_no_duplicate_feature_is_created_by_the_handoff(
+        self, buildable_door, buildable_runtime
+    ):
+        buildable_door.receive(chat_id=OWNER, text="Add a small badge")
+        assert len(buildable_runtime.pipeline.store.list()) == 1
+
+    def test_the_grant_journaled_is_code_write_for_feature_build(
+        self, buildable_door, buildable_runtime
+    ):
+        buildable_door.receive(chat_id=OWNER, text="Add a small badge")
+        entries = buildable_runtime.journal.entries()
+        grants = [
+            e
+            for e in entries
+            if e.kind == "authority.granted" and e.capability == "feature.build"
+        ]
+        assert grants, "feature.build must have actually been attempted"
+
+
+class TestAnAutoBuildRefusalIsJournaled:
+    """Independent of root cause: if the handoff refuses or fails, that must
+    survive past the one Telegram reply that carried it — see
+    OwnerDoor._journal_auto_build_outcome.
+    """
+
+    def test_a_refused_build_is_journaled_with_the_feature_id(self, tmp_path, incidents):
+        pipeline = FakePipeline(profile=_complete_profile(tmp_path))
+        product = ProductVerbs(
+            pipeline=pipeline,
+            memory=ProductMemory(tmp_path / "memory.db"),
+            runner=lambda feature_id: pipeline.run(feature_id),
+        )
+        # No CODE_WRITE granted: feature.build must be refused.
+        runtime = build_wiz(
+            home=tmp_path,
+            policy=AuthorityPolicy(
+                grants={Channel.TELEGRAM: frozenset({Authority.READ, Authority.SAFE_ACTION})}
+            ),
+            journal=WizJournal(tmp_path / "journal.jsonl"),
+            config=JarvisConfig(),
+            store_factory=incidents,
+            product=product,
+        )
+        door = OwnerDoor(
+            intake=TelegramIntake(
+                wiz=runtime.wiz, owner_chat_ids=[OWNER], journal=runtime.journal
+            ),
+            allowed_chat_ids=OWNER,
+        )
+        reply = door.receive(chat_id=OWNER, text="Add a small badge")
+        assert reply.capability == "feature.request"  # not "+build"
+        # The reply now carries a real reason, not the old empty-string
+        # detail that made a silent refusal look identical to a success.
+        assert reply.text.strip() != ""
+
+        [feature] = pipeline.store.list()
+        entries = [
+            e
+            for e in runtime.journal.entries()
+            if e.kind == "feature.auto_build_refused"
+        ]
+        assert len(entries) == 1
+        assert entries[0].detail["feature_id"] == feature.id
+        assert entries[0].reason  # a real, bounded reason, not empty
+
+    def test_the_journaled_reason_is_bounded(self, tmp_path, incidents):
+        pipeline = FakePipeline(profile=_complete_profile(tmp_path))
+        product = ProductVerbs(
+            pipeline=pipeline,
+            memory=ProductMemory(tmp_path / "memory.db"),
+            runner=lambda feature_id: pipeline.run(feature_id),
+        )
+        runtime = build_wiz(
+            home=tmp_path,
+            policy=AuthorityPolicy(
+                grants={Channel.TELEGRAM: frozenset({Authority.READ, Authority.SAFE_ACTION})}
+            ),
+            journal=WizJournal(tmp_path / "journal.jsonl"),
+            config=JarvisConfig(),
+            store_factory=incidents,
+            product=product,
+        )
+        door = OwnerDoor(
+            intake=TelegramIntake(
+                wiz=runtime.wiz, owner_chat_ids=[OWNER], journal=runtime.journal
+            ),
+            allowed_chat_ids=OWNER,
+        )
+        door.receive(chat_id=OWNER, text="Add a small badge")
+        entries = [
+            e
+            for e in runtime.journal.entries()
+            if e.kind == "feature.auto_build_refused"
+        ]
+        assert len(entries[0].reason) <= 500
+
+    def test_an_exploding_dispatch_is_journaled_as_failed_not_refused(
+        self, tmp_path, incidents
+    ):
+        pipeline = FakePipeline(profile=_complete_profile(tmp_path))
+        product = ProductVerbs(
+            pipeline=pipeline,
+            memory=ProductMemory(tmp_path / "memory.db"),
+            runner=lambda feature_id: pipeline.run(feature_id),
+        )
+        runtime = build_wiz(
+            home=tmp_path,
+            policy=AuthorityPolicy(
+                grants={
+                    Channel.TELEGRAM: frozenset(
+                        {Authority.READ, Authority.SAFE_ACTION, Authority.CODE_WRITE}
+                    )
+                }
+            ),
+            journal=WizJournal(tmp_path / "journal.jsonl"),
+            config=JarvisConfig(),
+            store_factory=incidents,
+            product=product,
+        )
+
+        class ExplodingWiz:
+            def handle(self, request, *, capability=None):
+                raise RuntimeError("boom")
+
+        intake = TelegramIntake(
+            wiz=ExplodingWiz(), owner_chat_ids=[OWNER], journal=runtime.journal
+        )
+        # feature.request still needs the real wiz to record the feature, so
+        # build it for real first, then swap wiz out from under the door for
+        # the auto-build call only.
+        real_intake = TelegramIntake(
+            wiz=runtime.wiz, owner_chat_ids=[OWNER], journal=runtime.journal
+        )
+        door = OwnerDoor(intake=real_intake, allowed_chat_ids=OWNER)
+        door.intake = intake  # now .receive() would fail too; call the method directly
+
+        build_result = door._auto_build_feature("FEAT-99999", OWNER, OWNER)
+        assert build_result["started"] is False
+
+        entries = [
+            e for e in runtime.journal.entries() if e.kind == "feature.auto_build_failed"
+        ]
+        assert len(entries) == 1
+        assert "boom" in entries[0].reason
+        assert entries[0].detail["feature_id"] == "FEAT-99999"

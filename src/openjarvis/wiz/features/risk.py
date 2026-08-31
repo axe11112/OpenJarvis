@@ -120,13 +120,15 @@ _NEGATION_CUES: Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-#: How far back a negation cue can sit and still be read as governing the
-#: matched word. Long enough for a list like "do not change functionality,
-#: authentication, data, APIs, or styling" — the cue is at the front and the
-#: risky word can be several items later — short enough that a negation in an
-#: earlier, unrelated sentence cannot reach forward and silence a real
-#: request later in the same text.
-_NEGATION_WINDOW = 80
+#: Marks the end of a prohibition's reach even mid-sentence: "do not touch
+#: auth, but change permissions" must let "permissions" answer for itself.
+#: Not "except"/"excluding" — those are negation cues themselves (already in
+#: _NEGATION_CUES): "except for billing" *continues* to exclude billing,
+#: where "but change billing" reopens it. The two read oppositely and must
+#: stay in separate lists.
+_CLAUSE_REOPENERS: Pattern[str] = re.compile(
+    r"[.!?;]|\b(?:but|however|though|yet)\b", re.IGNORECASE
+)
 
 
 def _is_prohibited(text: str, match: "re.Match[str]") -> bool:
@@ -136,17 +138,23 @@ def _is_prohibited(text: str, match: "re.Match[str]") -> bool:
     but an operator explicitly ruling something out is not the same signal as
     an operator asking for it, and treating them alike means every request
     that lists what must stay untouched — the safest possible request — reads
-    as the most dangerous one. Handled as a bounded window immediately before
-    the match, stopped at the nearest sentence boundary so a prohibition in
-    one sentence cannot reach into the next.
+    as the most dangerous one.
+
+    Scoped to the enclosing clause, not a fixed character window. A window
+    wide enough for "do not change authentication, APIs, database, data
+    handling, navigation, forms, backend logic, permissions, or existing
+    functionality" is wide enough to also reach across a "but" into a
+    genuinely new instruction ("do not touch auth, but change permissions"),
+    and no fixed width is correct for both — a prohibition's list can be
+    arbitrarily long, so the boundary has to be what actually ends the
+    clause: the nearest sentence punctuation, or a conjunction like "but"
+    that reopens what came before it.
     """
-    start = max(0, match.start() - _NEGATION_WINDOW)
-    window = text[start : match.start()]
-    for boundary in (".", "!", "?"):
-        idx = window.rfind(boundary)
-        if idx != -1:
-            window = window[idx + 1 :]
-    return bool(_NEGATION_CUES.search(window))
+    before = text[: match.start()]
+    clause_start = 0
+    for boundary in _CLAUSE_REOPENERS.finditer(before):
+        clause_start = boundary.end()
+    return bool(_NEGATION_CUES.search(before[clause_start:]))
 
 
 _ORDER = {Risk.LOW: 0, Risk.MEDIUM: 1, Risk.HIGH: 2}

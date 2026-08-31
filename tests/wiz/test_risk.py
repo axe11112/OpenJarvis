@@ -208,6 +208,99 @@ class TestProhibitionIsNotARequest:
         assert classify_text(text).risk is Risk.LOW, text
 
 
+class TestProhibitionScopeIsClauseAware:
+    """FEAT-00030: "Do not change authentication, APIs, database, data
+    handling, navigation, forms, backend logic, permissions, or existing
+    functionality." still classified HIGH — the fixed-width negation window
+    (80 characters) never reached "permissions", the ninth item in the list.
+    A prohibition's list can be arbitrarily long, so the scope has to be the
+    actual clause it sits in — bounded by sentence punctuation or by a
+    conjunction like "but" that reopens it — not a character count.
+    """
+
+    def test_an_unqualified_change_is_still_risky(self):
+        assert classify_text("change permissions").risk is Risk.HIGH
+
+    def test_a_second_risky_word_joined_by_and_is_still_risky(self):
+        assert (
+            classify_text("change authentication and permissions").risk is Risk.HIGH
+        )
+
+    def test_a_long_prohibited_list_does_not_independently_raise_risk(self):
+        # The exact FEAT-00030 sentence: nine items, and the one that used
+        # to leak past the old 80-character window is ninth.
+        text = (
+            "Do not change authentication, APIs, database, data handling, "
+            "navigation, forms, backend logic, permissions, or existing "
+            "functionality."
+        )
+        assert classify_text(text).risk is not Risk.HIGH, text
+
+    def test_the_full_feat_00030_request_is_low_risk(self):
+        text = (
+            'Add a small informational badge to the Wize landing page that '
+            'says\n"Built for athletes who want to understand their '
+            'performance."\n\nPlace it where it fits naturally near the main '
+            "hero content.\n\nUse the existing Wize design system and "
+            "existing styling patterns so it feels native to the "
+            "page.\n\nKeep this strictly LOW-risk and presentation-only.\n\n"
+            "Do not change authentication, APIs, database, data handling, "
+            "navigation, forms, backend logic, permissions, or existing "
+            "functionality.\n\nBuild it, test it, deploy the exact Preview, "
+            "verify it with browser acceptance on desktop and mobile, and "
+            "ship it automatically only if every autonomous LOW-risk gate "
+            "passes.\n\nIf the final diff is not LOW-risk, do not "
+            "auto-ship it."
+        )
+        assert classify_text(text).risk is Risk.LOW, text
+
+    def test_but_reopens_risk_for_what_follows_it(self):
+        # A prohibition does not reach across a conjunction that reintroduces
+        # a new instruction: "but change permissions" is a real ask.
+        assert (
+            classify_text("Do not change authentication, but change permissions.").risk
+            is Risk.HIGH
+        )
+
+    def test_but_still_protects_what_came_before_it(self):
+        # The other half of the same sentence: "authentication" stays
+        # prohibited even though "permissions" (after "but") is real.
+        result = classify_text(
+            "Do not change authentication, but change permissions."
+        )
+        assert "authentication" not in " ".join(result.reasons)
+
+    def test_a_leading_without_clause_still_covers_a_list_before_a_comma(self):
+        text = "Without touching auth or permissions, add a badge."
+        assert classify_text(text).risk is not Risk.HIGH, text
+
+    def test_a_semicolon_also_ends_a_prohibitions_reach(self):
+        assert (
+            classify_text(
+                "Do not touch billing; change permissions for the admin panel."
+            ).risk
+            is Risk.HIGH
+        )
+
+    def test_however_also_reopens_risk(self):
+        assert (
+            classify_text(
+                "Do not change authentication, however change permissions."
+            ).risk
+            is Risk.HIGH
+        )
+
+    def test_a_ten_item_list_is_still_fully_covered(self):
+        # Not "a wider window" — the old fix's failure mode was a width that
+        # was merely too narrow for this one case. Confirms there is no
+        # width at all here to outgrow: the scope is the clause.
+        text = (
+            "Do not touch one, two, three, four, five, six, seven, eight, "
+            "nine, or permissions."
+        )
+        assert classify_text(text).risk is not Risk.HIGH, text
+
+
 class TestApprovalGate:
     def test_high_risk_requires_approval(self):
         assert classify(paths=["src/lib/auth/x.ts"]).requires_approval
