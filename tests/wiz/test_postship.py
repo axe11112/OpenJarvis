@@ -851,6 +851,33 @@ class TestReconcileExternalMerge:
         assert len(notifier.calls) == 1
         assert notifier.calls[0][1] == "feature.external_bypass_reconciled"
 
+    def test_the_real_owner_notifier_actually_sends_for_this_kind(self, tmp_path):
+        # The FakeOwnerNotifier above proves the *call* happens with the
+        # right kind, not that the real FeatureOwnerNotifier recognizes it —
+        # found the hard way on FEAT-00030 itself: the fake test passed while
+        # the real notifier silently dropped the message, because
+        # "feature.external_bypass_reconciled" was in neither SUCCESS_KIND
+        # nor NEEDS_OWNER_KINDS. This uses the real class end to end.
+        from openjarvis.wiz.features.notify import FeatureOwnerNotifier
+
+        feature = self._unmerged_feature()
+        store = self._store(tmp_path, feature)
+        sent = []
+        notifier = FeatureOwnerNotifier(
+            send=sent.append, ledger_path=tmp_path / "ledger.json"
+        )
+        reconcile_external_merge(
+            feature.id,
+            pr_number=251,
+            owner_acknowledged=True,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(success=True),
+            owner_notifier=notifier,
+        )
+        assert len(sent) == 1
+        assert "it's live" in sent[0]
+
     def test_it_never_merges_or_creates_a_pull_request_itself(self):
         import inspect
 

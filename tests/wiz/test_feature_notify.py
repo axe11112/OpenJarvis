@@ -9,6 +9,7 @@ import pytest
 from openjarvis.wiz.features.notify import (
     NEEDS_OWNER_KINDS,
     SUCCESS_KIND,
+    SUCCESS_KINDS,
     FeatureOwnerNotifier,
 )
 
@@ -56,6 +57,24 @@ class TestSuccessMessage:
             FakeFeature(), kind=SUCCESS_KIND, reason="production agrees: ok"
         )
         assert "feature.shipped" not in recorder.sent[0]
+
+    def test_an_externally_reconciled_feature_also_says_its_live(self, tmp_path):
+        # FEAT-00030: reconcile_external_merge() journals a distinct kind
+        # (never "feature.shipped", so the audit trail never implies
+        # ship() performed a merge it did not) — but the owner must still
+        # hear "it's live" exactly like an ordinary shipped feature.
+        notifier, recorder = build(tmp_path)
+        sent = notifier.notify(
+            FakeFeature(),
+            kind="feature.external_bypass_reconciled",
+            reason="production agrees",
+        )
+        assert sent
+        assert "it's live" in recorder.sent[0]
+
+    def test_success_kinds_include_both(self):
+        assert SUCCESS_KIND in SUCCESS_KINDS
+        assert "feature.external_bypass_reconciled" in SUCCESS_KINDS
 
 
 class TestNeedsOwnerMessage:

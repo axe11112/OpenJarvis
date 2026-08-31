@@ -38,12 +38,22 @@ from typing import Any, Callable, Dict
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["FeatureOwnerNotifier", "NEEDS_OWNER_KINDS", "SUCCESS_KIND"]
+__all__ = ["FeatureOwnerNotifier", "NEEDS_OWNER_KINDS", "SUCCESS_KIND", "SUCCESS_KINDS"]
 
-#: The one journal kind that means "it shipped and production agrees" — see
-#: openjarvis.wiz.features.postship.complete: COMPLETE is reserved for
-#: exactly this, so this is the only kind that maps to it.
+#: The ordinary journal kind that means "it shipped and production agrees" —
+#: see openjarvis.wiz.features.postship.complete: COMPLETE is reserved for
+#: exactly this. Kept as the single name existing callers already use.
 SUCCESS_KIND = "feature.shipped"
+
+#: Every kind that is a real "it's live" outcome — not only the ordinary one.
+#: Found on FEAT-00030: reconcile_external_merge() deliberately journals
+#: "feature.external_bypass_reconciled" rather than "feature.shipped" so the
+#: audit trail never implies canonical ship() performed a merge it did not —
+#: but that meant notify() below, which only ever recognised the one literal
+#: SUCCESS_KIND, silently never told the owner the feature had actually
+#: finished. The audit trail's honesty and the owner's "it's live" message
+#: are two different concerns; this is what lets both be true at once.
+SUCCESS_KINDS = frozenset({SUCCESS_KIND, "feature.external_bypass_reconciled"})
 
 #: Every journal kind that represents a genuine "I need you" — the feature's
 #: own attempt loop is exhausted, evidence changed too much to proceed
@@ -97,7 +107,7 @@ class FeatureOwnerNotifier:
         Returns whether a message was actually sent — mainly useful to a
         caller proving a diagnostic message really went out, and to tests.
         """
-        if kind == SUCCESS_KIND:
+        if kind in SUCCESS_KINDS:
             text = self._success_text(feature)
         elif kind in NEEDS_OWNER_KINDS:
             text = self._needs_owner_text(feature, reason)
