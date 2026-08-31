@@ -10,6 +10,7 @@ from openjarvis.wiz.features.postship import (
     ProductionFailure,
     complete,
     handoff_to_reliability,
+    reconcile_external_merge,
     reverify_production,
 )
 from openjarvis.wiz.features.preview import PreviewObserver
@@ -639,4 +640,222 @@ class TestReverifyProduction:
 
         source = inspect.getsource(postship.reverify_production)
         for word in ("merge_pull_request", "create_pull_request", "push"):
+            assert word not in source
+
+
+# ---------------------------------------------------------------------------
+# INC-00107 / FEAT-00030: reconciling a merge canonical ship() never performed
+# ---------------------------------------------------------------------------
+
+
+class TestReconcileExternalMerge:
+    """A feature whose merge happened outside the pipeline entirely — a
+    coding session's own gh pr merge, not a flaky post-ship recheck on a
+    merge the pipeline itself made. Every test here starts from a feature
+    with no tracked PR, matching real FEAT-00030.
+    """
+
+    def _store(self, tmp_path, feature):
+        store = FeatureStore(tmp_path / "features.db")
+        store.create(feature)
+        return store
+
+    def _postship(self, *, success=True):
+        return PostShipVerifier(
+            deployments=observer(FakeVercel()),
+            verifier=verifier(FakeBrowser(success=success)),
+            handler=lambda f: "reliability (test)",
+        )
+
+    def _unmerged_feature(self):
+        return human_required_shipped_feature(pr_number=0)
+
+    def test_refuses_without_owner_acknowledgement(self, tmp_path):
+        feature = self._unmerged_feature()
+        store = self._store(tmp_path, feature)
+        result = reconcile_external_merge(
+            feature.id,
+            pr_number=251,
+            owner_acknowledged=False,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(),
+        )
+        assert not result.recovered
+        assert result.refusals[0].code == "owner_acknowledgement_required"
+        # Refusing must not have touched anything.
+        assert store.get(feature.id).state is FeatureState.HUMAN_REQUIRED
+        assert store.get(feature.id).pr_number == 0
+
+    def test_refuses_without_a_pr_number(self, tmp_path):
+        feature = self._unmerged_feature()
+        store = self._store(tmp_path, feature)
+        result = reconcile_external_merge(
+            feature.id,
+            pr_number=0,
+            owner_acknowledged=True,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(),
+        )
+        assert not result.recovered
+        assert result.refusals[0].code == "no_pull_request"
+
+    def test_refuses_an_unmerged_pr(self, tmp_path):
+        feature = self._unmerged_feature()
+        store = self._store(tmp_path, feature)
+        result = reconcile_external_merge(
+            feature.id,
+            pr_number=251,
+            owner_acknowledged=True,
+            store=store,
+            github=FakeGitHub(merged=False, state="open"),
+            postship=self._postship(),
+        )
+        assert not result.recovered
+        assert result.refusals[0].code == "pull_request_not_merged"
+
+    def test_refuses_a_feature_not_stuck_in_human_required(self, tmp_path):
+        feature = shipped_feature(state=FeatureState.READY)
+        store = self._store(tmp_path, feature)
+        result = reconcile_external_merge(
+            feature.id,
+            pr_number=251,
+            owner_acknowledged=True,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(),
+        )
+        assert not result.recovered
+        assert result.refusals[0].code == "wrong_state"
+
+    def test_an_already_complete_feature_is_idempotent(self, tmp_path):
+        feature = shipped_feature(state=FeatureState.COMPLETE)
+        store = self._store(tmp_path, feature)
+        github = FakeGitHub()
+        result = reconcile_external_merge(
+            feature.id,
+            pr_number=251,
+            owner_acknowledged=True,
+            store=store,
+            github=github,
+            postship=self._postship(),
+        )
+        assert result.recovered
+        assert github.calls == []
+
+    def test_success_completes_and_records_the_shipping_path_honestly(self, tmp_path):
+        feature = self._unmerged_feature()
+        store = self._store(tmp_path, feature)
+        result = reconcile_external_merge(
+            feature.id,
+            pr_number=251,
+            owner_acknowledged=True,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(success=True),
+        )
+        assert result.recovered
+        saved = store.get(feature.id)
+        assert saved.state is FeatureState.COMPLETE
+        assert saved.pr_number == 251
+        assert saved.metadata["shipping_path"] == "external_bypass_reconciled"
+        assert saved.metadata["external_bypass_pr_number"] == 251
+        assert saved.metadata["external_bypass_merge_commit_sha"] == MERGE_SHA
+
+    def test_success_never_journals_the_ordinary_shipped_kind(self, tmp_path):
+        # "does NOT pretend ship() performed the merge" — the audit trail
+        # must say so, not read identically to an ordinary shipped feature.
+        feature = self._unmerged_feature()
+        store = self._store(tmp_path, feature)
+        journal = FakeJournal()
+        reconcile_external_merge(
+            feature.id,
+            pr_number=251,
+            owner_acknowledged=True,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(success=True),
+            journal=journal,
+        )
+        kinds = [e["kind"] for e in journal.entries]
+        assert "feature.shipped" not in kinds
+        assert "feature.external_bypass_reconciliation_started" in kinds
+        assert "feature.external_bypass_reconciled" in kinds
+
+    def test_a_failed_reverify_stays_human_required_and_unmarked(self, tmp_path):
+        feature = self._unmerged_feature()
+        store = self._store(tmp_path, feature)
+        result = reconcile_external_merge(
+            feature.id,
+            pr_number=251,
+            owner_acknowledged=True,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(success=False),
+        )
+        assert not result.recovered
+        saved = store.get(feature.id)
+        assert saved.state is FeatureState.HUMAN_REQUIRED
+        assert "shipping_path" not in saved.metadata
+
+    def test_success_resolves_the_associated_incident(self, tmp_path):
+        from openjarvis.reliability.types import IncidentState
+
+        feature = self._unmerged_feature()
+        store = self._store(tmp_path, feature)
+        incident = FakeIncident()
+        incident_store = FakeIncidentStore(incident)
+        reconcile_external_merge(
+            feature.id,
+            pr_number=251,
+            owner_acknowledged=True,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(success=True),
+            incident_store=incident_store,
+        )
+        assert incident.state is IncidentState.RESOLVED
+
+    def test_a_failed_reverify_leaves_the_incident_open(self, tmp_path):
+        from openjarvis.reliability.types import IncidentState
+
+        feature = self._unmerged_feature()
+        store = self._store(tmp_path, feature)
+        incident = FakeIncident()
+        incident_store = FakeIncidentStore(incident)
+        reconcile_external_merge(
+            feature.id,
+            pr_number=251,
+            owner_acknowledged=True,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(success=False),
+            incident_store=incident_store,
+        )
+        assert incident.state is not IncidentState.RESOLVED
+
+    def test_success_notifies_the_owner_exactly_once(self, tmp_path):
+        feature = self._unmerged_feature()
+        store = self._store(tmp_path, feature)
+        notifier = FakeOwnerNotifier()
+        reconcile_external_merge(
+            feature.id,
+            pr_number=251,
+            owner_acknowledged=True,
+            store=store,
+            github=FakeGitHub(),
+            postship=self._postship(success=True),
+            owner_notifier=notifier,
+        )
+        assert len(notifier.calls) == 1
+        assert notifier.calls[0][1] == "feature.external_bypass_reconciled"
+
+    def test_it_never_merges_or_creates_a_pull_request_itself(self):
+        import inspect
+
+        from openjarvis.wiz.features import postship
+
+        source = inspect.getsource(postship.reconcile_external_merge)
+        for word in ("merge_pull_request", "create_pull_request"):
             assert word not in source

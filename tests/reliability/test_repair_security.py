@@ -198,7 +198,21 @@ class TestAgentEnvironment:
         env = ClaudeCliAgent.scrubbed_environment(
             {"NODE_ENV": "test", "HOME": "/home/x", "CI": "1"}
         )
-        assert env == {"NODE_ENV": "test", "HOME": "/home/x", "CI": "1"}
+        assert env["NODE_ENV"] == "test"
+        assert env["HOME"] == "/home/x"
+        assert env["CI"] == "1"
+
+    def test_gh_cannot_find_the_operators_own_ambient_login(self):
+        """FEAT-00030: gh authenticates from the operator's own `gh auth
+        login`, stored in the keychain and resolved via $GH_CONFIG_DIR — not
+        through any of the env vars STRIPPED_ENV_PARTS ever touched. Pointed
+        at a directory that cannot exist, so `gh` behaves as logged out.
+        """
+        env = ClaudeCliAgent.scrubbed_environment({"HOME": "/home/x"})
+        assert env["GH_CONFIG_DIR"] != ""
+        import os
+
+        assert not os.path.exists(env["GH_CONFIG_DIR"])
 
     def test_network_tools_are_refused_by_default(self):
         assert "WebFetch" in ClaudeCliAgent.DEFAULT_DISALLOWED_TOOLS
@@ -225,6 +239,34 @@ class TestAgentEnvironment:
         assert isinstance(captured["command"], list)
         assert "; rm -rf /" in captured["command"]
         assert "shell" not in captured["kwargs"]
+
+    def test_every_invocation_carries_the_engineer_guard_settings(self):
+        """FEAT-00030: a building session merged its own PR through Bash.
+        Every ClaudeCliAgent.run() call must carry the guard settings — not
+        opt-in, not something a caller can forget to pass.
+        """
+        import json
+
+        captured = {}
+
+        def runner(command, **kwargs):
+            captured["command"] = command
+
+            class _P:
+                returncode = 0
+                stdout = "done"
+                stderr = ""
+
+            return _P()
+
+        agent = ClaudeCliAgent(runner=runner, executable="echo")
+        agent.run("do something", workspace=".")
+
+        command = captured["command"]
+        assert "--settings" in command
+        settings = json.loads(command[command.index("--settings") + 1])
+        assert "Bash(gh *)" in settings["permissions"]["deny"]
+        assert settings["hooks"]["PreToolUse"][0]["matcher"] == "Bash"
 
 
 # ---------------------------------------------------------------------------

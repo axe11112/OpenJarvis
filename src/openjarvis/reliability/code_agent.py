@@ -249,6 +249,26 @@ class ClaudeCliAgent(CodeAgent):
 
         The agent inherits PATH, HOME and everything the target project needs to
         build, but not the tokens JARVIS uses to read GitHub, Vercel or Supabase.
+
+        None of that touches the ``gh`` CLI's own authentication, though:
+        found on FEAT-00030, a building session ran ``gh pr merge`` and it
+        worked, because ``gh`` authenticates from the operator's own
+        ``gh auth login`` — stored in the macOS keychain, resolved through
+        ``$GH_CONFIG_DIR`` (``~/.config/gh`` by default), not through any
+        environment variable this method ever stripped. That ambient
+        credential is what makes the operator's own terminal usable and
+        cannot be revoked without breaking that; what can change is whether
+        *this* subprocess can find it. Pointing ``GH_CONFIG_DIR`` at a
+        directory that does not exist makes ``gh`` behave exactly as if
+        nobody had ever run ``gh auth login`` on this machine — confirmed
+        against the real CLI: ``gh auth status`` and even a read like
+        ``gh pr view`` both refuse with "not logged into any GitHub hosts."
+        This is a second, independent layer alongside the command-level
+        guard in :mod:`~openjarvis.reliability.engineer_guard` — belt and
+        braces, not a replacement for it: a command-injection bypass of the
+        guard would still meet an unauthenticated ``gh``, and a way to reach
+        the keychain directly (unlikely, but not this method's business to
+        rule out) would still meet the guard.
         """
         import os
 
@@ -259,6 +279,7 @@ class ClaudeCliAgent(CodeAgent):
             upper = name.upper()
             if any(part in upper for part in cls.STRIPPED_ENV_PARTS):
                 env.pop(name, None)
+        env["GH_CONFIG_DIR"] = "/nonexistent/no-gh-auth-for-coding-sessions"
         return env
 
     def available(self) -> bool:
@@ -280,6 +301,13 @@ class ClaudeCliAgent(CodeAgent):
             command += ["--allowedTools", ",".join(self._allowed)]
         if self._disallowed:
             command += ["--disallowedTools", ",".join(self._disallowed)]
+        # Not optional, not passed through extra_args, not something a caller
+        # can quietly omit: this is the boundary that stops a coding session
+        # from merging its own change — see engineer_guard's module docstring
+        # for the incident that made it not-optional.
+        from openjarvis.reliability.engineer_guard import guard_settings_json
+
+        command += ["--settings", guard_settings_json()]
         command += self._extra_args
 
         # The task text is passed as an argv element, never through a shell, so

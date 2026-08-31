@@ -49,6 +49,7 @@ __all__ = [
     "PostShipVerifier",
     "ProductionFailure",
     "handoff_to_reliability",
+    "reconcile_external_merge",
     "reverify_production",
 ]
 
@@ -611,6 +612,196 @@ def reverify_production(
             incident_store,
             reason=incident_resolution_reason
             or f"Production verification passed on reverify: {result.summary()}",
+        )
+
+    return RecoveryResult(feature.id, bool(result.verified), feature.state.value, [])
+
+
+def reconcile_external_merge(
+    feature_id: str,
+    *,
+    pr_number: int,
+    owner_acknowledged: bool,
+    store: FeatureStore,
+    github: Any,
+    postship: "PostShipVerifier",
+    journal: Any = None,
+    clock: Callable[[], str] = lambda: "",
+    reason: str = "",
+    incident_store: Any = None,
+    incident_resolution_reason: str = "",
+    owner_notifier: Any = None,
+) -> "RecoveryResult":
+    """Reconcile a feature whose merge happened *outside* canonical ship().
+
+    Deliberately not a variant of :func:`reverify_production`. That function
+    covers a merge the pipeline itself performed, where only the post-ship
+    check flaked — the merge's legitimacy was never in question. This covers
+    the opposite: a merge this package never authorized, through a channel
+    it does not control (found on FEAT-00030 / INC-00107 — a coding
+    session's own shell running ``gh pr merge`` directly; see
+    :mod:`~openjarvis.reliability.engineer_guard` for the structural fix).
+    Reusing ``reverify_production`` for this would let an unauthorized merge
+    complete through the same quiet path as an ordinary flaky retry, which
+    is exactly the outcome this function exists to refuse by default.
+
+    Two things distinguish it, both required, neither implicit:
+
+    ``pr_number`` is a parameter, not read from ``feature.pr_number``. A
+    feature reconciled here typically has no pull request on record at all —
+    the pipeline never opened one — so there is nothing on the feature to
+    trust; the caller (a person who has looked at what actually happened)
+    supplies it.
+
+    ``owner_acknowledged`` must be ``True`` explicitly. There is no default
+    that lets this succeed unattended: completing a feature whose real
+    shipping mechanism was an unauthorized merge is a judgement call about
+    an already-live production change, not a fact a fresh Playwright run can
+    establish on its own.
+
+    Even given both, this never pretends ``ship()`` performed the merge: on
+    success the feature's ``shipping_path`` metadata is stamped
+    ``"external_bypass_reconciled"`` — never the ordinary ``"feature.shipped"``
+    journal kind — and the associated incident (see
+    :func:`_resolve_associated_incident`) is resolved with that history
+    preserved, not erased.
+    """
+    from openjarvis.wiz.features.recovery import RecoveryRefusal, RecoveryResult
+
+    feature = store.get(feature_id)
+    if feature is None:
+        return RecoveryResult(
+            feature_id, False, "UNKNOWN", [RecoveryRefusal("not_found", f"no feature {feature_id!r}")]
+        )
+
+    if feature.state is FeatureState.COMPLETE:
+        return RecoveryResult(feature.id, True, feature.state.value, [])
+
+    if feature.state is not FeatureState.HUMAN_REQUIRED:
+        return RecoveryResult(
+            feature.id,
+            False,
+            feature.state.value,
+            [
+                RecoveryRefusal(
+                    "wrong_state",
+                    f"{feature.state.value} is not a state an external-merge "
+                    "reconciliation can act on",
+                )
+            ],
+        )
+
+    if not owner_acknowledged:
+        return RecoveryResult(
+            feature.id,
+            False,
+            feature.state.value,
+            [
+                RecoveryRefusal(
+                    "owner_acknowledgement_required",
+                    "reconciling a merge that happened outside canonical ship() "
+                    "requires explicit, informed owner acknowledgement — refusing "
+                    "to complete this silently",
+                )
+            ],
+        )
+
+    if not pr_number:
+        return RecoveryResult(
+            feature.id,
+            False,
+            feature.state.value,
+            [RecoveryRefusal("no_pull_request", "no pull request number was supplied")],
+        )
+
+    try:
+        pr = github.get_pull_request(pr_number)
+    except Exception as exc:
+        return RecoveryResult(
+            feature.id,
+            False,
+            feature.state.value,
+            [RecoveryRefusal("pull_request_unreadable", str(exc))],
+        )
+
+    if not pr.get("merged"):
+        return RecoveryResult(
+            feature.id,
+            False,
+            feature.state.value,
+            [
+                RecoveryRefusal(
+                    "pull_request_not_merged",
+                    f"PR #{pr_number} is not merged (state={pr.get('state', 'unknown')!r})",
+                )
+            ],
+        )
+
+    merge_commit_sha = str(pr.get("merge_commit_sha") or "")
+    if not merge_commit_sha:
+        return RecoveryResult(
+            feature.id,
+            False,
+            feature.state.value,
+            [
+                RecoveryRefusal(
+                    "no_merge_commit_sha",
+                    f"PR #{pr_number} is merged but GitHub reports no merge commit SHA",
+                )
+            ],
+        )
+
+    # Recorded now, honestly: a PR exists and this is its number — a fact —
+    # distinct from feature.metadata["shipping_path"] below, which records
+    # *how* it got merged. One documents what happened; the other documents
+    # that ship() is not what did it.
+    feature.pr_number = pr_number
+    feature.pr_url = str(pr.get("url") or feature.pr_url)
+
+    feature.resume_production_reverification_from_human_required(
+        at=clock(),
+        reason=reason
+        or f"owner-acknowledged reconciliation of PR #{pr_number}, merged outside ship()",
+    )
+    store.save(feature)
+    _record_journal(
+        journal,
+        feature,
+        clock,
+        kind="feature.external_bypass_reconciliation_started",
+        reason=f"reconciling PR #{pr_number} (merge commit {merge_commit_sha[:12]}), owner acknowledged",
+    )
+
+    result = postship.verify(feature, merge_commit_sha=merge_commit_sha)
+
+    if result.verified:
+        feature.metadata["shipping_path"] = "external_bypass_reconciled"
+        feature.metadata["external_bypass_pr_number"] = pr_number
+        feature.metadata["external_bypass_merge_commit_sha"] = merge_commit_sha
+
+    complete(feature, result, at=clock())
+    store.save(feature)
+    outcome_kind = (
+        "feature.external_bypass_reconciled" if result.verified else "feature.production_unverified"
+    )
+    _record_journal(journal, feature, clock, kind=outcome_kind, reason=result.summary())
+
+    if owner_notifier is not None:
+        try:
+            owner_notifier.notify(feature, kind=outcome_kind, reason=result.summary())
+        except Exception:
+            logger.exception("owner notification failed for %s", feature.id)
+
+    if result.verified and incident_store is not None:
+        _resolve_associated_incident(
+            feature,
+            incident_store,
+            reason=incident_resolution_reason
+            or (
+                f"Reconciled: production verification passed against PR #{pr_number}'s "
+                f"merge commit, with explicit owner acknowledgement that this merge "
+                f"happened outside canonical ship()."
+            ),
         )
 
     return RecoveryResult(feature.id, bool(result.verified), feature.state.value, [])
