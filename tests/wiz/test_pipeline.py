@@ -73,6 +73,12 @@ class FakeWorkspace:
         self.created.append(worktree)
         return worktree
 
+    def reuse(self, feature_id, *, path, branch, base_sha):
+        # None by default: every existing test's pipeline falls through to
+        # create() exactly as before. A test proving real reuse semantics
+        # subclasses this and overrides it.
+        return None
+
     def changed_files(self, worktree):
         return list(self.changed)
 
