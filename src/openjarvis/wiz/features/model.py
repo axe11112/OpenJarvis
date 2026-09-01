@@ -488,6 +488,57 @@ class FeatureRequest:
         self.state = FeatureState.PRODUCTION_VERIFYING
         self.updated_at = at
 
+    def resume_deploy_from_human_required(self, *, at: str, reason: str) -> None:
+        """Reopen a ``HUMAN_REQUIRED`` feature directly into ``TESTING``,
+        to check its most recent attempt's existing diff again rather than
+        starting a new build.
+
+        The fourth ``resume_*`` sibling. Found on FEAT-00031: three attempts
+        in a row failed identically on infrastructure (a missing
+        ``node_modules``, not a code defect — see
+        :mod:`openjarvis.wiz.features.provision`), and by the time that was
+        fixed, ``max_attempts`` was already spent. Nothing was wrong with
+        the diff Claude produced; the worktree still has it, uncommitted,
+        exactly as attempt 3 left it. Calling a fourth Claude session to
+        redo work that was never the problem would be exactly the kind of
+        unverified, unnecessary autonomous action this whole recovery
+        family exists to avoid.
+
+        ``TESTING`` is ``_deploy_preview``'s own step, and that method reads
+        ``feature.attempts[-1]`` — the same attempt this resume points back
+        at, not a new one. Requires that attempt to actually have changed
+        files: an attempt that produced nothing has nothing to re-check, and
+        this method refuses rather than silently reaching
+        :meth:`~.pipeline.FeaturePipeline._deploy_preview` with an empty
+        diff. It is the caller's job — see
+        :meth:`~.pipeline.FeaturePipeline.reopen_for_deploy` — to have a real
+        reason for believing the *previous* failure was infrastructure, not
+        code; this method only enforces the state machine and that there is
+        something real to test, exactly like its three siblings.
+        """
+        if self.state is not FeatureState.HUMAN_REQUIRED:
+            raise InvalidFeatureTransition(
+                f"resume_deploy_from_human_required called from {self.state.value}, "
+                "not HUMAN_REQUIRED"
+            )
+        if not self.attempts or not self.attempts[-1].changed_files:
+            raise InvalidFeatureTransition(
+                "resume_deploy_from_human_required needs an existing attempt "
+                "with real changed files to test — there is nothing to "
+                "re-check otherwise"
+            )
+        self.history.append(
+            {
+                "at": at,
+                "from": self.state.value,
+                "to": FeatureState.TESTING.value,
+                "reason": reason,
+                "resumed": True,
+            }
+        )
+        self.state = FeatureState.TESTING
+        self.updated_at = at
+
     def next_attempt(self, *, at: str, hypothesis: str = "") -> FeatureAttempt:
         attempt = FeatureAttempt(
             number=len(self.attempts) + 1, started_at=at, hypothesis=hypothesis

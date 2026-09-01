@@ -193,6 +193,47 @@ class TestReopeningProductionReverificationFromHumanRequired:
             feature.transition(FeatureState.PRODUCTION_VERIFYING, at="t")
 
 
+class TestReopeningDeployFromHumanRequired:
+    """The fourth resume_* sibling: attempts exhausted by infrastructure
+    (FEAT-00031's missing node_modules), not by the diff itself. Also
+    deliberately not a LEGAL_TRANSITIONS entry, for the same reason as its
+    three siblings.
+    """
+
+    def test_it_only_works_from_human_required(self):
+        feature = _feature(FeatureState.READY)
+        with pytest.raises(InvalidFeatureTransition):
+            feature.resume_deploy_from_human_required(at="t", reason="x")
+
+    def test_it_refuses_a_feature_with_no_attempts(self):
+        feature = _feature(FeatureState.HUMAN_REQUIRED)
+        with pytest.raises(InvalidFeatureTransition):
+            feature.resume_deploy_from_human_required(at="t", reason="x")
+
+    def test_it_refuses_an_attempt_with_no_changed_files(self):
+        feature = _feature(FeatureState.HUMAN_REQUIRED)
+        feature.next_attempt(at="t")
+        with pytest.raises(InvalidFeatureTransition):
+            feature.resume_deploy_from_human_required(at="t", reason="x")
+
+    def test_a_successful_reopen_lands_on_testing(self):
+        feature = _feature(FeatureState.HUMAN_REQUIRED)
+        attempt = feature.next_attempt(at="t")
+        attempt.changed_files = ["src/x.ts"]
+        feature.resume_deploy_from_human_required(
+            at="t", reason="attempts exhausted by a missing node_modules, now fixed"
+        )
+        assert feature.state is FeatureState.TESTING
+        assert feature.history[-1]["resumed"] is True
+        assert feature.history[-1]["from"] == "HUMAN_REQUIRED"
+        assert feature.history[-1]["to"] == "TESTING"
+
+    def test_it_does_not_widen_check_transition(self):
+        feature = _feature(FeatureState.HUMAN_REQUIRED)
+        with pytest.raises(InvalidFeatureTransition):
+            feature.transition(FeatureState.TESTING, at="t")
+
+
 class TestTheIterativeLoop:
     def test_a_failed_check_sends_the_work_back_to_building(self):
         feature = _feature(FeatureState.TESTING)

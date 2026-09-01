@@ -927,6 +927,120 @@ class TestReopenForPlanning:
             pipeline.reopen_for_planning(feature.id)
 
 
+class TestReopenForDeploy:
+    """FEAT-00031: attempts exhausted by infrastructure (node_modules never
+    provisioned), not by the diff. Recovering must not call Claude again.
+    """
+
+    def _always_failing_provision(self, profile, workspace):
+        from openjarvis.reliability.checks import CheckResult
+
+        return CheckResult(
+            name="provision",
+            ran=True,
+            passed=False,
+            summary="failed (exit 127)",
+            output="sh: tsc: command not found",
+        )
+
+    def test_reopening_after_the_infra_is_fixed_reaches_ready_without_a_new_build(
+        self, tmp_path, clock
+    ):
+        engineer = ScriptedEngineer()
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            engineer=engineer,
+            max_attempts=1,
+            provision_factory=self._always_failing_provision,
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        stopped = pipeline.run(feature.id)
+        assert stopped.state is FeatureState.HUMAN_REQUIRED
+        assert stopped.attempts_used == 1
+        first_build_calls = len(engineer.build_calls)
+        assert first_build_calls == 1
+
+        # "the infra is fixed" — the same feature, the same worktree, the
+        # same diff; only the provisioning outcome changes.
+        pipeline.provision_factory = _passing_provision
+
+        reopened = pipeline.reopen_for_deploy(feature.id, reason="node_modules fix landed")
+        assert reopened.state is FeatureState.TESTING
+
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert len(engineer.build_calls) == first_build_calls  # no new Claude session
+
+    def test_a_genuine_second_failure_stops_again_without_a_new_build(
+        self, tmp_path, clock
+    ):
+        # Reopened, but the check suite itself still fails for a real
+        # reason this time — must not retry into a 4th Claude session
+        # either; attempts are already exhausted.
+        engineer = ScriptedEngineer()
+        suite = FakeSuite([FakeCheckResult(passed=False, summary="still broken")])
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            engineer=engineer,
+            max_attempts=1,
+            provision_factory=self._always_failing_provision,
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        first_build_calls = len(engineer.build_calls)
+
+        pipeline.provision_factory = _passing_provision
+        pipeline.check_suite_factory = lambda profile: suite
+        pipeline.reopen_for_deploy(feature.id, reason="node_modules fix landed")
+        result = pipeline.run(feature.id)
+
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert len(engineer.build_calls) == first_build_calls
+
+    def test_no_existing_attempt_cannot_be_reopened_this_way(self, tmp_path, clock):
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            engineer=ScriptedEngineer(
+                plans=[EngineeringSession(mode="plan", succeeded=False, error="ambiguous")]
+            ),
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)  # stops in planning, zero attempts
+
+        with pytest.raises(InvalidFeatureTransition):
+            pipeline.reopen_for_deploy(feature.id)
+
+    def test_a_feature_not_in_human_required_cannot_be_reopened_this_way(
+        self, tmp_path, clock
+    ):
+        pipeline = build_pipeline(tmp_path, clock)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        with pytest.raises(InvalidFeatureTransition):
+            pipeline.reopen_for_deploy(feature.id)
+
+    def test_reopening_is_recorded_in_the_journal(self, tmp_path, clock):
+        engineer = ScriptedEngineer()
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            engineer=engineer,
+            max_attempts=1,
+            provision_factory=self._always_failing_provision,
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        pipeline.provision_factory = _passing_provision
+        pipeline.reopen_for_deploy(feature.id, reason="node_modules fix landed")
+
+        entries = [
+            e for e in pipeline.journal.tail(50) if e.detail.get("feature_id") == feature.id
+        ]
+        assert any(e.kind == "feature.reopened_for_deploy" for e in entries)
+
+
 class TestVerificationDecides:
     def test_a_preview_that_fails_the_contract_is_not_ready(self, tmp_path, clock):
         pipeline = build_pipeline(

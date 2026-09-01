@@ -318,6 +318,55 @@ class FeaturePipeline:
             self.queue.submit(feature)
         return feature
 
+    def reopen_for_deploy(
+        self, feature_id: str, *, reason: str = ""
+    ) -> FeatureRequest:
+        """Give a feature whose attempts were exhausted by infrastructure,
+        not by its own diff, another run at the check suite — without a new
+        Claude session.
+
+        Deliberately not :meth:`reopen_for_planning` (that one is for zero
+        attempts and nothing built yet) and not the crash-recovery path in
+        :mod:`openjarvis.wiz.features.recovery` (that one requires a real
+        pull request to re-verify against; a feature stopped here never
+        reached one). Found on FEAT-00031: three attempts failed identically
+        on ``node_modules`` never existing — an infrastructure gap, fixed in
+        :mod:`openjarvis.wiz.features.provision` — not a defect in what
+        Claude wrote. The worktree still has that diff, uncommitted, exactly
+        as the last attempt left it; this re-enters the pipeline at
+        ``TESTING``, the same step :meth:`~.pipeline.FeaturePipeline._deploy_preview`
+        already owns, so provisioning and every gate run for real against
+        it, through the same code every ordinary feature goes through from
+        that point on — including, if they now pass, the commit, push,
+        preview and verification steps that never happened before.
+
+        If a gate genuinely fails this time — a real defect, not
+        infrastructure — :meth:`~.pipeline.FeaturePipeline._retry_or_stop`
+        finds attempts already exhausted and stops again, the same as any
+        other feature that runs out of attempts. This method does not, and
+        cannot, grant a fourth Claude session; it only proves whether the
+        third one's actual output was ever the problem.
+
+        An explicit operator action, not something the pipeline reaches on
+        its own — the same reason :meth:`reopen_for_planning` and
+        :meth:`cancel` are their own verbs rather than states :meth:`run`
+        enters unprompted.
+        """
+        feature = self._load(feature_id)
+        feature.resume_deploy_from_human_required(
+            at=self.clock(),
+            reason=(reason or "reopened for deploy by the operator")[:300],
+        )
+        self.store.save(feature)
+        self._record(
+            feature,
+            "feature.reopened_for_deploy",
+            reason or "reopened for deploy by the operator",
+        )
+        if self.queue is not None:
+            self.queue.submit(feature)
+        return feature
+
     def ship(
         self, feature_id: str, *, operator_approved: bool = False
     ) -> FeatureRequest:
