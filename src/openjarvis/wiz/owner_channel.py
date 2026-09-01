@@ -53,7 +53,7 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -187,12 +187,31 @@ class OwnerDoor:
     seen: "SeenMessages" = field(default_factory=lambda: SeenMessages())
 
     def receive(
-        self, *, chat_id: Any, text: str, sender: str = "", message_id: Any = ""
+        self,
+        *,
+        chat_id: Any,
+        text: str,
+        sender: str = "",
+        message_id: Any = "",
+        send: Optional[Callable[[str], None]] = None,
     ) -> OwnerReply:
-        """Handle one inbound message. Never raises."""
+        """Handle one inbound message. Never raises.
+
+        *send*, when given, is a way to deliver text to the owner *before*
+        this call returns — used so the "I'll work on it" acknowledgement
+        can go out immediately, ahead of the auto-build handoff, which can
+        block for as long as ``pipeline.run()`` takes (minutes, across
+        retries). Callers with no live transport (the CLI's ``jarvis wiz
+        say``, most tests) omit it and get the old single-reply-at-the-end
+        behaviour unchanged.
+        """
         try:
             return self._receive(
-                chat_id=chat_id, text=text, sender=sender, message_id=message_id
+                chat_id=chat_id,
+                text=text,
+                sender=sender,
+                message_id=message_id,
+                send=send,
             )
         except Exception:  # noqa: BLE001 - an inbound message must not be able
             logger.exception("owner message handling failed")  # ...to stop Wiz.
@@ -204,7 +223,13 @@ class OwnerDoor:
     # -- routing -----------------------------------------------------------
 
     def _receive(
-        self, *, chat_id: Any, text: str, sender: str, message_id: Any = ""
+        self,
+        *,
+        chat_id: Any,
+        text: str,
+        sender: str,
+        message_id: Any = "",
+        send: Optional[Callable[[str], None]] = None,
     ) -> OwnerReply:
         from openjarvis.reliability.owner_commands import authorized_chat
 
@@ -234,7 +259,7 @@ class OwnerDoor:
         if self._is_live_reliability_instruction(message):
             return self._reliability(chat_id=chat_id, text=message)
 
-        return self._dispatch(chat_id=chat_id, text=message, sender=sender)
+        return self._dispatch(chat_id=chat_id, text=message, sender=sender, send=send)
 
     def _is_live_reliability_instruction(self, text: str) -> bool:
         """Whether the reliability half should take this one.
@@ -278,7 +303,14 @@ class OwnerDoor:
             authorized=True,
         )
 
-    def _dispatch(self, *, chat_id: Any, text: str, sender: str) -> OwnerReply:
+    def _dispatch(
+        self,
+        *,
+        chat_id: Any,
+        text: str,
+        sender: str,
+        send: Optional[Callable[[str], None]] = None,
+    ) -> OwnerReply:
         if self.intake is None:
             return OwnerReply(
                 text=self._say(
@@ -297,25 +329,58 @@ class OwnerDoor:
 
         # Auto-build after recording: feature.request on Telegram should seamlessly
         # start execution (feature.build) so the owner gets smooth UX from one message
+        auto_build_dispatched = False
         if (capability == "feature.request"
             and getattr(result, "accepted", False)
             and getattr(result, "feature_id", "")):
+            auto_build_dispatched = True
             feature_id = str(result.feature_id)
-            build_result = self._auto_build_feature(feature_id, sender, chat_id)
-            if build_result.get("started", False):
-                # Auto-build succeeded; update response
-                capability = "feature.request+build"
-                reply = f"{reply} Starting work now."
-            else:
-                # Auto-build failed; include reason in reply. `or`, not
-                # dict.get's default: a present-but-empty detail (any read
-                # capability's result, which has no "say" key at all) must
-                # still fall back to something the owner can see, not a
-                # reply that looks identical to a clean success.
-                detail = build_result.get("detail") or "could not start building"
-                reply = f"{reply} {detail}"
 
-        if not reply and getattr(result, "accepted", False):
+            if send is not None:
+                # _auto_build_feature() calls pipeline.run(), which can take
+                # minutes across retries — found on FEAT-00031/FEAT-00032,
+                # where the owner's phone showed nothing until the whole
+                # build finished, and sometimes saw "I need your help"
+                # (sent mid-run, straight to the notifier, for a real
+                # pipeline outcome) *before* ever seeing this acknowledgement.
+                # Sending it now, ahead of the blocking call, fixes the
+                # ordering without touching that separate notifier path or
+                # spawning any new thread — this call still runs on the
+                # same poller thread that received the message.
+                if reply:
+                    send(reply)
+                build_result = self._auto_build_feature(feature_id, sender, chat_id)
+                if build_result.get("started", False):
+                    # The pipeline's own eventual outcome (shipped, needs
+                    # approval, attempts exhausted, ...) is a NEEDS_OWNER /
+                    # SUCCESS journal kind and reaches the owner through
+                    # owner_notifier once pipeline.run() actually knows one
+                    # — sending a second, already-sent "Starting work now."
+                    # here would just be a stale echo of the ack above.
+                    capability = "feature.request+build"
+                    reply = ""
+                else:
+                    # Nothing else reports a refusal/failure to even start —
+                    # that only reaches the journal (feature.auto_build_*),
+                    # not owner_notifier — so this is the owner's one chance
+                    # to hear it.
+                    reply = build_result.get("detail") or "could not start building"
+            else:
+                build_result = self._auto_build_feature(feature_id, sender, chat_id)
+                if build_result.get("started", False):
+                    # Auto-build succeeded; update response
+                    capability = "feature.request+build"
+                    reply = f"{reply} Starting work now."
+                else:
+                    # Auto-build failed; include reason in reply. `or`, not
+                    # dict.get's default: a present-but-empty detail (any read
+                    # capability's result, which has no "say" key at all) must
+                    # still fall back to something the owner can see, not a
+                    # reply that looks identical to a clean success.
+                    detail = build_result.get("detail") or "could not start building"
+                    reply = f"{reply} {detail}"
+
+        if not reply and getattr(result, "accepted", False) and not auto_build_dispatched:
             # A read verb answered with facts and no words. The intake only
             # forwards a handler's own sentence, and the read verbs deliberately
             # produce none — so the owner asking "how is Wize?" used to get
@@ -326,7 +391,7 @@ class OwnerDoor:
                 capability, getattr(result, "structured", None), persona=self.persona
             )
 
-        if not reply:
+        if not reply and not auto_build_dispatched:
             reply = self._say("I did not understand that one.")
 
         return OwnerReply(
@@ -509,15 +574,17 @@ class TelegramOwnerDoor:
         chat_id = getattr(message, "conversation_id", "") or getattr(
             message, "sender", ""
         )
+        reply_chat_id = str(getattr(message, "conversation_id", ""))
         reply = self.door.receive(
             chat_id=chat_id,
             text=getattr(message, "content", ""),
             sender=str(getattr(message, "sender", "") or ""),
             message_id=str(getattr(message, "message_id", "") or ""),
+            send=lambda text: self._reply(reply_chat_id, text),
         )
         if not reply.text:
             return
-        self._reply(str(getattr(message, "conversation_id", "")), reply.text)
+        self._reply(reply_chat_id, reply.text)
 
     def _reply(self, chat_id: str, text: str) -> None:
         channel = self._channel()

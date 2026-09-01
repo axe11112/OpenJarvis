@@ -626,3 +626,217 @@ class TestAnAutoBuildRefusalIsJournaled:
         assert len(entries) == 1
         assert "boom" in entries[0].reason
         assert entries[0].detail["feature_id"] == "FEAT-99999"
+
+
+# ---------------------------------------------------------------------------
+# Acknowledgement ordering: the "I'll work on it" reply must not wait for the
+# (possibly minutes-long) auto-build to finish. Found on FEAT-00031/32, where
+# a mid-run "I need your help" — sent straight to the notifier for a real
+# pipeline outcome — could arrive on the owner's phone before the initial
+# acknowledgement, because the acknowledgement was only ever sent as part of
+# one combined reply built *after* the blocking auto-build call returned.
+# ---------------------------------------------------------------------------
+
+
+def _runtime_with_recording_runner(tmp_path, incidents, *, events):
+    """Same shape as the buildable_runtime fixture, but the runner records
+    into *events* before doing its (here: instant, but stands in for
+    pipeline.run()) work, so tests can see whether send() ran first."""
+    pipeline = FakePipeline(profile=_complete_profile(tmp_path))
+
+    def runner(feature_id):
+        events.append("runner")
+        feature = pipeline.store.get(feature_id)
+        if feature is not None and feature.state is FeatureState.RECEIVED:
+            feature.transition(
+                FeatureState.UNDERSTANDING,
+                at="2026-08-19T10:05:00+00:00",
+                reason="auto-build reached the real pipeline",
+            )
+            pipeline.store.save(feature)
+        return feature
+
+    product = ProductVerbs(
+        pipeline=pipeline,
+        memory=ProductMemory(tmp_path / "memory.db"),
+        runner=runner,
+    )
+    runtime = build_wiz(
+        home=tmp_path,
+        policy=AuthorityPolicy(
+            grants={
+                Channel.TELEGRAM: frozenset(
+                    {Authority.READ, Authority.SAFE_ACTION, Authority.CODE_WRITE}
+                )
+            }
+        ),
+        journal=WizJournal(tmp_path / "journal.jsonl"),
+        config=JarvisConfig(),
+        store_factory=incidents,
+        product=product,
+    )
+    runtime.pipeline = pipeline
+    return runtime
+
+
+class TestAcknowledgementIsSentBeforeAutoBuildBlocks:
+    def test_send_is_called_before_the_blocking_runner(self, tmp_path, incidents, outages):
+        events = []
+        runtime = _runtime_with_recording_runner(tmp_path, incidents, events=events)
+        door = OwnerDoor(
+            intake=TelegramIntake(
+                wiz=runtime.wiz, owner_chat_ids=[OWNER], journal=runtime.journal
+            ),
+            allowed_chat_ids=OWNER,
+            outages=outages,
+        )
+
+        def send(text):
+            events.append(("send", text))
+
+        door.receive(chat_id=OWNER, text="Add a small badge", send=send)
+
+        kinds = [e[0] if isinstance(e, tuple) else e for e in events]
+        assert kinds == ["send", "runner"]
+
+    def test_the_acknowledgement_names_the_feature_id(self, tmp_path, incidents, outages):
+        events = []
+        runtime = _runtime_with_recording_runner(tmp_path, incidents, events=events)
+        door = OwnerDoor(
+            intake=TelegramIntake(
+                wiz=runtime.wiz, owner_chat_ids=[OWNER], journal=runtime.journal
+            ),
+            allowed_chat_ids=OWNER,
+            outages=outages,
+        )
+        sent = []
+        door.receive(chat_id=OWNER, text="Add a small badge", send=sent.append)
+
+        [feature] = runtime.pipeline.store.list()
+        assert len(sent) == 1
+        assert feature.id in sent[0]
+
+    def test_no_duplicate_feature_is_created_via_the_send_path(
+        self, tmp_path, incidents, outages
+    ):
+        events = []
+        runtime = _runtime_with_recording_runner(tmp_path, incidents, events=events)
+        door = OwnerDoor(
+            intake=TelegramIntake(
+                wiz=runtime.wiz, owner_chat_ids=[OWNER], journal=runtime.journal
+            ),
+            allowed_chat_ids=OWNER,
+            outages=outages,
+        )
+        door.receive(chat_id=OWNER, text="Add a small badge", send=lambda text: None)
+        assert len(runtime.pipeline.store.list()) == 1
+
+    def test_a_started_build_does_not_send_a_stale_second_ack(
+        self, tmp_path, incidents, outages
+    ):
+        # The real, eventual outcome reaches the owner through owner_notifier
+        # once pipeline.run() actually has one; _dispatch() itself has
+        # nothing further worth saying once the ack already went out.
+        events = []
+        runtime = _runtime_with_recording_runner(tmp_path, incidents, events=events)
+        door = OwnerDoor(
+            intake=TelegramIntake(
+                wiz=runtime.wiz, owner_chat_ids=[OWNER], journal=runtime.journal
+            ),
+            allowed_chat_ids=OWNER,
+            outages=outages,
+        )
+        sent = []
+        reply = door.receive(chat_id=OWNER, text="Add a small badge", send=sent.append)
+        assert len(sent) == 1
+        assert reply.text == ""
+
+    def test_a_refusal_to_start_still_reaches_the_owner_as_a_second_message(
+        self, tmp_path, incidents, outages
+    ):
+        # No CODE_WRITE granted -> feature.build is refused. Nothing else
+        # (owner_notifier only fires for NEEDS_OWNER_KINDS journal entries,
+        # and a refusal-to-start is not one of them) tells the owner this
+        # happened, so it must ride the returned reply.
+        pipeline = FakePipeline(profile=_complete_profile(tmp_path))
+        product = ProductVerbs(
+            pipeline=pipeline,
+            memory=ProductMemory(tmp_path / "memory.db"),
+            runner=lambda feature_id: pipeline.run(feature_id),
+        )
+        runtime = build_wiz(
+            home=tmp_path,
+            policy=AuthorityPolicy(
+                grants={Channel.TELEGRAM: frozenset({Authority.READ, Authority.SAFE_ACTION})}
+            ),
+            journal=WizJournal(tmp_path / "journal.jsonl"),
+            config=JarvisConfig(),
+            store_factory=incidents,
+            product=product,
+        )
+        door = OwnerDoor(
+            intake=TelegramIntake(
+                wiz=runtime.wiz, owner_chat_ids=[OWNER], journal=runtime.journal
+            ),
+            allowed_chat_ids=OWNER,
+            outages=outages,
+        )
+        sent = []
+        reply = door.receive(chat_id=OWNER, text="Add a small badge", send=sent.append)
+
+        assert len(sent) == 1  # the ack, sent immediately
+        assert reply.text.strip() != ""  # the refusal, sent as a follow-up
+        assert reply.text != sent[0]  # two distinct messages, not a duplicate
+
+    def test_callers_with_no_send_keep_the_single_combined_reply(
+        self, buildable_door, buildable_runtime
+    ):
+        # jarvis wiz say, and every pre-existing test in this file, call
+        # receive() with no send — behaviour there is unchanged.
+        reply = buildable_door.receive(chat_id=OWNER, text="Add a small badge")
+        assert reply.capability == "feature.request+build"
+        assert "Starting work now." in reply.text
+
+class TestAcknowledgementOrderingThroughTheRealTransport:
+    def test_the_ack_goes_out_before_on_message_returns_and_before_any_follow_up(
+        self, tmp_path, incidents, outages
+    ):
+        events = []
+        runtime = _runtime_with_recording_runner(tmp_path, incidents, events=events)
+        door = OwnerDoor(
+            intake=TelegramIntake(
+                wiz=runtime.wiz, owner_chat_ids=[OWNER], journal=runtime.journal
+            ),
+            allowed_chat_ids=OWNER,
+            outages=outages,
+        )
+
+        class RecordingChannel(Channel_):
+            def send(self, chat_id, text):
+                events.append(("channel.send", text))
+                super().send(chat_id, text)
+
+        channel = RecordingChannel()
+        listener = TelegramOwnerDoor(door=door, notifier=Transport(channel))
+        listener.start()
+
+        channel.handler(
+            type(
+                "M",
+                (),
+                {
+                    "conversation_id": OWNER,
+                    "sender": OWNER,
+                    "content": "Add a small badge",
+                    "message_id": "wire-1",
+                },
+            )()
+        )
+
+        kinds = [e[0] if isinstance(e, tuple) else e for e in events]
+        # The channel actually sent the ack before the runner (the stand-in
+        # for the blocking pipeline.run()) ever ran — not merely computed it.
+        assert kinds.index("channel.send") < kinds.index("runner")
+        # Exactly one message went out on the wire: the started-build case
+        # has nothing further to say once the ack is sent (see above).
+        assert len(channel.sent) == 1
