@@ -539,6 +539,72 @@ class FeatureRequest:
         self.state = FeatureState.TESTING
         self.updated_at = at
 
+    def resume_for_owner_authorized_rebuild_from_human_required(
+        self, *, at: str, reason: str
+    ) -> None:
+        """Reopen a ``HUMAN_REQUIRED`` feature into ``BUILDING`` for one
+        genuinely fresh Claude Code session, on the owner's explicit,
+        one-off say-so — not an ordinary retry, and not something the
+        ordinary attempt loop or any of this method's four siblings can
+        reach on their own.
+
+        The narrowest and most privileged of the five ``resume_*`` methods,
+        and the only one that grants a *new* attempt past an exhausted
+        ``max_attempts``. It exists for exactly one situation: attempts were
+        burned entirely by a framework bug that has since been fixed — not
+        by the request being hard, and not by anything wrong with a diff —
+        so re-running the ordinary attempt loop would just fail the same way
+        again for the same non-reason. See FEAT-00031's incident: three
+        attempts were spent entirely on ``BUILDING`` having no ``Bash`` to
+        provision dependencies with (fixed in
+        :mod:`openjarvis.wiz.features.provision`), and the diff that
+        infrastructure fix would have unblocked was then lost to a separate
+        worktree-reuse bug (fixed in
+        :meth:`~openjarvis.wiz.features.workspace.FeatureWorkspace.reuse`) —
+        leaving nothing left to re-test the way
+        :meth:`resume_deploy_from_human_required` does, and no pull request
+        for :class:`~openjarvis.wiz.features.recovery.FeatureRecovery` to
+        verify against either.
+
+        Usable exactly once per feature: a second call refuses, because
+        "exceptional, owner-authorized" describes a specific decision made
+        once, not a standing retry button silently available to whoever
+        next calls this. If the fresh attempt this grants also fails, the
+        ordinary ``max_attempts`` gate in
+        :meth:`~openjarvis.wiz.features.pipeline.FeaturePipeline._retry_or_stop`
+        stops it again exactly as it would any other feature — this method
+        grants one attempt, never an unbounded loop.
+        """
+        if self.state is not FeatureState.HUMAN_REQUIRED:
+            raise InvalidFeatureTransition(
+                "resume_for_owner_authorized_rebuild_from_human_required "
+                f"called from {self.state.value}, not HUMAN_REQUIRED"
+            )
+        if self.risk.strip().upper() == "HIGH":
+            raise InvalidFeatureTransition(
+                "HIGH-risk features are never reopened without a person "
+                "reviewing the new diff themselves"
+            )
+        marker = "owner-authorized exceptional rebuild"
+        if any(
+            str(entry.get("reason", "")).startswith(marker) for entry in self.history
+        ):
+            raise InvalidFeatureTransition(
+                f"{self.id} already used its one owner-authorized exceptional "
+                "rebuild; this is not an ordinary retry primitive"
+            )
+        self.history.append(
+            {
+                "at": at,
+                "from": self.state.value,
+                "to": FeatureState.BUILDING.value,
+                "reason": f"{marker}: {reason}",
+                "resumed": True,
+            }
+        )
+        self.state = FeatureState.BUILDING
+        self.updated_at = at
+
     def next_attempt(self, *, at: str, hypothesis: str = "") -> FeatureAttempt:
         attempt = FeatureAttempt(
             number=len(self.attempts) + 1, started_at=at, hypothesis=hypothesis

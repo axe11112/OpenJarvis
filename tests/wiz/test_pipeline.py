@@ -1047,6 +1047,100 @@ class TestReopenForDeploy:
         assert any(e.kind == "feature.reopened_for_deploy" for e in entries)
 
 
+class TestReopenForOwnerAuthorizedRebuild:
+    """FEAT-00031's actual situation: attempts exhausted entirely by
+    infrastructure, and the diff that infrastructure fix would have
+    unblocked was separately lost (a worktree-reuse bug), leaving nothing
+    for reopen_for_deploy to re-test. Unlike that method, this one *does*
+    call Claude again — exactly once, on the owner's explicit say-so.
+    """
+
+    def _always_failing_provision(self, profile, workspace):
+        from openjarvis.reliability.checks import CheckResult
+
+        return CheckResult(
+            name="provision",
+            ran=True,
+            passed=False,
+            summary="failed (exit 127)",
+            output="sh: tsc: command not found",
+        )
+
+    def test_reopening_calls_a_genuinely_new_build_and_can_reach_ready(
+        self, tmp_path, clock
+    ):
+        engineer = ScriptedEngineer()
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            engineer=engineer,
+            max_attempts=1,
+            provision_factory=self._always_failing_provision,
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        stopped = pipeline.run(feature.id)
+        assert stopped.state is FeatureState.HUMAN_REQUIRED
+        assert stopped.attempts_used == 1
+        first_build_calls = len(engineer.build_calls)
+
+        pipeline.provision_factory = _passing_provision
+        reopened = pipeline.reopen_for_owner_authorized_rebuild(
+            feature.id, reason="attempts burned entirely by a framework bug, now fixed"
+        )
+        assert reopened.state is FeatureState.BUILDING
+
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert len(engineer.build_calls) == first_build_calls + 1  # a new Claude session
+        assert result.attempts_used == 2  # prior attempt preserved, not reset
+
+    def test_a_second_owner_authorized_rebuild_is_refused(self, tmp_path, clock):
+        engineer = ScriptedEngineer()
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            engineer=engineer,
+            max_attempts=1,
+            provision_factory=self._always_failing_provision,
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        pipeline.provision_factory = self._always_failing_provision
+        pipeline.reopen_for_owner_authorized_rebuild(feature.id, reason="first exception")
+        stopped_again = pipeline.run(feature.id)
+        assert stopped_again.state is FeatureState.HUMAN_REQUIRED
+
+        with pytest.raises(InvalidFeatureTransition):
+            pipeline.reopen_for_owner_authorized_rebuild(feature.id, reason="again?")
+
+    def test_a_feature_not_in_human_required_cannot_be_reopened_this_way(
+        self, tmp_path, clock
+    ):
+        pipeline = build_pipeline(tmp_path, clock)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        with pytest.raises(InvalidFeatureTransition):
+            pipeline.reopen_for_owner_authorized_rebuild(feature.id, reason="x")
+
+    def test_reopening_is_recorded_in_the_journal(self, tmp_path, clock):
+        engineer = ScriptedEngineer()
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            engineer=engineer,
+            max_attempts=1,
+            provision_factory=self._always_failing_provision,
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        pipeline.provision_factory = _passing_provision
+        pipeline.reopen_for_owner_authorized_rebuild(feature.id, reason="the owner said so")
+
+        entries = [
+            e for e in pipeline.journal.tail(50) if e.detail.get("feature_id") == feature.id
+        ]
+        assert any(e.kind == "feature.owner_authorized_rebuild" for e in entries)
+
+
 class TestVerificationDecides:
     def test_a_preview_that_fails_the_contract_is_not_ready(self, tmp_path, clock):
         pipeline = build_pipeline(

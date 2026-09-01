@@ -367,6 +367,38 @@ class FeaturePipeline:
             self.queue.submit(feature)
         return feature
 
+    def reopen_for_owner_authorized_rebuild(
+        self, feature_id: str, *, reason: str
+    ) -> FeatureRequest:
+        """Grant one genuinely fresh Claude Code session to a feature whose
+        attempts are exhausted, on the owner's explicit, one-off say-so.
+
+        The most privileged of the three ``reopen_for_*`` operator verbs, and
+        the only one that spends a new attempt past an exhausted
+        ``max_attempts`` — see
+        :meth:`~openjarvis.wiz.features.model.FeatureRequest.resume_for_owner_authorized_rebuild_from_human_required`
+        for when this is (and is not) the right call, and for the one-use-
+        per-feature guard that makes this a specific decision rather than a
+        standing retry button. ``reason`` has no default, deliberately: unlike
+        :meth:`reopen_for_planning` and :meth:`reopen_for_deploy`, there is no
+        generic phrase honest enough to stand in for "the owner looked at
+        this specific feature and said so" — the caller must actually say why.
+
+        An explicit operator action, not something the pipeline reaches on
+        its own — the same reason :meth:`reopen_for_planning` and
+        :meth:`reopen_for_deploy` are their own verbs rather than states
+        :meth:`run` enters unprompted.
+        """
+        feature = self._load(feature_id)
+        feature.resume_for_owner_authorized_rebuild_from_human_required(
+            at=self.clock(), reason=reason[:300]
+        )
+        self.store.save(feature)
+        self._record(feature, "feature.owner_authorized_rebuild", reason[:1000])
+        if self.queue is not None:
+            self.queue.submit(feature)
+        return feature
+
     def ship(
         self, feature_id: str, *, operator_approved: bool = False
     ) -> FeatureRequest:

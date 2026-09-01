@@ -234,6 +234,74 @@ class TestReopeningDeployFromHumanRequired:
             feature.transition(FeatureState.TESTING, at="t")
 
 
+class TestOwnerAuthorizedRebuildFromHumanRequired:
+    """The fifth, narrowest, and only privileged resume_* sibling: it is the
+    one that grants a genuinely new attempt past an exhausted max_attempts,
+    on the owner's explicit one-off say-so. FEAT-00031's actual situation
+    (three attempts spent entirely on infrastructure, and the resulting diff
+    later lost to a separate worktree bug) fits none of its four siblings —
+    resume_deploy needs an attempt with real changed_files to re-check, and
+    FeatureRecovery needs a pull request to verify against.
+    """
+
+    def test_it_only_works_from_human_required(self):
+        feature = _feature(FeatureState.READY)
+        with pytest.raises(InvalidFeatureTransition):
+            feature.resume_for_owner_authorized_rebuild_from_human_required(
+                at="t", reason="owner said so"
+            )
+
+    def test_it_refuses_a_high_risk_feature(self):
+        feature = _feature(FeatureState.HUMAN_REQUIRED)
+        feature.risk = "HIGH"
+        with pytest.raises(InvalidFeatureTransition):
+            feature.resume_for_owner_authorized_rebuild_from_human_required(
+                at="t", reason="owner said so"
+            )
+
+    def test_a_successful_rebuild_lands_on_building(self):
+        feature = _feature(FeatureState.HUMAN_REQUIRED)
+        feature.resume_for_owner_authorized_rebuild_from_human_required(
+            at="t", reason="attempts burned entirely by a framework bug, now fixed"
+        )
+        assert feature.state is FeatureState.BUILDING
+        assert feature.history[-1]["resumed"] is True
+        assert feature.history[-1]["from"] == "HUMAN_REQUIRED"
+        assert feature.history[-1]["to"] == "BUILDING"
+        assert feature.history[-1]["reason"].startswith(
+            "owner-authorized exceptional rebuild"
+        )
+
+    def test_it_preserves_prior_attempts(self):
+        feature = _feature(FeatureState.HUMAN_REQUIRED)
+        feature.next_attempt(at="t")
+        feature.next_attempt(at="t")
+        feature.next_attempt(at="t")
+        assert feature.attempts_used == 3
+        feature.resume_for_owner_authorized_rebuild_from_human_required(
+            at="t", reason="owner said so"
+        )
+        assert feature.attempts_used == 3
+        assert len(feature.attempts) == 3
+
+    def test_it_can_only_be_used_once_per_feature(self):
+        feature = _feature(FeatureState.HUMAN_REQUIRED)
+        feature.resume_for_owner_authorized_rebuild_from_human_required(
+            at="t", reason="owner said so"
+        )
+        # Simulate the attempt failing again and landing back at HUMAN_REQUIRED.
+        feature.transition(FeatureState.HUMAN_REQUIRED, at="t")
+        with pytest.raises(InvalidFeatureTransition):
+            feature.resume_for_owner_authorized_rebuild_from_human_required(
+                at="t", reason="trying again"
+            )
+
+    def test_it_does_not_widen_check_transition(self):
+        feature = _feature(FeatureState.HUMAN_REQUIRED)
+        with pytest.raises(InvalidFeatureTransition):
+            feature.transition(FeatureState.BUILDING, at="t")
+
+
 class TestTheIterativeLoop:
     def test_a_failed_check_sends_the_work_back_to_building(self):
         feature = _feature(FeatureState.TESTING)
