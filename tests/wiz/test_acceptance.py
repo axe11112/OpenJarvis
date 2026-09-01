@@ -447,6 +447,67 @@ class TestSerialisation:
         assert len(parsed) == 1
         assert parsed[0].text == "Hi"
 
+    def test_an_explicit_json_null_becomes_an_empty_string_not_the_word_none(self):
+        """Found on FEAT-00031: a plan's ``"then_text": null`` -- valid JSON
+        for "no specific text expected" -- survived as the Python string
+        ``"None"`` through ``str(raw.get("then_text", ""))``, because a
+        dict's own ``.get(key, default)`` returns the key's actual value
+        (``None``) rather than *default* when the key is present but null.
+        A browser check then searched the live page for the four characters
+        "None" and correctly never found them, failing a feature whose real
+        behaviour was entirely correct.
+        """
+        criterion = Criterion.from_dict(
+            {
+                "kind": "INTERACTION",
+                "description": "clicking it expands the answer",
+                "selector": "#why-wize-question",
+                "then_selector": None,
+                "then_text": None,
+            }
+        )
+        assert criterion.then_text == ""
+        assert criterion.then_selector == ""
+        # Every other string field is exposed to the same risk (a model may
+        # emit `null` for any of them) and must fail the same way.
+        for field in ("route", "selector", "text", "name"):
+            assert Criterion.from_dict({"kind": "CONSOLE", "description": "d", field: None})
+
+    def test_a_null_then_text_produces_no_spurious_expectation(self):
+        """The actual failure mode: with then_text wrongly "None", the
+        compiler treated it as real text to assert on the page. Fixed, an
+        INTERACTION with a selector but no then_selector/then_text -- exactly
+        what ``Criterion.from_dict`` now produces from a plan's ``"then_text":
+        null`` -- compiles to a click with no text expectation attached.
+        """
+        contract = AcceptanceContract(
+            feature_id="FEAT-00031",
+            criteria=(
+                Criterion.from_dict(
+                    {
+                        "kind": "INTERACTION",
+                        "description": "clicking it expands the answer",
+                        "route": "/",
+                        "selector": "#why-wize-question",
+                        "then_selector": None,
+                        "then_text": None,
+                    }
+                ),
+                Criterion(kind=CONSOLE, description="no console errors", route="/"),
+            ),
+        )
+        specs = contract.probe_specs()
+        assert specs
+        clicks = [
+            step
+            for _, spec in specs
+            for step in spec.steps
+            if step.action == "click"
+        ]
+        assert clicks  # the interaction itself still happened
+        expectation_values = [e.value for _, spec in specs for e in spec.expect]
+        assert "None" not in expectation_values
+
 
 class TestProposedCriteriaExtraction:
     """extract_proposed_criteria: pulling a plan session's proposal out of its prose."""

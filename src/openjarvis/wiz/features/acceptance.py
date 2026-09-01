@@ -118,6 +118,25 @@ BROWSER_KINDS = frozenset({CONTENT, INTERACTION, VIEWPORT, CONSOLE, NETWORK})
 UNCHECKABLE_KINDS = frozenset({MANUAL})
 
 
+def _str(value: Any, default: str) -> str:
+    """``str(value)``, except an explicit ``None`` becomes *default* rather
+    than the four-character string ``"None"``.
+
+    Found on FEAT-00031: a criterion's ``then_text: null`` — a plan's valid,
+    idiomatic way to say "no specific text expected after this interaction"
+    — survived JSON round-tripping as Python ``None``, and
+    ``str(raw.get("then_text", ""))`` reached for that default only when the
+    key was *missing*, not when it was present with value ``None``. A
+    dict's own ``.get(key, default)`` already returns ``None`` in that case,
+    so ``str(None)`` produced the literal string ``"None"`` instead — which
+    :meth:`AcceptanceContract._spec_for_route` then treated as real text a
+    browser check should find on the page. It never could, so a feature
+    whose real behaviour was correct failed browser acceptance for a
+    property nobody asked it to have.
+    """
+    return default if value is None else str(value)
+
+
 @dataclass(frozen=True, slots=True)
 class Viewport:
     """A screen size the feature is verified at."""
@@ -271,17 +290,17 @@ class Criterion:
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "Criterion":
         return cls(
-            kind=str(raw.get("kind", "")).upper(),
-            description=str(raw.get("description", "")),
-            route=str(raw.get("route", "")),
-            selector=str(raw.get("selector", "")),
-            text=str(raw.get("text", "")),
-            expected=str(raw.get("expected", "PRESENT")).upper() or "PRESENT",
-            then_selector=str(raw.get("then_selector", "")),
-            then_text=str(raw.get("then_text", "")),
-            method=str(raw.get("method", "GET")).upper() or "GET",
+            kind=_str(raw.get("kind"), "").upper(),
+            description=_str(raw.get("description"), ""),
+            route=_str(raw.get("route"), ""),
+            selector=_str(raw.get("selector"), ""),
+            text=_str(raw.get("text"), ""),
+            expected=_str(raw.get("expected"), "PRESENT").upper() or "PRESENT",
+            then_selector=_str(raw.get("then_selector"), ""),
+            then_text=_str(raw.get("then_text"), ""),
+            method=_str(raw.get("method"), "GET").upper() or "GET",
             expected_status=int(raw.get("expected_status", 0) or 0),
-            name=str(raw.get("name", "")),
+            name=_str(raw.get("name"), ""),
             budget=float(raw.get("budget", 0.0) or 0.0),
             baseline=float(raw.get("baseline", 0.0) or 0.0),
             viewports=tuple(str(v) for v in (raw.get("viewports") or ())),
