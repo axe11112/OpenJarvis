@@ -361,6 +361,17 @@ class RepairWorkspace:
         git_output(command, cwd=worktree.path)
         return git_output(["rev-parse", "HEAD"], cwd=worktree.path).strip()
 
+    def head_sha(self, worktree: Worktree) -> str:
+        """*worktree*'s current commit, without committing anything.
+
+        For a caller that needs to know what would be re-deployed when
+        :meth:`has_changes` already says there is nothing new to commit —
+        re-verifying an attempt whose diff a previous run already committed
+        and pushed, for instance, rather than trying (and failing) to commit
+        it again.
+        """
+        return git_output(["rev-parse", "HEAD"], cwd=worktree.path).strip()
+
     def push(self, worktree: Worktree, *, remote: str = "origin") -> None:
         """Push the incident branch to *remote*.
 

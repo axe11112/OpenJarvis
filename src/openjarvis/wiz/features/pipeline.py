@@ -1005,8 +1005,19 @@ class FeaturePipeline:
             self.store.save(feature)
             return self._retry_or_stop(feature, attempt, evidence)
 
-        message = _commit_message(feature)
-        attempt.commit_sha = self.workspace.commit_all(worktree, message)
+        # Usually there is something uncommitted here — the session that just
+        # ran BUILDING left it. Not always: reopen_for_deploy re-enters this
+        # exact step for an attempt a *previous* run of this method already
+        # committed and pushed (found re-verifying FEAT-00031 against a fixed
+        # acceptance contract — the diff was already on its branch, and
+        # commit_all() raised "nothing to commit" rather than being asked to
+        # commit nothing). The worktree's current HEAD is that same commit
+        # either way, so this reuses it instead of trying to create a new one.
+        if self.workspace.has_changes(worktree):
+            message = _commit_message(feature)
+            attempt.commit_sha = self.workspace.commit_all(worktree, message)
+        else:
+            attempt.commit_sha = self.workspace.head_sha(worktree)
         attempt.succeeded = False  # not yet: the preview has to agree
         self.store.save(feature)
 

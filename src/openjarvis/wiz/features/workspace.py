@@ -255,6 +255,9 @@ class FeatureWorkspace:
     def commit_all(self, worktree: Worktree, message: str) -> str:
         return self._inner.commit_all(worktree, message)
 
+    def head_sha(self, worktree: Worktree) -> str:
+        return self._inner.head_sha(worktree)
+
     def push(self, worktree: Worktree, *, remote: str = "origin") -> None:
         self._inner.push(worktree, remote=remote)
 

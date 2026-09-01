@@ -61,6 +61,10 @@ class FakeWorkspace:
         self.removed = []
         self.commit_sha = "feedface" + "0" * 32
         self.diff_text = diff_text
+        #: Independent of `changed` (what `_build` reads as the attempt's
+        #: files) so a test can simulate "already committed" -- has_changes()
+        #: False even though the attempt genuinely has changed_files.
+        self.changes_present = True
 
     def create(self, feature_id, *, title="", base_ref="HEAD"):
         path = self.tmp_path / f"wt-{feature_id}"
@@ -96,7 +100,10 @@ class FakeWorkspace:
         self.pushes.append(remote)
 
     def has_changes(self, worktree):
-        return bool(self.changed)
+        return self.changes_present
+
+    def head_sha(self, worktree):
+        return self.commit_sha
 
     def remove(self, worktree, *, succeeded=True):
         self.removed.append((worktree, succeeded))
@@ -977,6 +984,51 @@ class TestReopenForDeploy:
         result = pipeline.run(feature.id)
         assert result.state is FeatureState.READY
         assert len(engineer.build_calls) == first_build_calls  # no new Claude session
+
+    def test_reopening_an_already_committed_attempt_does_not_crash(
+        self, tmp_path, clock
+    ):
+        """Found re-verifying FEAT-00031 against a fixed acceptance contract:
+        reopen_for_deploy re-enters TESTING, which always tried to
+        commit_all() the worktree -- fine the first time a build genuinely
+        left something uncommitted, but this attempt's diff was already
+        committed and pushed by an earlier full run of this same method
+        (the one that reached PREVIEWING/VERIFYING and only failed browser
+        acceptance). commit_all() raised "nothing to commit", which the
+        pipeline's generic exception handler turned into an opaque
+        feature.failed -- masking the real, fixed, re-verifiable diff behind
+        a crash that looked like a fresh problem.
+        """
+        engineer = ScriptedEngineer()
+        workspace = FakeWorkspace(tmp_path)
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            engineer=engineer,
+            workspace=workspace,
+            max_attempts=1,
+            browser=FakeBrowser([False]),  # first run fails browser acceptance
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        stopped = pipeline.run(feature.id)
+        assert stopped.state is FeatureState.HUMAN_REQUIRED
+        first_commit_sha = stopped.attempts[-1].commit_sha
+        assert first_commit_sha  # it really did commit and push once already
+
+        # "already committed" -- the worktree has nothing left to commit,
+        # exactly as it would after a prior successful commit_all().
+        workspace.changes_present = False
+        pipeline._browser.outcomes = [True]  # the fix under test now passes
+
+        reopened = pipeline.reopen_for_deploy(feature.id, reason="verifier fixed")
+        assert reopened.state is FeatureState.TESTING
+
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert result.attempts[-1].commit_sha == first_commit_sha  # reused, not crashed
+        assert len(engineer.build_calls) == 1  # still no new Claude session
+        assert len(workspace.commits) == 1  # never asked to commit a second time
+        assert len(workspace.pushes) == 2  # pushed again -- a safe no-op for git
 
     def test_a_genuine_second_failure_stops_again_without_a_new_build(
         self, tmp_path, clock
