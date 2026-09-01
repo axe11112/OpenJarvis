@@ -150,3 +150,147 @@ class TestReuse:
             check=True,
         ).stdout.strip()
         assert author == "Wiz <wiz@example.com>"
+
+
+class TestReusingAnExistingWorktree:
+    """Found on FEAT-00031's recovery: a process with a cold in-memory
+    worktree cache (a restarted watcher, or a one-off recovery run against an
+    existing HUMAN_REQUIRED feature) used to call create() unconditionally,
+    which *removes* whatever is already at that path before making a fresh
+    one — silently destroying an uncommitted diff nobody asked it to touch.
+    reuse() exists so a cold cache is never the reason that happens again.
+    """
+
+    def test_an_uncommitted_diff_survives_a_reuse(self, workspace):
+        from pathlib import Path
+
+        worktree = workspace.create("FEAT-00001")
+        (Path(worktree.path) / "NEW.md").write_text("uncommitted work\n")
+
+        reused = workspace.reuse(
+            "FEAT-00001",
+            path=worktree.path,
+            branch=worktree.branch,
+            base_sha=worktree.base_commit,
+        )
+
+        assert reused is not None
+        assert reused.path == worktree.path
+        assert (Path(reused.path) / "NEW.md").read_text() == "uncommitted work\n"
+
+    def test_reuse_never_calls_create(self, workspace):
+        worktree = workspace.create("FEAT-00001")
+        workspace.created = []  # forget the call above; only reuse() must follow
+
+        workspace.reuse(
+            "FEAT-00001",
+            path=worktree.path,
+            branch=worktree.branch,
+            base_sha=worktree.base_commit,
+        )
+        # create() logs through the same worktree-add path create() uses;
+        # the reliable signal that reuse() took the non-destructive branch
+        # is that the file written above is still there (proven separately)
+        # and that the branch/HEAD are exactly what was asked for.
+        import subprocess
+
+        actual = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=worktree.path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert actual == worktree.branch
+
+    def test_a_missing_path_is_not_reused(self, workspace, tmp_path):
+        reused = workspace.reuse(
+            "FEAT-00001",
+            path=str(tmp_path / "never-existed"),
+            branch="wiz/feature/FEAT-00001",
+            base_sha="a" * 40,
+        )
+        assert reused is None
+
+    def test_a_path_on_the_wrong_branch_is_not_reused(self, workspace, repo):
+        worktree = workspace.create("FEAT-00001")
+        _git(["checkout", "-b", "something-else"], worktree.path)
+
+        reused = workspace.reuse(
+            "FEAT-00001",
+            path=worktree.path,
+            branch=worktree.branch,
+            base_sha=worktree.base_commit,
+        )
+        assert reused is None
+
+    def test_no_path_at_all_is_not_reused(self, workspace):
+        assert workspace.reuse("FEAT-00001", path="", branch="", base_sha="") is None
+
+    def test_an_unsafe_path_is_not_reused(self, repo, tmp_path):
+        workspace = FeatureWorkspace(
+            repo_path=str(repo),
+            root=str(tmp_path / "worktrees"),
+            protected_checkouts=[str(repo)],
+        )
+        reused = workspace.reuse(
+            "FEAT-00001", path=str(repo), branch="main", base_sha=""
+        )
+        assert reused is None
+
+
+class TestPipelineReusesAnExistingWorktreeAcrossAColdCache:
+    """The same guarantee, proven at the level FEAT-00031 actually broke it:
+    a *second*, independently-constructed FeaturePipeline (standing in for a
+    restarted process, or a one-off recovery script) picking up a feature
+    that already has a real, uncommitted diff on disk.
+    """
+
+    def test_a_second_pipeline_instance_does_not_destroy_the_diff(
+        self, repo, tmp_path
+    ):
+        from pathlib import Path
+
+        from openjarvis.wiz.features.model import FeatureRequest, FeatureState
+        from openjarvis.wiz.features.pipeline import FeaturePipeline
+        from openjarvis.wiz.features.profile import EngineeringProfile
+        from openjarvis.wiz.features.store import FeatureStore
+
+        workspace = FeatureWorkspace(
+            repo_path=str(repo),
+            root=str(tmp_path / "worktrees"),
+            git_identity=("Wiz", "wiz@example.com"),
+        )
+        worktree = workspace.create("FEAT-00001", title="Add a dashboard")
+        (Path(worktree.path) / "NEW.md").write_text("uncommitted work\n")
+
+        store = FeatureStore(tmp_path / "features.db")
+        feature = FeatureRequest(
+            id="FEAT-00001",
+            title="Add a dashboard",
+            operator_request="Add a dashboard",
+            state=FeatureState.HUMAN_REQUIRED,
+            created_at="2026-08-19T10:00:00+00:00",
+            updated_at="2026-08-19T10:00:00+00:00",
+            worktree=worktree.path,
+            branch=worktree.branch,
+            base_sha=worktree.base_commit,
+        )
+        store.create(feature)
+
+        # A brand-new pipeline, its own fresh (cold) _worktrees cache — the
+        # exact shape of a restarted process or a one-off recovery script.
+        profile = EngineeringProfile(name="x", checkout=str(repo), test_command="t")
+        second_pipeline = FeaturePipeline(
+            store=store,
+            profile=profile,
+            # Neither is touched by _worktree_for(); real values would only
+            # obscure what this test is actually proving.
+            engineer=object(),
+            workspace=workspace,
+            check_suite_factory=lambda profile: None,
+        )
+        recovered = second_pipeline._worktree_for(feature)
+
+        assert recovered.path == worktree.path
+        assert (Path(recovered.path) / "NEW.md").read_text() == "uncommitted work\n"

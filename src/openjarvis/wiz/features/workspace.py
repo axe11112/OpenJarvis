@@ -152,6 +152,67 @@ class FeatureWorkspace:
         )
         return worktree
 
+    def reuse(
+        self, feature_id: str, *, path: str, branch: str, base_sha: str
+    ) -> Optional[Worktree]:
+        """Hand back *path* as-is if it is genuinely still that worktree.
+
+        Never calls :meth:`create` — found on FEAT-00031's recovery, where a
+        one-off process with a cold worktree cache called ``create()`` for a
+        feature that already had a live worktree with an uncommitted diff on
+        disk, and ``create()`` is documented and correct to remove whatever
+        is already at that path first ("a previous attempt left one behind;
+        reuse would mix two repairs" — true for a fresh attempt, false for
+        resuming an existing one). A feature resuming after
+        ``reopen_for_deploy`` is exactly the case that distinction misses:
+        there was no previous, abandoned attempt to clean up, only this
+        process's own memory of it being cold.
+
+        ``None`` when *path* is not a real, matching git worktree, so the
+        caller can safely fall back to :meth:`create` for the ordinary
+        first-use case.
+        """
+        if not path or not branch:
+            return None
+        target = Path(path)
+        if not (target / ".git").exists():
+            return None
+        try:
+            self._assert_safe(target)
+        except UnsafeWorkspace:
+            return None
+        from openjarvis.reliability.workspace import git_output
+
+        try:
+            actual_branch = git_output(
+                ["rev-parse", "--abbrev-ref", "HEAD"], cwd=str(target)
+            ).strip()
+            actual_head = git_output(["rev-parse", "HEAD"], cwd=str(target)).strip()
+        except Exception:  # noqa: BLE001 - not a usable worktree either way
+            return None
+        if actual_branch != branch:
+            return None
+        if base_sha and actual_head != base_sha:
+            # A branch that has moved past its recorded base is not
+            # necessarily wrong (a commit may have landed), but this method
+            # only ever exists to hand back an *untouched* worktree — anything
+            # else should go through the normal, explicit paths instead of
+            # being guessed at here.
+            return None
+        logger.info(
+            "reusing the existing feature worktree for %s: %s @ %s",
+            feature_id,
+            branch,
+            actual_head[:12],
+        )
+        return Worktree(
+            incident_id=feature_id,
+            path=str(target),
+            branch=branch,
+            base_commit=base_sha or actual_head,
+            base_ref=self.repo_path,
+        )
+
     def _forget_stale_worktrees(self) -> None:
         """Drop git's record of worktrees whose directories are gone.
 

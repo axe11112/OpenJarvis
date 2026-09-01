@@ -1314,10 +1314,31 @@ class FeaturePipeline:
     # -- helpers -----------------------------------------------------------
 
     def _worktree_for(self, feature: FeatureRequest) -> Any:
-        """The feature's isolated worktree, created on first use."""
+        """The feature's isolated worktree, created on first use.
+
+        "First use" is process-relative, and this in-memory cache is not the
+        only fact that says so — ``feature.worktree``/``.branch``/``.base_sha``
+        are persisted on the feature itself and can point at a worktree this
+        process has never seen (a restarted watcher, or a one-off recovery
+        run against an existing HUMAN_REQUIRED feature). Reused via
+        :meth:`~.workspace.FeatureWorkspace.reuse` when it still checks out —
+        never re-created — because ``create()`` unconditionally removes
+        whatever already exists at that path, and for a feature with an
+        existing attempt that is somebody else's uncommitted diff.
+        """
         existing = self._worktrees.get(feature.id)
         if existing is not None:
             return existing
+
+        reused = self.workspace.reuse(
+            feature.id,
+            path=feature.worktree,
+            branch=feature.branch,
+            base_sha=feature.base_sha,
+        )
+        if reused is not None:
+            self._worktrees[feature.id] = reused
+            return reused
 
         worktree = self.workspace.create(
             feature.id,
