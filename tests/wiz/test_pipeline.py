@@ -246,6 +246,12 @@ def clock():
     return tick
 
 
+def _passing_provision(profile, workspace):
+    from openjarvis.reliability.checks import CheckResult
+
+    return CheckResult(name="provision", ran=True, passed=True, summary="provisioned")
+
+
 def build_pipeline(
     tmp_path,
     clock,
@@ -261,6 +267,7 @@ def build_pipeline(
     max_attempts=3,
     verifier=True,
     preview=True,
+    provision_factory=None,
 ):
     store = FeatureStore(tmp_path / "features.db")
     suite = FakeSuite(suite_results or [FakeCheckResult()])
@@ -281,6 +288,7 @@ def build_pipeline(
         engineer=engineer or ScriptedEngineer(),
         workspace=workspace or FakeWorkspace(tmp_path),
         check_suite_factory=lambda profile: suite,
+        provision_factory=provision_factory or _passing_provision,
         preview=observer,
         verifier=(
             FeatureVerifier(runner_factory=lambda vp: the_browser) if verifier else None
@@ -2289,6 +2297,83 @@ class TestTheReviewIsAdvisory:
         feature = pipeline.submit(REQUEST, actor=operator_actor())
         pipeline.run(feature.id)
         assert reviewer.calls == []
+
+
+class TestProvisioningRunsBeforeTheCheckSuite:
+    """FEAT-00031: three attempts failed identically on "tsc: command not
+    found" because node_modules never existed and nothing installed it.
+    """
+
+    def test_a_failed_provision_blocks_the_check_suite_entirely(self, tmp_path, clock):
+        from openjarvis.reliability.checks import CheckResult
+
+        def failing_provision(profile, workspace):
+            return CheckResult(
+                name="provision",
+                ran=True,
+                passed=False,
+                summary="failed (exit 127)",
+                output="sh: tsc: command not found",
+            )
+
+        pipeline = build_pipeline(
+            tmp_path, clock, max_attempts=1, provision_factory=failing_provision
+        )
+        submitted = pipeline.submit(REQUEST, actor=operator_actor())
+        feature = pipeline.run(submitted.id)
+
+        assert pipeline._suite.runs == []  # the check suite itself never ran
+        assert feature.state is FeatureState.HUMAN_REQUIRED
+        assert any("tsc: command not found" in a.failure for a in feature.attempts)
+
+    def test_a_failed_provision_is_fed_back_to_the_next_attempt(self, tmp_path, clock):
+        from openjarvis.reliability.checks import CheckResult
+
+        calls = {"n": 0}
+
+        def flaky_provision(profile, workspace):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return CheckResult(
+                    name="provision",
+                    ran=True,
+                    passed=False,
+                    summary="failed (exit 127)",
+                    output="sh: tsc: command not found",
+                )
+            return CheckResult(name="provision", ran=True, passed=True, summary="provisioned")
+
+        engineer = ScriptedEngineer()
+        pipeline = build_pipeline(
+            tmp_path, clock, engineer=engineer, provision_factory=flaky_provision
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+
+        assert calls["n"] >= 2
+        # The second build session was told about the first failure.
+        second_goal = engineer.build_calls[1][0].render()
+        assert "tsc: command not found" in second_goal
+
+    def test_a_successful_provision_result_is_recorded_alongside_the_gates(
+        self, tmp_path, clock
+    ):
+        pipeline = build_pipeline(tmp_path, clock)
+        submitted = pipeline.submit(REQUEST, actor=operator_actor())
+        feature = pipeline.run(submitted.id)
+
+        gates = feature.metadata.get("gates", {})
+        names = [r.get("name") for r in gates.get("results", [])]
+        assert "provision" in names
+
+    def test_building_still_has_no_bash_and_cannot_provision_itself(self):
+        # Not re-tested here in depth (see test_engineer.py) — pinned once
+        # more at the integration boundary this module actually touches:
+        # provisioning is pipeline code, never something the model's own
+        # tool list could reach.
+        from openjarvis.wiz.features.engineer import BUILDING_TOOLS
+
+        assert "Bash" not in BUILDING_TOOLS
 
 
 class TestTheEvidenceAGateProduces:

@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from openjarvis.reliability.briefing import has_critical_secret
+from openjarvis.reliability.checks import CheckResult
 from openjarvis.wiz.approvals import ApprovalError, ApprovalStore
 from openjarvis.wiz.authority import Actor, Authority, AuthorityPolicy
 from openjarvis.wiz.capabilities import Risk
@@ -69,6 +70,7 @@ from openjarvis.wiz.features.model import (
 from openjarvis.wiz.features.postship import complete as _complete_postship
 from openjarvis.wiz.features.preview import PreviewObserver
 from openjarvis.wiz.features.profile import EngineeringProfile
+from openjarvis.wiz.features.provision import PROVISION_CHECK_NAME, provision_check
 from openjarvis.wiz.features.risk import classify, classify_paths
 from openjarvis.wiz.features.verification import (
     CriterionOutcome,
@@ -134,6 +136,13 @@ class FeaturePipeline:
     #: this module should know neither.
     check_suite_factory: Callable[[EngineeringProfile], Any]
 
+    #: Provisions dependencies before the check suite runs — see
+    #: openjarvis.wiz.features.provision. Injected for the same reason
+    #: check_suite_factory is: a test proving the gate/retry loop should not
+    #: need a real npm install to do it. Defaults to the real, deterministic
+    #: provisioner.
+    provision_factory: Callable[[EngineeringProfile, str], Any] = None  # type: ignore[assignment]
+
     preview: Optional[PreviewObserver] = None
     verifier: Optional[FeatureVerifier] = None
 
@@ -168,6 +177,8 @@ class FeaturePipeline:
     push_remote: str = "origin"
 
     def __post_init__(self) -> None:
+        if self.provision_factory is None:
+            self.provision_factory = _default_provision
         self._worktrees: Dict[str, Any] = {}
         # Guards the whole of ship(): merge, production observation and
         # production verification are one critical section, process-wide.
@@ -834,13 +845,54 @@ class FeaturePipeline:
         return StepResult(feature, message="Building with Claude Code...")
 
     def _deploy_preview(self, feature: FeatureRequest) -> StepResult:
-        """Run the local gates, then push the branch so a preview is built."""
+        """Provision dependencies, run the local gates, then push the branch
+        so a preview is built.
+
+        FEAT-00031: three attempts failed identically on "tsc: command not
+        found" because node_modules did not exist in the worktree and
+        nothing installed it — dependency installation had always been a
+        Bash-enabled coding session's own implicit job, and BUILDING has had
+        no Bash since the FEAT-00030 fix (see
+        openjarvis.wiz.features.engineer's module docstring). Provisioning
+        runs here, first, deterministically, using the exact same
+        path_prepend the check suite itself was built with — a project that
+        pins a Node version gets the same one for installing as for
+        checking, never two different runtimes silently disagreeing about
+        what "the dependencies" even are.
+        """
         worktree = self._worktree_for(feature)
         attempt = feature.attempts[-1]
 
+        # Its own gate, checked and recorded before the suite runs at all —
+        # not merged into the suite's own result object, deliberately: the
+        # suite's shape (CheckSuiteResult, or a test double standing in for
+        # one) is owned by check_suite_factory, and reconstructing one from
+        # pieces here would mean silently assuming what that shape is.
+        provision_result = self.provision_factory(self.profile, worktree.path)
+        if not provision_result.passed:
+            attempt.checks = {
+                "passed": False,
+                "ran_any": provision_result.ran,
+                "results": [provision_result.to_dict()],
+                "summary": provision_result.summary,
+            }
+            feature.metadata["gates"] = attempt.checks
+            self.store.save(feature)
+            evidence = (
+                provision_result.output.strip()
+                if provision_result.output
+                else provision_result.summary
+            )
+            return self._retry_or_stop(feature, attempt, f"### {PROVISION_CHECK_NAME} failed\n\n{evidence}")
+
         suite = self.check_suite_factory(self.profile)
         result = suite.run(workspace=worktree.path)
-        attempt.checks = _checks_record(result)
+        checks = _checks_record(result)
+        # provision_result is recorded first — same list, same shape as
+        # every other gate, not a separate top-level key a reader would
+        # have to know to look for.
+        checks["results"] = [provision_result.to_dict(), *checks.get("results", [])]
+        attempt.checks = checks
         feature.metadata["gates"] = attempt.checks
 
         if not getattr(result, "passed", False):
@@ -1576,6 +1628,15 @@ def _plain_failure(exc: Exception) -> str:
     # Anything genuinely unforeseen. One line, and the detail is in the log.
     first = str(exc).strip().split("\n", 1)[0]
     return f"Something went wrong and I have stopped: {first[:160]}"
+
+
+def _default_provision(profile: EngineeringProfile, workspace: str) -> CheckResult:
+    """The real provisioner: dependencies, under the same pinned Node the
+    check suite itself runs under, or whatever this process already has if
+    the project pins none.
+    """
+    node_bin_dir = profile.resolve_node_bin_dir()
+    return provision_check(workspace, path_prepend=[node_bin_dir] if node_bin_dir else None)
 
 
 def _checks_record(result: Any) -> Dict[str, Any]:
