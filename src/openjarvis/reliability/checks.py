@@ -54,6 +54,13 @@ class CheckCommand:
     #: runtime is not evidence about the change — it is evidence about the
     #: machine. Empty by default, meaning "whatever this process already has".
     path_prepend: List[str] = field(default_factory=list)
+    #: Extra environment variables, applied on top of this process's own
+    #: environment. Found on FEAT-00031: a production ``next build`` can
+    #: genuinely need more V8 heap than Node's default ceiling on a given
+    #: machine, and a build killed by that is evidence about the machine's
+    #: memory, not about the change — the same distinction ``path_prepend``
+    #: already draws for the runtime version. Empty by default.
+    env: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -172,9 +179,11 @@ def run_check(check: CheckCommand, *, workspace: str) -> CheckResult:
         )
 
     env = None
-    if check.path_prepend:
+    if check.path_prepend or check.env:
         env = dict(os.environ)
-        env["PATH"] = os.pathsep.join([*check.path_prepend, env.get("PATH", "")])
+        if check.path_prepend:
+            env["PATH"] = os.pathsep.join([*check.path_prepend, env.get("PATH", "")])
+        env.update(check.env)
 
     started = time.monotonic()
     try:
@@ -242,6 +251,7 @@ class CheckSuite:
         build_command: str = "",
         timeout: int = 1800,
         path_prepend: Optional[List[str]] = None,
+        build_env: Optional[Dict[str, str]] = None,
     ) -> "CheckSuite":
         """Build the standard suite from configured commands.
 
@@ -253,6 +263,12 @@ class CheckSuite:
         a pinned runtime for all four gates or none of them, and letting them
         disagree would make "which Node ran the tests" a question with more
         than one honest answer.
+
+        *build_env* applies to the build check alone, unlike *path_prepend* —
+        unlike a runtime version, an environment fix like extra V8 heap is
+        something only the heaviest of the four gates has ever been observed
+        to need; forcing it onto lint/typecheck/tests as well would only make
+        their behaviour harder to reason about for no benefit.
         """
         prepend = list(path_prepend or [])
         return cls(
@@ -271,7 +287,11 @@ class CheckSuite:
                     "tests", test_command, timeout=timeout, path_prepend=prepend
                 ),
                 CheckCommand(
-                    "build", build_command, timeout=timeout, path_prepend=prepend
+                    "build",
+                    build_command,
+                    timeout=timeout,
+                    path_prepend=prepend,
+                    env=dict(build_env or {}),
                 ),
             ]
         )

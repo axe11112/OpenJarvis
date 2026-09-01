@@ -200,6 +200,15 @@ def _check_suite_factory(profile: EngineeringProfile) -> Any:
     return CheckSuite.from_config(
         **profile.check_commands(),
         path_prepend=[node_bin_dir] if node_bin_dir else None,
+        # Found on FEAT-00031: a production `next build` genuinely needs more
+        # V8 heap than Node's default ceiling gives it on this machine — it
+        # aborts with "JavaScript heap out of memory" on the unmodified
+        # diff, and the same build succeeds unmodified once given more heap.
+        # That is evidence about this machine, not about any change, so it
+        # belongs here alongside the Node-version pin rather than as
+        # per-feature retry feedback. Vercel's own build environment is
+        # unaffected — this only reaches the local pre-push check.
+        build_env={"NODE_OPTIONS": "--max-old-space-size=4096"},
     )
 
 

@@ -116,6 +116,57 @@ class TestPathPrepend:
         assert all(c.path_prepend == [] for c in suite.checks)
 
 
+class TestEnv:
+    """A build can genuinely need more resources than a default environment
+    gives it (FEAT-00031: `next build` hit V8's default heap ceiling on an
+    8GB machine, and the same build succeeded unmodified with more heap) —
+    that is evidence about the machine, not about the change, and only the
+    build check has ever been observed to need it.
+    """
+
+    def test_env_overrides_reach_the_subprocess(self, tmp_path):
+        result = run_check(
+            CheckCommand(
+                "tests", "echo $MY_MARKER", env={"MY_MARKER": "found-it"}
+            ),
+            workspace=str(tmp_path),
+        )
+        assert result.passed
+        # success discards output by design; force a failure to see it.
+        result = run_check(
+            CheckCommand(
+                "tests",
+                "echo $MY_MARKER && exit 1",
+                env={"MY_MARKER": "found-it"},
+            ),
+            workspace=str(tmp_path),
+        )
+        assert "found-it" in result.output
+
+    def test_no_env_by_default(self, tmp_path):
+        result = run_check(CheckCommand("tests", "exit 0"), workspace=str(tmp_path))
+        assert result.ran and result.passed  # unaffected by the new field
+
+    def test_check_suite_from_config_applies_build_env_to_build_only(self):
+        suite = CheckSuite.from_config(
+            test_command="t",
+            lint_command="l",
+            typecheck_command="c",
+            build_command="b",
+            build_env={"NODE_OPTIONS": "--max-old-space-size=4096"},
+        )
+        by_name = {c.name: c for c in suite.checks}
+        assert by_name["build"].env == {"NODE_OPTIONS": "--max-old-space-size=4096"}
+        assert by_name["lint"].env == {}
+        assert by_name["typecheck"].env == {}
+        assert by_name["tests"].env == {}
+
+    def test_no_build_env_by_default(self):
+        suite = CheckSuite.from_config(build_command="b")
+        build = next(c for c in suite.checks if c.name == "build")
+        assert build.env == {}
+
+
 class TestCheckSuite:
     def test_from_config_orders_cheapest_first(self):
         suite = CheckSuite.from_config(
