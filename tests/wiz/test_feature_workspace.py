@@ -178,6 +178,68 @@ class TestReusingAnExistingWorktree:
         assert reused.path == worktree.path
         assert (Path(reused.path) / "NEW.md").read_text() == "uncommitted work\n"
 
+    def test_a_real_committed_advance_past_base_sha_is_still_reused(self, workspace):
+        """Found re-verifying FEAT-00031 a second time: refusing whenever
+        actual_head != base_sha (the original, unconditional check) sent a
+        worktree whose diff had *already been committed and pushed* by a
+        prior successful run to create() -- which destroyed the local commit
+        and left the worktree at base_sha while origin sat ahead of it on
+        the same branch. The next push then failed as a non-fast-forward.
+        A worktree whose HEAD is a genuine descendant of base_sha (real,
+        forward progress) must be handed back exactly like an untouched one.
+        """
+        from pathlib import Path
+
+        worktree = workspace.create("FEAT-00001")
+        (Path(worktree.path) / "NEW.md").write_text("real work\n")
+        _git(["add", "-A"], worktree.path)
+        _git(["commit", "-m", "did the work"], worktree.path)
+        advanced_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=worktree.path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert advanced_head != worktree.base_commit
+
+        reused = workspace.reuse(
+            "FEAT-00001",
+            path=worktree.path,
+            branch=worktree.branch,
+            base_sha=worktree.base_commit,  # the *original* base, not the new HEAD
+        )
+
+        assert reused is not None
+        assert reused.path == worktree.path
+        actual_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=reused.path,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert actual_head == advanced_head  # the real commit, not destroyed
+
+    def test_a_head_not_descended_from_base_sha_is_not_reused(self, workspace, repo):
+        """The case the ancestor check exists to still refuse: HEAD moved,
+        but not *forward* from the recorded base -- diverged, rewound, or
+        pointing somewhere unrelated. Simulated with an orphan commit that
+        shares no history with base_sha at all.
+        """
+        worktree = workspace.create("FEAT-00001")
+        _git(["checkout", "--orphan", "unrelated-history"], worktree.path)
+        _git(["commit", "--allow-empty", "-m", "shares no history"], worktree.path)
+        _git(["branch", "-M", worktree.branch], worktree.path)
+
+        reused = workspace.reuse(
+            "FEAT-00001",
+            path=worktree.path,
+            branch=worktree.branch,
+            base_sha=worktree.base_commit,
+        )
+        assert reused is None
+
     def test_reuse_never_calls_create(self, workspace):
         worktree = workspace.create("FEAT-00001")
         workspace.created = []  # forget the call above; only reuse() must follow

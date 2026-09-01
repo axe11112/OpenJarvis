@@ -44,6 +44,7 @@ __all__ = [
     "WorkspaceError",
     "Worktree",
     "git_output",
+    "is_ancestor",
 ]
 
 
@@ -85,6 +86,26 @@ def git_output(
             f"{(proc.stderr or proc.stdout).strip()[:500]}"
         )
     return proc.stdout
+
+
+def is_ancestor(candidate: str, descendant: str, *, cwd: str | Path) -> bool:
+    """Whether *candidate* is reachable from *descendant* by walking parents.
+
+    ``git merge-base --is-ancestor`` communicates its answer purely through
+    the exit code (0 = yes, 1 = no), which :func:`git_output` — built to
+    raise on a non-zero exit — cannot expose. A separate, small function
+    rather than a ``raise_on_nonzero`` flag on that one: "is X an ancestor
+    of Y" is a question with a real false answer, not a failure.
+    """
+    proc = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", candidate, descendant],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    return proc.returncode == 0
 
 
 @dataclass(slots=True)

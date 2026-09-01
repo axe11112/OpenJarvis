@@ -193,12 +193,31 @@ class FeatureWorkspace:
         if actual_branch != branch:
             return None
         if base_sha and actual_head != base_sha:
-            # A branch that has moved past its recorded base is not
-            # necessarily wrong (a commit may have landed), but this method
-            # only ever exists to hand back an *untouched* worktree — anything
-            # else should go through the normal, explicit paths instead of
-            # being guessed at here.
-            return None
+            # Found re-verifying FEAT-00031 a second time: a branch that has
+            # moved past its recorded base is not necessarily wrong — a
+            # commit may genuinely have landed, which is exactly what a
+            # successful build-and-push does. Refusing unconditionally here
+            # sent every caller (see _worktree_for) to create(), which is
+            # documented and correct to destroy whatever already exists at
+            # the path — silently discarding a real, already-pushed commit
+            # and leaving the local worktree at base_sha while origin sat
+            # ahead of it. The next push then failed as a non-fast-forward,
+            # which reads like a fresh problem rather than the actual cause.
+            #
+            # The distinction that matters is not "did HEAD move" but "did it
+            # move *forward*": a worktree whose HEAD is a genuine descendant
+            # of base_sha reflects real, intentional progress and is exactly
+            # as safe to hand back as an untouched one. Only a HEAD that is
+            # NOT reachable from base_sha at all — diverged, rewound, or
+            # pointed somewhere unrelated — is the case this method was
+            # actually built to refuse.
+            from openjarvis.reliability.workspace import is_ancestor
+
+            try:
+                if not is_ancestor(base_sha, actual_head, cwd=target):
+                    return None
+            except Exception:  # noqa: BLE001 - not a usable worktree either way
+                return None
         logger.info(
             "reusing the existing feature worktree for %s: %s @ %s",
             feature_id,
