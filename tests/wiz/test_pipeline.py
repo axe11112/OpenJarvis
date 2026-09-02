@@ -10,7 +10,7 @@ from typing import Any, Dict, List
 import pytest
 
 from openjarvis.reliability.types import ProbeResult
-from openjarvis.wiz.approvals import ApprovalStore
+from openjarvis.wiz.approvals import ApprovalError, ApprovalStore
 from openjarvis.wiz.authority import Actor, Authority, AuthorityPolicy, Channel
 from openjarvis.wiz.features.acceptance import DESKTOP, MOBILE
 from openjarvis.wiz.features.engineer import (
@@ -2346,6 +2346,258 @@ class TestAwaitingItemsOneOffShipApproval:
         shipped = pipeline.ship(feature.id)
         assert shipped.state is FeatureState.READY
         assert not github.merge_calls
+
+
+class RealisticFakeBrowser:
+    """Unlike :class:`FakeBrowser`, this mirrors production's per-criterion
+    attribution shape (``expectation_outcomes``/``assertion_outcomes`` in
+    :class:`~openjarvis.reliability.types.ProbeResult`'s metadata) rather
+    than one pass/fail verdict applied to every criterion in the batch by
+    association. That distinction matters for exactly one thing here: a
+    VIEWPORT criterion with no selector produces no expectation at all
+    (:meth:`~openjarvis.wiz.features.acceptance.AcceptanceContract.
+    _spec_for_route`), so with real per-criterion attribution it is
+    genuinely left uncovered and lands in ``awaiting_a_person`` — the
+    :class:`FakeBrowser` fallback instead marks it passed "by association"
+    with whatever else shared its probe run, which never reproduces
+    FEAT-00031's actual deadlock shape at all.
+    """
+
+    def __init__(self):
+        self.runs = []
+
+    def run(self, spec, *, base_url="", evidence_dir=None, **kwargs):
+        self.runs.append(spec)
+        expectation_outcomes = [
+            {
+                "kind": e.kind,
+                "selector": e.selector,
+                "value": e.value,
+                "matches": e.matches,
+                "passed": True,
+                "detail": "",
+            }
+            for e in spec.expect
+        ]
+        assertion_outcomes = {}
+        if spec.assertions.no_console_errors:
+            assertion_outcomes["console"] = {"passed": True, "detail": ""}
+        if spec.assertions.no_failed_requests:
+            assertion_outcomes["network"] = {"passed": True, "detail": ""}
+        return ProbeResult(
+            probe_id=spec.id,
+            success=True,
+            error="",
+            metadata={
+                "viewport": spec.metadata.get("viewport", ""),
+                "expectation_outcomes": expectation_outcomes,
+                "assertion_outcomes": assertion_outcomes,
+            },
+        )
+
+
+class TestManualAcceptanceLifecycle:
+    """The lifecycle gap FEAT-00031 actually hit, and the fix for it.
+
+    _finish() stops unconditionally whenever verification.complete is
+    false — true whenever anything sits in awaiting_a_person, which a
+    VIEWPORT criterion with no selector always does, by contract_for()'s
+    own deterministic design, for essentially any UI-touching feature.
+    FeatureRecovery.recover() *can* tolerate outstanding awaiting_a_person
+    items and reach READY despite them, but it hard-requires an existing
+    pull request — and a pull request is only ever opened by _finish()
+    itself, after reaching READY. A feature with only awaiting_a_person
+    items left and no PR yet could reach neither path: a permanent
+    deadlock, proven here before it is closed.
+    """
+
+    def _pipeline_with_unmeasured_viewport(self, tmp_path, clock, *, approvals=None):
+        # REQUEST ('...button...') is a UI request with nothing quoted for
+        # contract_for() to key a CONTENT criterion off directly-checkable
+        # text alone beyond what ScriptedEngineer's default diff satisfies —
+        # what matters here is only that it is UI-touching, so contract_for()
+        # always appends the unmeasured "works on a phone-sized screen"
+        # VIEWPORT criterion (acceptance.py: no labels quoted -> also a
+        # layout-overflow VIEWPORT criterion; both have no selector).
+        browser = RealisticFakeBrowser()
+        pipeline = build_pipeline(
+            tmp_path, clock, browser=browser, approvals=approvals, max_attempts=1
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        return pipeline, result, browser
+
+    def test_the_deadlock_is_real_without_an_approval(self, tmp_path, clock):
+        pipeline, feature, browser = self._pipeline_with_unmeasured_viewport(
+            tmp_path, clock
+        )
+        assert feature.state is FeatureState.HUMAN_REQUIRED
+        v = feature.metadata["verification"]
+        assert v["passed"] is True  # nothing actually failed
+        assert v["complete"] is False  # only because of awaiting_a_person
+        assert v["awaiting_a_person"]  # genuinely non-empty
+        assert not feature.pr_number  # no PR — _open_pull_request never ran
+
+        # And FeatureRecovery cannot rescue it either: no PR exists yet.
+        from openjarvis.wiz.features.recovery import recover_feature
+
+        result = recover_feature(
+            feature.id,
+            store=pipeline.store,
+            profile=pipeline.profile,
+            github=None,
+            preview=pipeline.preview,
+            check_suite_factory=pipeline.check_suite_factory,
+        )
+        assert not result.recovered
+        assert any(r.code == "no_pull_request" for r in result.refusals)
+
+        # And ship() refuses outright: it never got to READY.
+        pipeline.shipper = None  # irrelevant to this refusal; make it explicit
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.HUMAN_REQUIRED
+
+    def test_an_exact_approval_reaches_ready_and_opens_a_pr(self, tmp_path, clock):
+        approvals = ApprovalStore(clock=lambda: 0.0, ttl_seconds=900)
+        pipeline, feature, browser = self._pipeline_with_unmeasured_viewport(
+            tmp_path, clock, approvals=approvals
+        )
+        assert feature.state is FeatureState.HUMAN_REQUIRED
+        head_sha = feature.attempts[-1].commit_sha
+        outstanding = sorted(feature.metadata["verification"]["awaiting_a_person"])
+
+        approved = pipeline.approve_manual_acceptance(
+            feature.id, reason="looked at the desktop and mobile preview, both clean"
+        )
+        assert approved.metadata.get("ship_manual_approval_token")
+
+        pipeline.shipper = FeatureShipper(
+            policy=FeatureShippingPolicy(merge_medium_risk=True),
+            github=TestShip.FakeGitHub(),
+            authority=AuthorityPolicy(
+                grants={
+                    Channel.CONTROL_CENTER: frozenset(
+                        {Authority.PR_WRITE, Authority.PRODUCTION_CHANGE}
+                    )
+                }
+            ),
+        )
+        reopened = pipeline.reopen_for_deploy(
+            feature.id, reason="manual acceptance approved; re-verifying"
+        )
+        assert reopened.state is FeatureState.TESTING
+
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert result.pr_number  # _open_pull_request ran
+
+        # The distinction the task requires: an owner's yes is not a
+        # Playwright pass. verification.complete stays exactly what was
+        # measured; manual_acceptance is recorded separately.
+        assert result.metadata["verification"]["complete"] is False
+        assert result.metadata["verification"]["awaiting_a_person"] == outstanding
+        manual = result.metadata["manual_acceptance"]
+        assert manual["owner_confirmed"] is True
+        assert sorted(manual["items"]) == outstanding
+        assert manual["head_sha"] == result.attempts[-1].commit_sha
+        for outcome in result.metadata["verification"]["outcomes"]:
+            if outcome["description"] in outstanding:
+                assert outcome["passed"] is None  # never rewritten to True
+
+        assert "ship_manual_approval_token" not in result.metadata
+
+    def test_the_approval_is_consumed_the_journal_records_both_steps(
+        self, tmp_path, clock
+    ):
+        approvals = ApprovalStore(clock=lambda: 0.0, ttl_seconds=900)
+        pipeline, feature, browser = self._pipeline_with_unmeasured_viewport(
+            tmp_path, clock, approvals=approvals
+        )
+        pipeline.approve_manual_acceptance(feature.id, reason="checked the preview")
+        pipeline.reopen_for_deploy(feature.id, reason="re-verifying")
+        pipeline.run(feature.id)
+
+        entries = [
+            e
+            for e in pipeline.journal.tail(50)
+            if e.detail.get("feature_id") == feature.id
+        ]
+        kinds = [e.kind for e in entries]
+        assert "feature.manual_acceptance_approved" in kinds
+        assert "feature.manual_items_confirmed" in kinds
+
+    def test_a_stale_head_sha_approval_is_refused(self, tmp_path, clock):
+        # The approval names a head SHA that is no longer this attempt's —
+        # exactly what "if head SHA changes, revalidate" means in practice.
+        approvals = ApprovalStore(clock=lambda: 0.0, ttl_seconds=900)
+        pipeline, feature, browser = self._pipeline_with_unmeasured_viewport(
+            tmp_path, clock, approvals=approvals
+        )
+        outstanding = sorted(feature.metadata["verification"]["awaiting_a_person"])
+        approval = approvals.issue(
+            capability="feature.ship_manual_items",
+            subject=feature.id,
+            parameters={"head_sha": "stale" + "0" * 36, "outstanding": outstanding},
+        )
+        feature.metadata["ship_manual_approval_token"] = approval.token
+        pipeline.store.save(feature)
+
+        reopened = pipeline.reopen_for_deploy(feature.id, reason="re-verifying")
+        assert reopened.state is FeatureState.TESTING
+        result = pipeline.run(feature.id)
+
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert not result.pr_number
+        assert "manual_acceptance" not in result.metadata
+
+    def test_a_genuine_automated_failure_is_never_masked_by_a_valid_approval(
+        self, tmp_path, clock
+    ):
+        # A real failure must refuse regardless of any manual approval —
+        # _finish() checks verification.passed, unconditionally, before it
+        # ever looks at the awaiting-items approval.
+        approvals = ApprovalStore(clock=lambda: 0.0, ttl_seconds=900)
+        browser = RealisticFakeBrowser()
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            browser=browser,
+            approvals=approvals,
+            suite_results=[FakeCheckResult(passed=False, summary="typecheck broken")],
+            max_attempts=1,
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        # Never even reached the browser: a failing local gate stops in
+        # _deploy_preview, before there is any verification to approve.
+        assert "verification" not in result.metadata
+
+        # Even handing it a (structurally unusable, since there is no
+        # verified commit yet) approval attempt is refused outright.
+        with pytest.raises(ApprovalError):
+            pipeline.approve_manual_acceptance(feature.id, reason="trying anyway")
+
+    def test_approve_manual_acceptance_refuses_with_nothing_outstanding(
+        self, tmp_path, clock
+    ):
+        approvals = ApprovalStore(clock=lambda: 0.0, ttl_seconds=900)
+        pipeline = build_pipeline(tmp_path, clock, approvals=approvals)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY  # the plain FakeBrowser path
+
+        with pytest.raises(ApprovalError):
+            pipeline.approve_manual_acceptance(feature.id, reason="nothing to approve")
+
+    def test_approve_manual_acceptance_refuses_without_an_approval_store(
+        self, tmp_path, clock
+    ):
+        pipeline, feature, browser = self._pipeline_with_unmeasured_viewport(
+            tmp_path, clock, approvals=None
+        )
+        with pytest.raises(ApprovalError):
+            pipeline.approve_manual_acceptance(feature.id, reason="no store configured")
 
 
 class TestAutoShipIfEligible:

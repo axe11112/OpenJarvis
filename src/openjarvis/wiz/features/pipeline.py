@@ -399,6 +399,78 @@ class FeaturePipeline:
             self.queue.submit(feature)
         return feature
 
+    def approve_manual_acceptance(
+        self, feature_id: str, *, reason: str
+    ) -> FeatureRequest:
+        """Issue a one-off, fingerprint-bound approval for exactly this
+        feature's current outstanding ``awaiting_a_person`` items, at
+        exactly its current verified head SHA.
+
+        Closes a real lifecycle gap: a feature whose only remaining gap is
+        one or more structurally-unmeasurable criteria (a layout check with
+        no selector to compile, typically) could never reach ``READY``
+        through :meth:`_finish` — which stops unconditionally whenever
+        ``verification.complete`` is false — and could not reach it through
+        :class:`~openjarvis.wiz.features.recovery.FeatureRecovery` either,
+        since that path requires an existing pull request, and a pull
+        request is only ever opened *after* reaching ``READY``. Found on
+        FEAT-00031: every criterion this system could check, checked out
+        clean, and the feature was still permanently stuck.
+
+        This method only *issues* the approval (via the same
+        :class:`~openjarvis.wiz.approvals.ApprovalStore` every other
+        fingerprint-bound yes in this codebase uses) and stores its token
+        where :meth:`_finish` already knows to look
+        (``feature.metadata["ship_manual_approval_token"]``, redeemed by
+        :meth:`_awaiting_items_approved`). It grants nothing by itself: the
+        stored fingerprint names this feature, this exact head SHA, and the
+        exact sorted set of items currently outstanding, and redemption
+        recomputes that same fingerprint fresh from whatever the feature's
+        real state is when :meth:`_finish` next runs — so this approval
+        silently fails to redeem the moment any of those three things
+        change (a new attempt, a changed contract, a different set of
+        outstanding items), rather than being honoured as a standing yes.
+
+        Grants nothing about *automated* criteria: :meth:`_finish` checks
+        ``verification.passed`` — a real Playwright/gate failure — before
+        it ever looks at this approval, unconditionally, so this can never
+        mask one.
+
+        ``reason`` has no default, matching
+        :meth:`reopen_for_owner_authorized_rebuild`: there is no generic
+        phrase honest enough to stand in for a person having actually
+        looked at this feature's evidence and said yes.
+        """
+        feature = self._load(feature_id)
+        if self.approvals is None:
+            raise ApprovalError("no approval store is configured")
+        if not feature.attempts or not feature.attempts[-1].commit_sha:
+            raise ApprovalError(
+                f"{feature_id} has no verified commit to bind this approval to"
+            )
+        head_sha = feature.attempts[-1].commit_sha
+        outstanding = sorted(
+            (feature.metadata.get("verification") or {}).get("awaiting_a_person")
+            or []
+        )
+        if not outstanding:
+            raise ApprovalError(
+                f"{feature_id} has no outstanding manual-verification items "
+                "to approve"
+            )
+        approval = self.approvals.issue(
+            capability="feature.ship_manual_items",
+            subject=feature.id,
+            parameters={"head_sha": head_sha, "outstanding": outstanding},
+            actor_id=feature.actor_id,
+            channel=feature.source,
+            summary=reason[:1000],
+        )
+        feature.metadata["ship_manual_approval_token"] = approval.token
+        self.store.save(feature)
+        self._record(feature, "feature.manual_acceptance_approved", reason[:1000])
+        return feature
+
     def ship(
         self, feature_id: str, *, operator_approved: bool = False
     ) -> FeatureRequest:
@@ -1130,14 +1202,47 @@ class FeaturePipeline:
                 logger.warning("the review session failed: %s", exc)
 
         if not verification.complete:
+            # verification.passed is already true here (checked above,
+            # unconditionally) — every awaiting_a_person item left is a
+            # structural gap (no selector for a layout check, typically),
+            # never a failure. A redeemed, fingerprint-bound approval can
+            # close exactly that gap; it is asked for fresh every time,
+            # against whatever this feature's outstanding items and head
+            # SHA actually are right now, so it can never stand in for a
+            # different set of items or a different commit.
+            manual_approved = self._awaiting_items_approved(
+                feature, head_sha=attempt.commit_sha
+            )
+            if not manual_approved:
+                self.store.save(feature)
+                return self._stop(
+                    feature,
+                    "Sir, everything I can check passed. "
+                    + "; ".join(verification.awaiting_a_person)
+                    + " — that part needs you.",
+                    kind="feature.needs_a_person",
+                    message_is_success=True,
+                )
+            # Recorded distinctly from verification.outcomes, never folded
+            # into it: an owner looking at a preview and saying "this is
+            # fine" is real evidence, but it is a different *kind* of
+            # evidence than a Playwright assertion, and conflating the two
+            # would let a future reader mistake a human's yes for a
+            # measurement nothing here ever took. verification.complete
+            # itself is never touched — it stays exactly what was actually
+            # measured, permanently; this is a second, independent reason
+            # the pipeline may still proceed despite it.
+            feature.metadata["manual_acceptance"] = {
+                "head_sha": attempt.commit_sha,
+                "items": list(verification.awaiting_a_person),
+                "owner_confirmed": True,
+                "confirmed_at": self.clock(),
+            }
             self.store.save(feature)
-            return self._stop(
+            self._record(
                 feature,
-                "Sir, everything I can check passed. "
-                + "; ".join(verification.awaiting_a_person)
-                + " — that part needs you.",
-                kind="feature.needs_a_person",
-                message_is_success=True,
+                "feature.manual_items_confirmed",
+                "; ".join(verification.awaiting_a_person),
             )
 
         self._transition(feature, FeatureState.READY, verification.summary())
