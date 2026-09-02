@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+import re
+from typing import Dict, List, Tuple
 
 from openjarvis._rust_bridge import get_rust_module, scan_result_from_json
 from openjarvis.security._stubs import BaseScanner
-from openjarvis.security.types import ScanResult, ThreatLevel
+from openjarvis.security.types import ScanFinding, ScanResult, ThreatLevel
 
 # ---------------------------------------------------------------------------
 # SecretScanner
@@ -145,4 +146,82 @@ class PIIScanner(BaseScanner):
         return self._rust_impl.redact(text)
 
 
-__all__ = ["PIIScanner", "SecretScanner"]
+# ---------------------------------------------------------------------------
+# Pure-Python fallback, for when the compiled extension is unavailable
+# ---------------------------------------------------------------------------
+
+
+class _PatternTableScanner(BaseScanner):
+    """Scan/redact from a plain ``PATTERNS`` dict, in pure Python.
+
+    Found on a real, silent gap: :class:`~openjarvis.security.boundary.
+    BoundaryGuard` fell back to an *empty* scanner list whenever the
+    compiled Rust extension was unavailable — its own constructor caught
+    exactly that ImportError and returned ``[]`` rather than raising —
+    which made every :meth:`~.boundary.BoundaryGuard.scan_outbound` call a
+    silent no-op: no exception for a caller's own fallback path to catch,
+    just text returned unchanged. A real credential reached a live HTTP
+    response through exactly this gap (an incident's evidence, rendered by
+    the Control Center dashboard) on a machine where the extension had
+    never been built.
+
+    Reuses ``SecretScanner.PATTERNS``/``PIIScanner.PATTERNS`` directly
+    rather than keeping a third copy: a pattern added for the compiled
+    scanner is picked up here automatically, matching the same reasoning
+    :func:`~openjarvis.reliability.briefing._scan_with_pattern_table`
+    already applied for boolean-only detection — this is its scan+redact
+    counterpart, usable as a real, if weaker-coverage, drop-in ``BaseScanner``.
+    """
+
+    def __init__(
+        self, scanner_id: str, patterns: Dict[str, Tuple[str, ThreatLevel, str]]
+    ) -> None:
+        self.scanner_id = scanner_id
+        self._patterns = patterns
+
+    def scan(self, text: str) -> ScanResult:
+        findings: List[ScanFinding] = []
+        for name, (pattern, level, label) in self._patterns.items():
+            try:
+                for match in re.finditer(pattern, text, re.IGNORECASE):
+                    findings.append(
+                        ScanFinding(
+                            pattern_name=name,
+                            matched_text=match.group(0),
+                            threat_level=level,
+                            start=match.start(),
+                            end=match.end(),
+                            description=f"{label} (pattern-table fallback)",
+                        )
+                    )
+            except re.error:  # pragma: no cover - a malformed pattern is not a finding
+                continue
+        return ScanResult(findings=findings)
+
+    def redact(self, text: str) -> str:
+        redacted = text
+        for name, (pattern, _level, _label) in self._patterns.items():
+            try:
+                redacted = re.sub(
+                    pattern, f"[REDACTED:{name}]", redacted, flags=re.IGNORECASE
+                )
+            except re.error:  # pragma: no cover - a malformed pattern redacts nothing
+                continue
+        return redacted
+
+
+def fallback_scanners() -> List[BaseScanner]:
+    """Pure-Python stand-ins for ``[SecretScanner(), PIIScanner()]``.
+
+    Used by :class:`~openjarvis.security.boundary.BoundaryGuard` when the
+    compiled Rust extension cannot be imported, so a machine that merely
+    needs ``uv run maturin develop`` degrades to weaker pattern-table
+    coverage instead of no coverage at all.
+    """
+    return [
+        _PatternTableScanner("secrets-fallback", SecretScanner.PATTERNS),
+        _PatternTableScanner("pii-fallback", PIIScanner.PATTERNS),
+    ]
+
+
+__all__ = ["PIIScanner", "SecretScanner", "fallback_scanners"]

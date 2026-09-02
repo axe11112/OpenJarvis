@@ -30,6 +30,32 @@ _store: Optional[Any] = None
 _config: Optional[Any] = None
 
 
+def _redact_deep(value: Any) -> Any:
+    """Apply :func:`~openjarvis.reliability.briefing.redact_secrets` to every
+    string reachable inside *value*, recursively through dicts and lists.
+
+    :func:`~openjarvis.reliability.report.build_report` already redacts a
+    curated set of free-text fields one by one (title, root_cause,
+    transition reasons, ...) for the ``/report`` endpoint. The routes here
+    return the much wider, raw incident/evidence record — every current
+    field, and any future one nobody remembers to add to a hand-picked
+    list — so this sweeps everything unconditionally instead: an incident's
+    evidence content is exactly where an upstream error message (a stack
+    trace, a request log) is most likely to have captured a real credential
+    verbatim, and that must never reach an HTTP response whatever field it
+    happens to be sitting in.
+    """
+    from openjarvis.reliability.briefing import redact_secrets
+
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, dict):
+        return {k: _redact_deep(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_deep(v) for v in value]
+    return value
+
+
 def _get_config() -> Any:
     global _config
     if _config is None:
@@ -225,7 +251,11 @@ def get_incident(incident_id: str) -> Dict[str, Any]:
                 f"/api/reliability/incidents/{incident_id}/evidence/{item['id']}"
             )
             item.pop("artifact_path", None)
-    return payload
+    # Every free-text field here can carry an upstream error message
+    # (a log line, a request/response body) that captured a real
+    # credential verbatim — see report.py's own redaction of the curated
+    # subset it returns; this is the same guarantee for the raw record.
+    return _redact_deep(payload)
 
 
 @router.get("/incidents/{incident_id}/evidence/{evidence_id}")
@@ -268,7 +298,9 @@ def get_incident_history(incident_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"No such incident: {incident_id}")
     return {
         "incident_id": incident_id,
-        "transitions": [t.to_dict() for t in store.transitions_for(incident_id)],
+        "transitions": _redact_deep(
+            [t.to_dict() for t in store.transitions_for(incident_id)]
+        ),
         "chain_intact": store.verify_chain()[0],
     }
 

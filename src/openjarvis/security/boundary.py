@@ -63,13 +63,23 @@ class BoundaryGuard:
 
             return [SecretScanner(), PIIScanner()]
         except (ImportError, Exception) as exc:
+            # Found live: this used to return [], making every
+            # scan_outbound() call downstream a silent no-op -- text
+            # returned unchanged, no exception for a caller's own
+            # try/except fallback to ever catch. A real credential reached
+            # a live HTTP response through exactly that gap. The
+            # pattern-table fallback is weaker (regex only, no compiled
+            # scanner) but it is real coverage, not none.
             logger.warning(
                 "Rust-backed scanners unavailable (%s); "
-                "BoundaryGuard running without scanners. "
-                "Build the Rust extension: uv run maturin develop",
+                "BoundaryGuard falling back to the pure-Python pattern table. "
+                "Build the Rust extension for full coverage: "
+                "uv run maturin develop",
                 exc,
             )
-            return []
+            from openjarvis.security.scanner import fallback_scanners
+
+            return fallback_scanners()
 
     def scan_outbound(self, content: str, destination: str) -> str:
         """Scan text before it leaves the device.
