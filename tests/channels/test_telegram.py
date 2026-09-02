@@ -312,3 +312,77 @@ class TestChannelAgentWiring:
 
         assert len(calls_a) == 1
         assert len(calls_b) == 1
+
+
+class TestExactlyOnePollerConstructionSite:
+    """Found investigating ~1,593 'terminated by other getUpdates request'
+    Conflict errors in the reliability watcher's log: proven historical (a
+    one-time consequence of a hard SIGKILL-based restart not letting the
+    prior process release its long-poll slot before the new one opened
+    one), not a live architectural bug -- confirmed by both a bounded live
+    observation window and, more durably, by tracing every call site that
+    constructs a TelegramChannel.
+
+    That trace found exactly three: reliability_cmd.py's reliability_watch
+    (constructs a *receiving* channel and calls .connect(), gated on
+    accept_owner_commands), reliability/notify.py's TelegramNotifier
+    (send-only, never calls .connect()), and channels/telegram.py itself
+    (the class definition). Two Telegram-capable processes commonly run at
+    once -- the watcher and the Control Center dashboard (jarvis wiz
+    dashboard / jarvis reliability dashboard, both served by
+    reliability_cmd.run_control_center) -- so the one architectural
+    invariant worth a permanent regression guard is that the dashboard's
+    own code path never gains a second receiving construction site, which
+    would silently reintroduce the exact Conflict shape found tonight.
+
+    A source-level guard rather than an integration test that actually
+    launches both processes: cheaper, faster, and it fails at the exact
+    place a future change would introduce the regression -- adding a
+    TelegramChannel(...) construction to the dashboard's own module or
+    shared control-center code -- rather than only downstream, in a flaky
+    "did Telegram's API return Conflict" integration test.
+    """
+
+    def _source(self, module_name: str) -> str:
+        import importlib
+        import inspect
+
+        module = importlib.import_module(module_name)
+        return inspect.getsource(module)
+
+    def test_the_dashboard_module_never_constructs_a_telegram_channel(self):
+        source = self._source("openjarvis.cli.wiz_cmd")
+        assert "TelegramChannel(" not in source
+
+    def test_the_shared_control_center_function_never_constructs_one(self):
+        import inspect
+
+        from openjarvis.cli.reliability_cmd import run_control_center
+
+        assert "TelegramChannel(" not in inspect.getsource(run_control_center)
+
+    def test_exactly_one_function_in_reliability_cmd_constructs_a_receiving_channel(
+        self,
+    ):
+        import ast
+        import inspect
+
+        from openjarvis.cli import reliability_cmd
+
+        tree = ast.parse(inspect.getsource(reliability_cmd))
+        constructors = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                body_source = ast.get_source_segment(
+                    inspect.getsource(reliability_cmd), node
+                ) or ""
+                if "TelegramChannel(" in body_source:
+                    constructors.append(node.name)
+        assert constructors == ["reliability_watch"]
+
+    def test_notify_py_never_calls_connect(self):
+        import inspect
+
+        from openjarvis.reliability import notify
+
+        assert ".connect(" not in inspect.getsource(notify)
