@@ -53,7 +53,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from openjarvis.reliability.statefile import write_json_atomic
 from openjarvis.reliability.types import Incident, Severity, now_iso
@@ -472,6 +472,15 @@ class OutageRegistry:
     path: Optional[Path] = None
     join_window: timedelta = DEFAULT_JOIN_WINDOW
     retention: timedelta = DEFAULT_RETENTION
+    #: Injectable so a test can pin "now" to its own fixed fixture time —
+    #: found live: _prune_locked() read real wall-clock time directly, so a
+    #: test built around a fixed timestamp silently started failing the
+    #: moment real time advanced far enough past it for retention to treat
+    #: every freshly-created outage as already expired. Defaults to the
+    #: real clock; nothing about production behaviour changes.
+    clock: Callable[[], datetime] = field(
+        default=lambda: datetime.now(timezone.utc), repr=False
+    )
     _outages: Dict[str, Outage] = field(default_factory=dict, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _stamp: tuple = field(default=(0, 0.0), repr=False)
@@ -753,7 +762,7 @@ class OutageRegistry:
             outage.notes.append("reopened: the problem is being observed again")
 
     def _prune_locked(self) -> None:
-        cutoff = datetime.now(timezone.utc) - self.retention
+        cutoff = self.clock() - self.retention
         for key, outage in list(self._outages.items()):
             seen = _parse(outage.last_seen_at)
             if seen is not None and seen < cutoff:

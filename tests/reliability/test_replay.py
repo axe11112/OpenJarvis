@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from openjarvis.reliability.replay import (
     load_incidents,
     replay,
@@ -27,6 +29,31 @@ from openjarvis.reliability.types import (
 )
 
 T0 = datetime(2026, 8, 22, 7, 12, tzinfo=timezone.utc)
+
+
+class _FixedNow(datetime):
+    """A ``datetime`` subclass whose ``.now()`` always answers with a time
+    pinned just after T0, regardless of the real wall clock.
+
+    Found live: OutageRegistry._prune_locked() read real wall-clock time
+    directly rather than an injectable clock, so every fixture here -- built
+    around the fixed T0 above -- silently started failing the moment real
+    time advanced far enough past T0 for DEFAULT_RETENTION to treat a
+    just-created outage as already expired. Fixed at the source
+    (OutageRegistry.clock is now injectable); this pins these tests so the
+    same class of failure cannot recur as real time keeps moving.
+    """
+
+    @classmethod
+    def now(cls, tz=None):
+        return T0 + timedelta(hours=1)
+
+
+@pytest.fixture(autouse=True)
+def _pin_the_outage_clock(monkeypatch):
+    import openjarvis.reliability.outage as outage_module
+
+    monkeypatch.setattr(outage_module, "datetime", _FixedNow)
 
 
 def make(
