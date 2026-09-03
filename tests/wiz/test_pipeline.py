@@ -2052,6 +2052,83 @@ class TestShip:
         # SHA — neither verified the other's deployment.
         assert postship.calls[0][1] != postship.calls[1][1]
 
+    def test_ship_lease_blocks_a_second_process_shipping_anything(
+        self, tmp_path, clock
+    ):
+        # _ship_lock only protects against a second call in *this* process.
+        # Simulate the scenario ship_lease exists for: a second, genuinely
+        # separate OpenJarvis process is mid-ship (holding the cross-process
+        # lease) while this process tries to ship a *different* feature
+        # against the same state directory. Without ship_lease this would
+        # proceed and race the other process's merge/production observation.
+        import multiprocessing
+
+        from openjarvis.wiz.proclock import ProcessLease
+
+        lease_path = tmp_path / "ship.lock"
+
+        def _hold_lease(path_str, ready_event):
+            lease = ProcessLease(path_str, owner="other-wiz-process")
+            with lease.acquire(timeout=5.0):
+                ready_event.set()
+                import time
+
+                time.sleep(1.0)
+
+        ready = multiprocessing.Event()
+        holder = multiprocessing.Process(
+            target=_hold_lease, args=(str(lease_path), ready)
+        )
+        holder.start()
+        try:
+            assert ready.wait(timeout=5.0), "other process never acquired the lease"
+
+            github = self.FakeGitHub()
+            pipeline, feature = self._ready(
+                tmp_path,
+                clock,
+                shipper=self._shipper(github),
+                postship=self.FakePostShip(verified=True),
+            )
+            pipeline.ship_lease = ProcessLease(lease_path, owner="this-process")
+            pipeline.ship_lease_timeout = 0.3
+
+            shipped = pipeline.ship(feature.id)
+
+            # Refused exactly like any other ship_refused reason: left READY,
+            # GitHub was never touched, nothing was corrupted or guessed at.
+            assert shipped.state is FeatureState.READY
+            assert github.merge_calls == []
+            refusals = [
+                e
+                for e in pipeline.journal.tail(50)
+                if e.kind == "feature.ship_refused"
+                and e.detail.get("feature_id") == feature.id
+            ]
+            assert refusals, "the lease timeout was not journalled as a refusal"
+            assert "other-wiz-process" in refusals[-1].reason
+        finally:
+            holder.join(timeout=5.0)
+            if holder.is_alive():  # pragma: no cover - safety net
+                holder.terminate()
+                holder.join(timeout=5.0)
+
+    def test_ship_lease_released_lets_the_next_call_through(self, tmp_path, clock):
+        from openjarvis.wiz.proclock import ProcessLease
+
+        github = self.FakeGitHub()
+        pipeline, feature = self._ready(
+            tmp_path,
+            clock,
+            shipper=self._shipper(github),
+            postship=self.FakePostShip(verified=True),
+        )
+        pipeline.ship_lease = ProcessLease(tmp_path / "ship.lock", owner="this-process")
+
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.COMPLETE
+        assert pipeline.ship_lease.current_holder() is None
+
     def test_a_retry_against_an_already_merged_pr_asks_a_person_not_a_stall(
         self, tmp_path, clock
     ):

@@ -72,6 +72,7 @@ from openjarvis.wiz.features.preview import PreviewObserver
 from openjarvis.wiz.features.profile import EngineeringProfile
 from openjarvis.wiz.features.provision import PROVISION_CHECK_NAME, provision_check
 from openjarvis.wiz.features.risk import classify, classify_paths
+from openjarvis.wiz.proclock import LeaseTimeout, ProcessLease
 from openjarvis.wiz.features.verification import (
     CriterionOutcome,
     FeatureVerifier,
@@ -175,6 +176,15 @@ class FeaturePipeline:
 
     #: Set when the pipeline pushed a branch and a preview is expected.
     push_remote: str = "origin"
+
+    #: Cross-process guard for :meth:`ship`, in addition to ``_ship_lock``.
+    #: ``None`` in tests that construct a bare pipeline (they run alone, so a
+    #: cross-process guard has nothing to protect against); the real Wiz
+    #: always wires one in — see :func:`~openjarvis.wiz.assemble.assemble`.
+    #: See :mod:`openjarvis.wiz.proclock` for why this is a kernel ``flock``
+    #: lease rather than a second, hand-rolled PID/TTL scheme.
+    ship_lease: Optional[ProcessLease] = None
+    ship_lease_timeout: float = 30.0
 
     def __post_init__(self) -> None:
         if self.provision_factory is None:
@@ -509,9 +519,36 @@ class FeaturePipeline:
         the process holding it — the next process starts unlocked, and a
         feature left mid-ship is exactly the ``MERGING``/``DEPLOYING`` restart
         case :meth:`_load` and the state machine already have to answer.
+
+        ``_ship_lock`` alone only protects against a second call *in this
+        process*. Wiz is meant to run as more than one process against the
+        same state directory, and two of those each holding their own
+        ``_ship_lock`` would not stop each other from merging at the same
+        moment — the exact race the paragraph above describes, just between
+        processes instead of threads. When ``self.ship_lease`` is configured
+        (the real deployment always sets one; see
+        :mod:`openjarvis.wiz.proclock`), it is acquired *outside*
+        ``_ship_lock`` and held for the same critical section, so a second
+        process blocks — and eventually refuses with a named holder, never
+        silently proceeds — while this one is shipping anything at all. A
+        refusal here behaves exactly like any other ``ship_refused``: the
+        feature is left ``READY``, to be tried again.
         """
         with self._ship_lock:
-            return self._ship_locked(feature_id, operator_approved=operator_approved)
+            if self.ship_lease is None:
+                return self._ship_locked(feature_id, operator_approved=operator_approved)
+            try:
+                with self.ship_lease.acquire(
+                    timeout=self.ship_lease_timeout,
+                    reason=f"shipping {feature_id}",
+                ):
+                    return self._ship_locked(
+                        feature_id, operator_approved=operator_approved
+                    )
+            except LeaseTimeout as exc:
+                feature = self._load(feature_id)
+                self._record(feature, "feature.ship_refused", str(exc))
+                return feature
 
     def _ship_locked(
         self, feature_id: str, *, operator_approved: bool = False
