@@ -605,6 +605,54 @@ class FeatureRequest:
         self.state = FeatureState.BUILDING
         self.updated_at = at
 
+    def resume_base_refresh_from_ready(self, *, at: str, reason: str) -> None:
+        """Reopen a ``READY`` feature into ``TESTING`` to re-verify its
+        existing commit against a base branch that has moved since.
+
+        Not a ``resume_*from_human_required`` sibling: ``ship()``'s
+        ``require_base_unmoved`` refusal does not transition state at all
+        (see :meth:`~.pipeline.FeaturePipeline._ship_locked` — a refused
+        ship leaves the feature exactly ``READY``), so this is the one
+        primitive in the family that leaves ``READY`` instead of
+        ``HUMAN_REQUIRED``. Found on FEAT-00031: a feature can sit
+        genuinely ``READY`` — every automated and manual criterion already
+        satisfied — while ``main`` moves underneath it, with no existing
+        way back into the pipeline's own re-verification machinery at all.
+
+        Deliberately repeatable, unlike
+        :meth:`resume_for_owner_authorized_rebuild_from_human_required`'s
+        one-use guard: a base that moves again after one refresh is exactly
+        as real a reason to refresh again, not a standing loophole —
+        ``ship()``'s own gates, re-evaluated fresh every time, are what
+        actually decide whether shipping is safe, not how many times this
+        was called.
+
+        ``TESTING`` is the same step :meth:`resume_deploy_from_human_required`
+        already re-enters for the same reason (re-run the real, deterministic
+        gates rather than trust stale evidence) — the caller's job, not this
+        method's, is to have actually produced a new verified commit (a real
+        merge or fast-forward against current main, never a discard of the
+        existing one) and pointed ``attempts[-1].commit_sha`` /
+        :attr:`base_sha` at it *before* calling this, so the re-entered
+        ``TESTING`` step verifies the real thing rather than a stale record.
+        """
+        if self.state is not FeatureState.READY:
+            raise InvalidFeatureTransition(
+                f"resume_base_refresh_from_ready called from {self.state.value}, "
+                "not READY"
+            )
+        self.history.append(
+            {
+                "at": at,
+                "from": self.state.value,
+                "to": FeatureState.TESTING.value,
+                "reason": reason,
+                "resumed": True,
+            }
+        )
+        self.state = FeatureState.TESTING
+        self.updated_at = at
+
     def next_attempt(self, *, at: str, hypothesis: str = "") -> FeatureAttempt:
         attempt = FeatureAttempt(
             number=len(self.attempts) + 1, started_at=at, hypothesis=hypothesis

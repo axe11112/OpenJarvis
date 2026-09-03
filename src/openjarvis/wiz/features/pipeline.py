@@ -65,6 +65,7 @@ from openjarvis.wiz.features.model import (
     FeatureAttempt,
     FeatureRequest,
     FeatureState,
+    InvalidFeatureTransition,
     Priority,
 )
 from openjarvis.wiz.features.postship import complete as _complete_postship
@@ -469,6 +470,161 @@ class FeaturePipeline:
         feature.metadata["ship_manual_approval_token"] = approval.token
         self.store.save(feature)
         self._record(feature, "feature.manual_acceptance_approved", reason[:1000])
+        return feature
+
+    def reverify_against_current_base(
+        self, feature_id: str, *, expected_head_sha: str, reason: str
+    ) -> FeatureRequest:
+        """Re-verify a READY feature's existing commit against a base
+        branch that has moved since it was last verified.
+
+        The primitive :meth:`ship`'s own ``require_base_unmoved`` refusal
+        has no other way back into: that gate never transitions state (a
+        refused ship leaves the feature exactly ``READY`` —
+        see :meth:`_ship_locked`), so a feature can sit genuinely READY,
+        every automated and manual criterion already satisfied, while the
+        base branch moves underneath it with no existing lifecycle path
+        back to re-verification at all. Found on FEAT-00031.
+
+        Never rebuilds and never calls the coding engine — the existing
+        commit is reconciled with the current base by a real, mechanical
+        ``git merge`` (never a rebase, never ``--force`` anything), in a
+        freshly checked-out copy of the *same* branch (the feature's own
+        worktree is routinely torn down once it reaches READY; this
+        reconnects to the real, already-pushed history rather than
+        inventing a new one). A synthetic, in-memory "as if merged" result
+        was deliberately rejected as a model: a Vercel Preview can only
+        ever be built from a real, pushed commit, so anything short of a
+        real merge commit could never actually satisfy the "fresh exact
+        Preview SHA" requirement the rest of this pipeline already enforces
+        everywhere else.
+
+        A genuine conflict stops the feature at ``HUMAN_REQUIRED`` with the
+        exact conflicting files named — this method never attempts
+        product-level conflict resolution itself, mechanical or otherwise;
+        that decision belongs to a person or an explicit follow-up, not to
+        this primitive.
+
+        On success, every existing SHA-bound guarantee in this pipeline
+        does the rest without any special-casing here: the new commit
+        becomes ``attempts[-1].commit_sha``, the stale
+        ``manual_acceptance`` record is dropped (its own fingerprint would
+        refuse to match the new SHA regardless), and the feature re-enters
+        the same ``TESTING`` step :meth:`reopen_for_deploy` already uses —
+        so gates, the Preview, and browser acceptance are all re-run for
+        real, fresh, against the exact new commit. Repeatable: a base that
+        moves again after one refresh is exactly as real a reason to
+        refresh again, not a standing loophole — ``ship()``'s own gates,
+        evaluated fresh every time, are what actually decide whether
+        shipping is safe.
+
+        Does not spend a ``BUILDING`` attempt and does not touch
+        ``attempts_used``: this is the *same* attempt, its recorded commit
+        advancing to reflect a real, mechanical reconciliation, not a new
+        one.
+        """
+        feature = self._load(feature_id)
+        if feature.state is not FeatureState.READY:
+            raise InvalidFeatureTransition(
+                "reverify_against_current_base needs a READY feature, not "
+                f"{feature.state.value}"
+            )
+        actual_head = feature.attempts[-1].commit_sha if feature.attempts else ""
+        if actual_head != expected_head_sha:
+            raise InvalidFeatureTransition(
+                f"{feature_id}'s recorded head is {actual_head[:12] or '(none)'}, "
+                f"not the expected {expected_head_sha[:12]} — refusing to act "
+                "on a stale assumption"
+            )
+        if not feature.pr_number or self.shipper is None:
+            raise InvalidFeatureTransition(
+                f"{feature_id} has no pull request to reconcile against"
+            )
+
+        pr = self.shipper.github.get_pull_request(feature.pr_number)
+        pr_head = str(pr.get("head_sha", ""))
+        if pr_head != expected_head_sha:
+            raise InvalidFeatureTransition(
+                f"PR #{feature.pr_number}'s head ({pr_head[:12] or 'unknown'}) "
+                f"no longer matches the expected commit ({expected_head_sha[:12]})"
+            )
+        current_base = str(pr.get("base_sha", ""))
+        if not current_base:
+            raise InvalidFeatureTransition(
+                f"could not read PR #{feature.pr_number}'s current base"
+            )
+
+        if current_base == feature.base_sha:
+            # Nothing actually moved (or something else already reconciled
+            # it) — ship() should simply be retried as-is.
+            self._record(
+                feature,
+                "feature.base_refresh_not_needed",
+                f"base is still {current_base[:12]}; nothing to reconcile",
+            )
+            return feature
+
+        worktree = self.workspace.checkout_existing(
+            feature.id, title=feature.title, branch=feature.branch
+        )
+
+        base_branch = self.profile.base_branch or "main"
+        outcome = self.workspace.merge_base(worktree, base_branch=base_branch)
+        if outcome.merged:
+            # checkout_existing() resolved base_commit to the pre-merge
+            # branch tip (there was no base to diff against yet at that
+            # point). Every downstream diff/secret-scan/changed-files call
+            # reads worktree.base_commit, and what they must show from here
+            # on is "what would this PR add if merged now" — exactly what
+            # diffing against the new current base gives, and exactly what
+            # GitHub's own PR diff view already shows for the same PR.
+            worktree.base_commit = current_base
+        self._worktrees[feature.id] = worktree
+        if not outcome.merged:
+            feature.transition(
+                FeatureState.HUMAN_REQUIRED,
+                at=self.clock(),
+                reason=(
+                    "the base branch moved and could not be mechanically "
+                    "reconciled — conflicting files: "
+                    f"{', '.join(outcome.conflicting_files) or 'unknown'}"
+                ),
+            )
+            self.store.save(feature)
+            self._record(
+                feature,
+                "feature.base_refresh_conflict",
+                (
+                    f"conflicting files: {', '.join(outcome.conflicting_files)}\n"
+                    f"{outcome.error}"
+                )[:1000],
+            )
+            return feature
+
+        self.workspace.push(worktree, remote=self.push_remote)
+
+        attempt = feature.attempts[-1]
+        attempt.commit_sha = outcome.new_sha
+        attempt.succeeded = False  # not yet — has to be re-verified
+        feature.base_sha = current_base
+        feature.worktree = worktree.path
+        # Bound to the old SHA by its own fingerprint, and would refuse to
+        # redeem against the new one regardless — dropped explicitly anyway,
+        # so a reader of the stored record never mistakes it for still valid.
+        feature.metadata.pop("manual_acceptance", None)
+
+        feature.resume_base_refresh_from_ready(at=self.clock(), reason=reason[:300])
+        self.store.save(feature)
+        self._record(
+            feature,
+            "feature.base_refreshed",
+            (
+                f"merged current base {current_base[:12]} into the existing "
+                f"commit; new head {outcome.new_sha[:12]}. {reason}"
+            )[:1000],
+        )
+        if self.queue is not None:
+            self.queue.submit(feature)
         return feature
 
     def ship(

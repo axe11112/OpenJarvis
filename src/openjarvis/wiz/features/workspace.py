@@ -27,7 +27,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from openjarvis.reliability.workspace import RepairWorkspace, WorkspaceError, Worktree
+from openjarvis.reliability.workspace import (
+    MergeOutcome,
+    RepairWorkspace,
+    WorkspaceError,
+    Worktree,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +151,37 @@ class FeatureWorkspace:
         self._assert_safe(Path(worktree.path))
         logger.info(
             "prepared feature worktree for %s: %s @ %s",
+            feature_id,
+            worktree.branch,
+            worktree.base_commit[:12],
+        )
+        return worktree
+
+    def checkout_existing(self, feature_id: str, *, title: str = "", branch: str) -> Worktree:
+        """Check out an existing, already-pushed feature branch fresh.
+
+        For re-verifying a feature whose own worktree was already torn
+        down (routine cleanup once it reached READY) against a base branch
+        that has since moved — see
+        :meth:`~openjarvis.wiz.features.pipeline.FeaturePipeline.
+        reverify_against_current_base`. Never creates a new branch;
+        refuses (via the underlying git fetch) if *branch* does not
+        already exist on origin.
+        """
+        if not feature_id:
+            raise WorkspaceError("a feature id is required")
+        self.check_root()
+
+        name = self.workspace_name(feature_id, title)
+        target = Path(self.root) / name
+        self._assert_safe(target)
+
+        self._forget_stale_worktrees()
+        worktree = self._inner.checkout_existing(name, branch=branch)
+
+        self._assert_safe(Path(worktree.path))
+        logger.info(
+            "checked out existing feature worktree for %s: %s @ %s",
             feature_id,
             worktree.branch,
             worktree.base_commit[:12],
@@ -276,6 +312,9 @@ class FeatureWorkspace:
 
     def head_sha(self, worktree: Worktree) -> str:
         return self._inner.head_sha(worktree)
+
+    def merge_base(self, worktree: Worktree, *, base_branch: str) -> MergeOutcome:
+        return self._inner.merge_base(worktree, base_branch=base_branch)
 
     def push(self, worktree: Worktree, *, remote: str = "origin") -> None:
         self._inner.push(worktree, remote=remote)
