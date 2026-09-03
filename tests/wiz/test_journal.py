@@ -123,6 +123,65 @@ class TestTamperEvidence:
         assert broken_at == 3
 
 
+def _hammer_journal(path_str: str, kind: str, n: int, barrier) -> None:
+    journal = WizJournal(path_str)
+    barrier.wait()  # start all workers together, to maximise contention
+    for i in range(n):
+        journal.record(at=f"{kind}-{i}", kind=kind, reason=f"{kind} entry {i}")
+
+
+class TestCrossProcessSafety:
+    """A threading.Lock alone would let two OpenJarvis processes each read
+    the same tail and append the same sequence number. These prove the
+    kernel-level lease actually prevents that between real processes, not
+    just between threads in one."""
+
+    def test_two_processes_appending_at_once_produce_no_duplicate_sequence(
+        self, tmp_path
+    ):
+        import multiprocessing
+
+        path = tmp_path / "journal.jsonl"
+        n_per_worker = 15
+        barrier = multiprocessing.Barrier(3)
+        workers = [
+            multiprocessing.Process(
+                target=_hammer_journal, args=(str(path), f"worker-{i}", n_per_worker, barrier)
+            )
+            for i in range(3)
+        ]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(timeout=30)
+            assert not w.is_alive()
+            assert w.exitcode == 0
+
+        journal = WizJournal(path)
+        entries = journal.entries()
+        assert len(entries) == 3 * n_per_worker
+
+        sequences = [e.sequence for e in entries]
+        assert sorted(sequences) == list(range(1, len(entries) + 1)), (
+            "duplicate or skipped sequence numbers: two processes raced the "
+            "same tail read"
+        )
+        assert len(set(sequences)) == len(sequences)
+
+        intact, broken_at = journal.verify()
+        assert intact, f"chain broken at sequence {broken_at}"
+
+    def test_lease_file_sits_beside_the_journal_not_inside_it(self, tmp_path):
+        path = tmp_path / "journal.jsonl"
+        journal = WizJournal(path)
+        journal.record(at="t", kind="k", reason="r")
+        assert (tmp_path / "journal.jsonl.lock").exists()
+        # The lock file's bookkeeping content must never be mistaken for a
+        # journal entry by a naive reader of the directory.
+        entries = journal.entries()
+        assert len(entries) == 1
+
+
 class TestContents:
     def test_entries_carry_the_context_an_operator_needs(self, tmp_path):
         journal = _journal(tmp_path)
