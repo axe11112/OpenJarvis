@@ -123,14 +123,27 @@ class FeatureOwnerNotifier:
             previous = entries.get(key)
             if previous is not None and previous.get("digest") == digest:
                 return False  # already told them exactly this
+
+            # The ledger is only written *after* send() succeeds. Recording
+            # first and sending second would mean a single transient send
+            # failure (Telegram down, a network blip) permanently suppresses
+            # that outcome — the digest is already on disk, so every retry
+            # sees "already told them" and never tries again. For a COMPLETE
+            # or HUMAN_REQUIRED message, silently losing it forever is far
+            # worse than the alternative failure mode this ordering accepts:
+            # send() succeeding but the ledger write failing (a crash between
+            # the two, or a full disk) can cause one duplicate resend on the
+            # next attempt. send() stays inside the lock so a second,
+            # concurrent notify() for the same (feature, digest) still sees
+            # this one as pending and does not also send.
+            try:
+                self.send(text)
+            except Exception:  # noqa: BLE001 - a failed send must not break shipping
+                logger.exception("could not notify the owner about %s", key)
+                return False
+
             entries[key] = {"kind": kind, "digest": digest}
             self._save(entries)
-
-        try:
-            self.send(text)
-        except Exception:  # noqa: BLE001 - a failed send must not break shipping
-            logger.exception("could not notify the owner about %s", key)
-            return False
         return True
 
     def _success_text(self, feature: Any) -> str:

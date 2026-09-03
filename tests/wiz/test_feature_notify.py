@@ -176,3 +176,64 @@ class TestFailureIsolation:
         )
         assert not sent
         assert recorder.sent == []
+
+    def test_a_transient_send_failure_does_not_permanently_suppress_it(
+        self, tmp_path
+    ):
+        # The ledger must not record "told them" before the send is actually
+        # confirmed - otherwise a single flaky send (Telegram down for a
+        # moment) marks the digest as delivered forever, and a COMPLETE or
+        # HUMAN_REQUIRED message is lost with no way to recover it short of
+        # the wording changing.
+        ledger_path = tmp_path / "notify_ledger.json"
+        failing = Recorder(fail=True)
+        notifier = FeatureOwnerNotifier(send=failing, ledger_path=ledger_path)
+
+        first_attempt = notifier.notify(
+            FakeFeature(), kind=SUCCESS_KIND, reason="production agrees"
+        )
+        assert not first_attempt
+        assert failing.sent == []
+        assert not ledger_path.exists() or ledger_path.read_text().strip() in ("", "{}")
+
+        # The underlying transport recovers (retried by whatever drives this
+        # notifier - a later pipeline step, a restart). The exact same
+        # outcome must still be deliverable.
+        working = Recorder(fail=False)
+        notifier.send = working
+        retried = notifier.notify(
+            FakeFeature(), kind=SUCCESS_KIND, reason="production agrees"
+        )
+        assert retried
+        assert len(working.sent) == 1
+
+        # And now that it has actually gone out, it is deduplicated normally.
+        third_attempt = notifier.notify(
+            FakeFeature(), kind=SUCCESS_KIND, reason="production agrees"
+        )
+        assert not third_attempt
+        assert len(working.sent) == 1
+
+    def test_concurrent_notifiers_never_double_send_the_same_outcome(self, tmp_path):
+        # send() runs inside the lock precisely so this holds: two notify()
+        # calls racing for the same (feature, digest) must not both pass the
+        # dedup check and both send.
+        import threading
+
+        ledger_path = tmp_path / "notify_ledger.json"
+        recorder = Recorder()
+        notifier = FeatureOwnerNotifier(send=recorder, ledger_path=ledger_path)
+
+        barrier = threading.Barrier(5)
+
+        def fire():
+            barrier.wait()
+            notifier.notify(FakeFeature(), kind=SUCCESS_KIND, reason="production agrees")
+
+        threads = [threading.Thread(target=fire) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        assert len(recorder.sent) == 1
