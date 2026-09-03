@@ -475,8 +475,18 @@ class FeaturePipeline:
     def reverify_against_current_base(
         self, feature_id: str, *, expected_head_sha: str, reason: str
     ) -> FeatureRequest:
-        """Re-verify a READY feature's existing commit against a base
-        branch that has moved since it was last verified.
+        """Re-verify a READY (or base-refresh-stalled HUMAN_REQUIRED)
+        feature's existing commit against a base branch that has moved
+        since it was last verified.
+
+        HUMAN_REQUIRED is accepted too because a base-refresh attempt can
+        itself exhaust automated attempts against an intermediate base and
+        stop there while the base moves *again* in the meantime — see
+        :meth:`~openjarvis.wiz.features.model.FeatureRequest.resume_base_refresh_from_human_required`.
+        Safe from either entry state for the same reason: this method never
+        calls the coding engine and never spends a ``BUILDING`` attempt, so
+        the worst case is an identical re-failure with fresh evidence, not a
+        bypassed gate.
 
         The primitive :meth:`ship`'s own ``require_base_unmoved`` refusal
         has no other way back into: that gate never transitions state (a
@@ -524,11 +534,12 @@ class FeaturePipeline:
         one.
         """
         feature = self._load(feature_id)
-        if feature.state is not FeatureState.READY:
+        if feature.state not in (FeatureState.READY, FeatureState.HUMAN_REQUIRED):
             raise InvalidFeatureTransition(
-                "reverify_against_current_base needs a READY feature, not "
-                f"{feature.state.value}"
+                "reverify_against_current_base needs a READY or HUMAN_REQUIRED "
+                f"feature, not {feature.state.value}"
             )
+        entry_state = feature.state
         actual_head = feature.attempts[-1].commit_sha if feature.attempts else ""
         if actual_head != expected_head_sha:
             raise InvalidFeatureTransition(
@@ -581,15 +592,38 @@ class FeaturePipeline:
             worktree.base_commit = current_base
         self._worktrees[feature.id] = worktree
         if not outcome.merged:
-            feature.transition(
-                FeatureState.HUMAN_REQUIRED,
-                at=self.clock(),
-                reason=(
-                    "the base branch moved and could not be mechanically "
-                    "reconciled — conflicting files: "
-                    f"{', '.join(outcome.conflicting_files) or 'unknown'}"
-                ),
+            conflict_reason = (
+                "the base branch moved and could not be mechanically "
+                "reconciled — conflicting files: "
+                f"{', '.join(outcome.conflicting_files) or 'unknown'}"
             )
+            if entry_state is FeatureState.HUMAN_REQUIRED:
+                # Already there: HUMAN_REQUIRED -> HUMAN_REQUIRED is not a
+                # legal transition (it is documented and tested to progress
+                # nowhere on its own), so this appends the new conflict's
+                # reason to history directly rather than through
+                # transition()'s legality check — a reader of the history
+                # still sees why this call stopped, the same as the READY
+                # entry path leaves behind, without pretending a state
+                # change happened (the same pattern _retry_or_stop uses for
+                # BUILDING -> BUILDING).
+                at = self.clock()
+                feature.history.append(
+                    {
+                        "at": at,
+                        "from": FeatureState.HUMAN_REQUIRED.value,
+                        "to": FeatureState.HUMAN_REQUIRED.value,
+                        "reason": conflict_reason,
+                        "resumed": True,
+                    }
+                )
+                feature.updated_at = at
+            else:
+                feature.transition(
+                    FeatureState.HUMAN_REQUIRED,
+                    at=self.clock(),
+                    reason=conflict_reason,
+                )
             self.store.save(feature)
             self._record(
                 feature,
@@ -613,7 +647,12 @@ class FeaturePipeline:
         # so a reader of the stored record never mistakes it for still valid.
         feature.metadata.pop("manual_acceptance", None)
 
-        feature.resume_base_refresh_from_ready(at=self.clock(), reason=reason[:300])
+        if entry_state is FeatureState.HUMAN_REQUIRED:
+            feature.resume_base_refresh_from_human_required(
+                at=self.clock(), reason=reason[:300]
+            )
+        else:
+            feature.resume_base_refresh_from_ready(at=self.clock(), reason=reason[:300])
         self.store.save(feature)
         self._record(
             feature,

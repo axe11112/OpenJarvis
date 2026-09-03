@@ -653,6 +653,48 @@ class FeatureRequest:
         self.state = FeatureState.TESTING
         self.updated_at = at
 
+    def resume_base_refresh_from_human_required(self, *, at: str, reason: str) -> None:
+        """The ``HUMAN_REQUIRED`` sibling of :meth:`resume_base_refresh_from_ready`.
+
+        Found immediately after that method shipped: a base-refresh attempt
+        can itself run out of automated attempts against an *intermediate*
+        base and stop at ``HUMAN_REQUIRED``, while the base moves again in
+        the meantime — as it did for FEAT-00031, where the intermediate
+        failure (a dependency bump breaking typecheck) was independently
+        fixed on a *later* main than the one this feature had tried against.
+        Without this, that feature has no way back into re-verification at
+        all: :meth:`resume_base_refresh_from_ready` refuses anything but
+        ``READY``, and every other ``resume_*_from_human_required`` sibling
+        either grants a fresh Claude session or narrates a generic "reopened
+        by the operator" — neither of which is what re-trying the same,
+        already-committed diff against a newer base is.
+
+        Safe to allow from here for the same reason
+        :meth:`resume_base_refresh_from_ready` is safe to call repeatedly:
+        this method itself never invokes Claude and never spends a
+        ``BUILDING`` attempt, so the worst case is an identical re-failure
+        with fresh evidence, not a bypassed gate. The caller carries the
+        same responsibility either way — produce a real merge against
+        current main and point ``attempts[-1].commit_sha``/:attr:`base_sha`
+        at it before calling this.
+        """
+        if self.state is not FeatureState.HUMAN_REQUIRED:
+            raise InvalidFeatureTransition(
+                "resume_base_refresh_from_human_required called from "
+                f"{self.state.value}, not HUMAN_REQUIRED"
+            )
+        self.history.append(
+            {
+                "at": at,
+                "from": self.state.value,
+                "to": FeatureState.TESTING.value,
+                "reason": reason,
+                "resumed": True,
+            }
+        )
+        self.state = FeatureState.TESTING
+        self.updated_at = at
+
     def next_attempt(self, *, at: str, hypothesis: str = "") -> FeatureAttempt:
         attempt = FeatureAttempt(
             number=len(self.attempts) + 1, started_at=at, hypothesis=hypothesis

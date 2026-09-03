@@ -2635,6 +2635,8 @@ class TestReverifyAgainstCurrentBase:
     OLD_BASE = "base1234" + "0" * 32  # matches FakeWorkspace.create()'s default
     NEW_BASE = "newbase1" + "0" * 32
     MERGED_SHA = "merged01" + "0" * 32
+    NEW_BASE_2 = "newbase2" + "0" * 32
+    MERGED_SHA_2 = "merged02" + "0" * 32
 
     class FakeGitHub(TestShip.FakeGitHub):
         """Unlike TestShip.FakeGitHub, base_sha is mutable per test/per
@@ -2668,11 +2670,17 @@ class TestReverifyAgainstCurrentBase:
             ),
         )
 
-    def _ready(self, tmp_path, clock, *, github=None, workspace=None):
+    def _ready(self, tmp_path, clock, *, github=None, workspace=None, max_attempts=3):
         github = github or self.FakeGitHub()
         workspace = workspace or FakeWorkspace(tmp_path)
         engineer = ScriptedEngineer()
-        pipeline = build_pipeline(tmp_path, clock, workspace=workspace, engineer=engineer)
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            workspace=workspace,
+            engineer=engineer,
+            max_attempts=max_attempts,
+        )
         pipeline.shipper = self._shipper(github)
         pipeline.postship = TestShip.FakePostShip(verified=True)
         submitted = pipeline.submit(REQUEST, actor=operator_actor())
@@ -2863,6 +2871,143 @@ class TestReverifyAgainstCurrentBase:
         # from reverify_against_current_base's merge push -- both always to
         # "origin" for the feature branch, never main.
         assert workspace.pushes == ["origin", "origin"]
+
+    def test_reentry_from_human_required_after_exhausted_attempts_reverifies_cleanly(
+        self, tmp_path, clock
+    ):
+        """Found live on FEAT-00031: a base-refresh's own re-verification can
+        exhaust attempts against an *intermediate* base and stop at
+        HUMAN_REQUIRED while the base moves again in the meantime -- here,
+        because a later commit on main happened to also fix whatever the
+        check suite was failing on. Re-entry must work with no Engineer
+        session and no new attempt spent, exactly like the READY path.
+        """
+        github = self.FakeGitHub(base_sha=self.NEW_BASE)
+        failing_suite = FakeSuite([FakeCheckResult(passed=False, summary="still broken")])
+        workspace = FakeWorkspace(tmp_path)
+        # Attempts already exhausted by the time reverify runs, exactly as
+        # they were for real on FEAT-00031 -- so the post-reverify TESTING
+        # failure stops immediately (_retry_or_stop's exhausted-attempts
+        # check fires on the very first failure) rather than spending fresh
+        # BUILDING retries whose own attempt objects would never reach the
+        # commit-assignment code and so would carry no commit_sha at all.
+        pipeline, feature, github, workspace, engineer = self._ready(
+            tmp_path, clock, github=github, workspace=workspace, max_attempts=1
+        )
+        workspace.merge_outcome = MergeOutcome(merged=True, new_sha=self.MERGED_SHA)
+        pipeline.check_suite_factory = lambda profile: failing_suite
+
+        pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=self.HEAD_SHA, reason="base moved"
+        )
+        exhausted = pipeline.run(feature.id)
+        assert exhausted.state is FeatureState.HUMAN_REQUIRED
+        exhausted_head = exhausted.attempts[-1].commit_sha
+        assert exhausted_head == self.MERGED_SHA
+        build_calls_before = len(engineer.build_calls)
+
+        # The base moves again, and this time reconciling it also happens to
+        # carry in whatever fixed the check suite (matching FEAT-00031: a
+        # later main commit independently fixed the lucide-react break).
+        # The first reverify's merge was actually pushed, so the PR's real
+        # head moved too.
+        github.head_sha = exhausted_head
+        github.base_sha = self.NEW_BASE_2
+        fixed_suite = FakeSuite([FakeCheckResult(passed=True)])
+        pipeline.check_suite_factory = lambda profile: fixed_suite
+        workspace.merge_outcome = MergeOutcome(merged=True, new_sha=self.MERGED_SHA_2)
+
+        refreshed = pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=exhausted_head, reason="second move, fix landed"
+        )
+        assert refreshed.state is FeatureState.TESTING
+        assert refreshed.attempts[-1].commit_sha == self.MERGED_SHA_2
+        assert refreshed.base_sha == self.NEW_BASE_2
+        assert len(engineer.build_calls) == build_calls_before  # no new session
+
+        # Same fake-vs-real-git subtlety as the READY-entry tests: the merge
+        # already landed and was pushed, so the worktree is clean going into
+        # this run, and every double consulted elsewhere in the pipeline
+        # needs to agree the merged commit is now the one that exists.
+        workspace.changes_present = False
+        workspace.commit_sha = self.MERGED_SHA_2
+        pipeline.preview.vercel.commit_sha = self.MERGED_SHA_2
+        github.head_sha = self.MERGED_SHA_2
+
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert result.attempts[-1].commit_sha == self.MERGED_SHA_2
+        assert len(engineer.build_calls) == build_calls_before  # still none
+
+    def test_reentry_from_human_required_conflict_stays_human_required(
+        self, tmp_path, clock
+    ):
+        """A second base movement that genuinely conflicts, discovered while
+        already HUMAN_REQUIRED, must not crash on an illegal
+        HUMAN_REQUIRED -> HUMAN_REQUIRED self-transition -- it has to record
+        the new conflict and stay put, the same as _retry_or_stop does for
+        BUILDING -> BUILDING.
+        """
+        github = self.FakeGitHub(base_sha=self.NEW_BASE)
+        failing_suite = FakeSuite([FakeCheckResult(passed=False, summary="still broken")])
+        workspace = FakeWorkspace(tmp_path)
+        pipeline, feature, github, workspace, engineer = self._ready(
+            tmp_path, clock, github=github, workspace=workspace, max_attempts=1
+        )
+        workspace.merge_outcome = MergeOutcome(merged=True, new_sha=self.MERGED_SHA)
+        pipeline.check_suite_factory = lambda profile: failing_suite
+        pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=self.HEAD_SHA, reason="base moved"
+        )
+        exhausted = pipeline.run(feature.id)
+        assert exhausted.state is FeatureState.HUMAN_REQUIRED
+        exhausted_head = exhausted.attempts[-1].commit_sha
+        assert exhausted_head == self.MERGED_SHA
+
+        # The first reverify's merge was actually pushed, so the PR's real
+        # head moved too -- the fake has to track that, same as every other
+        # test here that pushes a second time.
+        github.head_sha = exhausted_head
+        github.base_sha = self.NEW_BASE_2
+        workspace.merge_outcome = MergeOutcome(
+            merged=False,
+            conflicting_files=["src/lib/language.ts"],
+            error="<<<<<<< HEAD",
+        )
+        result = pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=exhausted_head, reason="second move, real conflict"
+        )
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert "src/lib/language.ts" in result.history[-1]["reason"]
+        assert result.attempts[-1].commit_sha == exhausted_head  # unchanged
+
+    def test_reentry_from_human_required_works_even_when_original_stop_was_unrelated(
+        self, tmp_path, clock
+    ):
+        """Safe by construction, not by checking why the feature stopped:
+        this primitive never calls Engineer and never spends an attempt, so
+        re-entry from a HUMAN_REQUIRED reached for a completely unrelated
+        reason is harmless -- the worst case is a real, unrelated defect
+        surfacing again with fresh evidence, never a bypassed gate.
+        """
+        github = self.FakeGitHub(base_sha=self.OLD_BASE)
+        pipeline, feature, github, workspace, engineer = self._ready(
+            tmp_path, clock, github=github
+        )
+        # Reached HUMAN_REQUIRED for a reason with nothing to do with the
+        # base -- an ordinary owner cancellation, say.
+        feature.transition(
+            FeatureState.HUMAN_REQUIRED, at=clock(), reason="operator paused this for review"
+        )
+        pipeline.store.save(feature)
+
+        github.base_sha = self.NEW_BASE
+        workspace.merge_outcome = MergeOutcome(merged=True, new_sha=self.MERGED_SHA)
+        refreshed = pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=self.HEAD_SHA, reason="base moved"
+        )
+        assert refreshed.state is FeatureState.TESTING
+        assert refreshed.attempts[-1].commit_sha == self.MERGED_SHA
 
 
 class TestAutoShipIfEligible:
