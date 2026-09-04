@@ -3054,6 +3054,94 @@ class TestReverifyAgainstCurrentBase:
         assert refreshed.state is FeatureState.TESTING
         assert refreshed.attempts[-1].commit_sha == self.MERGED_SHA
 
+    def test_current_base_evidence_can_actually_ship_end_to_end(self, tmp_path, clock):
+        """The full real sequence, proven live shipping FEAT-00031: a
+        feature reaches READY with an outstanding VIEWPORT item, its base
+        moves, reverify_against_current_base() reconciles it and re-enters
+        TESTING, the manual acceptance (invalidated by the SHA change) is
+        reissued for the new SHA, and a fresh MEDIUM ship approval takes it
+        all the way to COMPLETE. Exercises both fixes together: base-refresh
+        re-entry and ship() accepting the durable manual-acceptance record
+        instead of re-redeeming an already-spent token.
+        """
+        github = self.FakeGitHub(base_sha=self.OLD_BASE)
+        browser = RealisticFakeBrowser()
+        approvals = ApprovalStore(clock=lambda: 0.0, ttl_seconds=900)
+        workspace = FakeWorkspace(tmp_path)
+        engineer = ScriptedEngineer()
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            workspace=workspace,
+            engineer=engineer,
+            browser=browser,
+            approvals=approvals,
+        )
+        # merge_medium_risk=False, matching real production config (wiz.json)
+        # -- the point of this test is that the one-off approval is what
+        # actually authorizes the merge, not a policy that would anyway.
+        pipeline.shipper = FeatureShipper(
+            policy=FeatureShippingPolicy(merge_medium_risk=False),
+            github=github,
+            authority=AuthorityPolicy(
+                grants={
+                    Channel.CONTROL_CENTER: frozenset(
+                        {Authority.PR_WRITE, Authority.PRODUCTION_CHANGE}
+                    )
+                }
+            ),
+        )
+        pipeline.postship = TestShip.FakePostShip(verified=True)
+
+        submitted = pipeline.submit(REQUEST, actor=operator_actor())
+        feature = pipeline.run(submitted.id)
+        assert feature.state is FeatureState.HUMAN_REQUIRED  # awaiting a person
+
+        pipeline.approve_manual_acceptance(feature.id, reason="checked the preview")
+        pipeline.reopen_for_deploy(feature.id, reason="manual acceptance approved")
+        feature = pipeline.run(feature.id)
+        assert feature.state is FeatureState.READY
+        assert feature.pr_number
+
+        # The base moves.
+        github.base_sha = self.NEW_BASE
+        workspace.merge_outcome = MergeOutcome(merged=True, new_sha=self.MERGED_SHA)
+        refreshed = pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=self.HEAD_SHA, reason="base moved"
+        )
+        assert refreshed.state is FeatureState.TESTING
+        assert "manual_acceptance" not in refreshed.metadata  # invalidated
+
+        workspace.changes_present = False
+        workspace.commit_sha = self.MERGED_SHA
+        pipeline.preview.vercel.commit_sha = self.MERGED_SHA
+        github.head_sha = self.MERGED_SHA
+        after_refresh = pipeline.run(feature.id)
+        assert after_refresh.state is FeatureState.HUMAN_REQUIRED  # needs reissue
+
+        # Reissue for the new SHA.
+        pipeline.approve_manual_acceptance(
+            feature.id, reason="checked the new preview for the reconciled commit"
+        )
+        pipeline.reopen_for_deploy(feature.id, reason="reissued after base refresh")
+        ready_again = pipeline.run(feature.id)
+        assert ready_again.state is FeatureState.READY
+        assert ready_again.attempts[-1].commit_sha == self.MERGED_SHA
+        assert ready_again.metadata["manual_acceptance"]["head_sha"] == self.MERGED_SHA
+
+        # One-off MEDIUM ship approval, bound to the reconciled SHA.
+        approval = approvals.issue(
+            capability="feature.ship",
+            subject=feature.id,
+            parameters={"risk": ready_again.risk, "head_sha": self.MERGED_SHA},
+        )
+        ready_again.metadata["ship_approval_token"] = approval.token
+        pipeline.store.save(ready_again)
+
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.COMPLETE
+        assert github.merge_calls
+
 
 class TestAutoShipIfEligible:
     """`auto_ship_if_eligible`: the only caller allowed to reach `ship` on its
