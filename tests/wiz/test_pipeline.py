@@ -2531,6 +2531,51 @@ class TestManualAcceptanceLifecycle:
 
         assert "ship_manual_approval_token" not in result.metadata
 
+    def test_a_feature_that_reached_ready_this_way_can_actually_be_shipped(
+        self, tmp_path, clock
+    ):
+        """Found live shipping FEAT-00031: reaching READY via
+        approve_manual_acceptance() consumes the ship_manual_approval_token
+        (by design -- see that method's docstring, "consumed the moment it
+        is used"). ship()'s own nothing_awaiting_a_person gate used to
+        re-check that same token, independently, every time -- so it always
+        found the token already spent and refused to ship, for every
+        feature this whole mechanism exists for. The fix: ship() checks the
+        durable feature.metadata["manual_acceptance"] record _finish()
+        already left behind instead of re-redeeming a spent token.
+        """
+        approvals = ApprovalStore(clock=lambda: 0.0, ttl_seconds=900)
+        pipeline, feature, browser = self._pipeline_with_unmeasured_viewport(
+            tmp_path, clock, approvals=approvals
+        )
+        assert feature.state is FeatureState.HUMAN_REQUIRED
+
+        pipeline.approve_manual_acceptance(
+            feature.id, reason="looked at the desktop and mobile preview, both clean"
+        )
+        github = TestShip.FakeGitHub()
+        pipeline.shipper = FeatureShipper(
+            policy=FeatureShippingPolicy(merge_medium_risk=True),
+            github=github,
+            authority=AuthorityPolicy(
+                grants={
+                    Channel.CONTROL_CENTER: frozenset(
+                        {Authority.PR_WRITE, Authority.PRODUCTION_CHANGE}
+                    )
+                }
+            ),
+        )
+        pipeline.postship = TestShip.FakePostShip(verified=True)
+        pipeline.reopen_for_deploy(feature.id, reason="manual acceptance approved")
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert "ship_manual_approval_token" not in result.metadata  # spent
+        assert result.metadata["manual_acceptance"]["owner_confirmed"] is True
+
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.COMPLETE
+        assert github.merge_calls
+
     def test_the_approval_is_consumed_the_journal_records_both_steps(
         self, tmp_path, clock
     ):

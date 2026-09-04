@@ -754,9 +754,18 @@ class FeaturePipeline:
 
         head_sha = str(pr.get("head_sha", ""))
         medium_risk_approved = self._medium_ship_approved(feature, head_sha=head_sha)
-        awaiting_items_approved = self._awaiting_items_approved(
+        # Either a durable record of the consent _finish already redeemed
+        # once reaching READY (the common case — see
+        # _manual_acceptance_still_valid's docstring for why re-redeeming
+        # the same token here always fails), or a fresh, independent
+        # ship-time approval (for a manual item that surfaced after READY
+        # without going back through _finish). Both are equally
+        # fingerprint-bound to this feature, this head SHA and this exact
+        # set of outstanding items; neither can stand in for the other's
+        # absence.
+        awaiting_items_approved = self._manual_acceptance_still_valid(
             feature, head_sha=head_sha
-        )
+        ) or self._awaiting_items_approved(feature, head_sha=head_sha)
 
         merge_result = self.shipper.merge_feature(
             feature,
@@ -1856,6 +1865,41 @@ class FeaturePipeline:
         feature.metadata["ship_manual_approved_head_sha"] = head_sha
         feature.metadata.pop("ship_manual_approval_token", None)
         return True
+
+    def _manual_acceptance_still_valid(
+        self, feature: FeatureRequest, *, head_sha: str
+    ) -> bool:
+        """Whether the feature's permanent manual-acceptance record still
+        covers exactly this head SHA and exactly today's outstanding items.
+
+        Not :meth:`_awaiting_items_approved`, and deliberately so: that
+        method *redeems* a single-use token, and :meth:`_finish` already
+        redeems it once, the moment a feature first reaches READY through
+        it — see the ``ship_manual_approval_token`` docstring there
+        ("consumed the moment it is used"). Found live shipping FEAT-00031:
+        calling that same method again from here, independently, always
+        found the token gone (spent reaching READY) and refused to ship
+        every feature that had ever needed a person to look at it, which
+        was every feature this whole mechanism exists for. What ``ship``
+        actually needs is not a second redemption but the same fact
+        :meth:`_finish` already recorded permanently in
+        ``feature.metadata["manual_acceptance"]``, still true for the
+        feature as it stands right now — the same commit (a changed head
+        SHA invalidates it, same as the token would have) and the same
+        exact set of outstanding items (a different set means the owner
+        never looked at *these* items).
+        """
+        record = feature.metadata.get("manual_acceptance")
+        if not record:
+            return False
+        if record.get("head_sha") != head_sha:
+            return False
+        outstanding = sorted(
+            (feature.metadata.get("verification") or {}).get("awaiting_a_person") or []
+        )
+        if not outstanding:
+            return False
+        return sorted(record.get("items") or []) == outstanding
 
     def _proposed_criteria(self, feature: FeatureRequest) -> Sequence[Criterion]:
         """Criteria the planning session suggested. Additive only."""
