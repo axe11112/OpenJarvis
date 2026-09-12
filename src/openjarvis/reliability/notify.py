@@ -741,8 +741,20 @@ class NotificationRouter:
 
         message = render_alert(incident, persona=self.persona)
         if self.critical_grace_seconds <= 0:
-            self._remember(incident)
-            return self.notify(message, severity=Severity.CRITICAL)
+            # Recorded only after the send actually succeeded. Recording first and
+            # sending second means one transient failure (Telegram down, a network
+            # blip) is written down as "told them", and _is_news then sees the
+            # entry on every retry and never tries again -- the owner is never told
+            # that this system needs them, permanently, because of a momentary
+            # blip. The opposite failure (the send succeeds, the ledger write does
+            # not) costs at most one duplicate message. For an escalation, a
+            # duplicate is an annoyance and a silence is the system quietly giving
+            # up. This is the same ordering, and the same trade, as
+            # FeatureOwnerNotifier on the Wiz side.
+            sent = self.notify(message, severity=Severity.CRITICAL)
+            if sent:
+                self._remember(incident)
+            return sent
 
         # Not recorded yet: a held alert has not been said. Recording here would
         # make an escalation that supersedes it look like a repeat and silence
@@ -863,12 +875,14 @@ class NotificationRouter:
         """Nothing superseded it, so the owner hears about it after all."""
         with self._alert_lock:
             self._deferred.pop(incident_id, None)
-        if incident is not None:
-            # Recorded only now, at the moment it is actually said. A held alert
-            # that was cancelled must leave no trace, or it would silence the
-            # escalation that replaced it.
+        # Recorded only now, at the moment it is actually said, and only if
+        # saying it worked. A held alert that was cancelled must leave no
+        # trace, or it would silence the escalation that replaced it -- and a
+        # held alert whose send failed must leave no trace either, for the same
+        # reason it must not elsewhere: the entry would suppress every retry.
+        sent = self.notify(message, severity=Severity.CRITICAL)
+        if sent and incident is not None:
             self._remember(incident)
-        self.notify(message, severity=Severity.CRITICAL)
 
     def _supersede(self, identity: str) -> bool:
         """Drop a held alert because a better message is going out instead.
@@ -1066,10 +1080,22 @@ class NotificationRouter:
         self._supersede(identity)
         if not self._is_news(incident, ask=ask):
             return False
-        self._remember(incident, ask=ask)
-        return self.notify(
+        # Recorded only after the send actually succeeded. Recording first and
+        # sending second means one transient failure (Telegram down, a network
+        # blip) is written down as "told them", and _is_news then sees the
+        # entry on every retry and never tries again -- the owner is never told
+        # that this system needs them, permanently, because of a momentary
+        # blip. The opposite failure (the send succeeds, the ledger write does
+        # not) costs at most one duplicate message. For an escalation, a
+        # duplicate is an annoyance and a silence is the system quietly giving
+        # up. This is the same ordering, and the same trade, as
+        # FeatureOwnerNotifier on the Wiz side.
+        sent = self.notify(
             render_ask(ask, persona=self.persona), severity=Severity.CRITICAL
         )
+        if sent:
+            self._remember(incident, ask=ask)
+        return sent
 
     def _record_ask(self, incident: Incident, ask: OwnerAsk) -> None:
         """Store the ask on the incident, so Control Center can show it.
@@ -1097,11 +1123,23 @@ class NotificationRouter:
         self._supersede(identity)
         if not self._is_news(incident):
             return False
-        self._remember(incident)
-        return self.notify(
+        # Recorded only after the send actually succeeded. Recording first and
+        # sending second means one transient failure (Telegram down, a network
+        # blip) is written down as "told them", and _is_news then sees the
+        # entry on every retry and never tries again -- the owner is never told
+        # that this system needs them, permanently, because of a momentary
+        # blip. The opposite failure (the send succeeds, the ledger write does
+        # not) costs at most one duplicate message. For an escalation, a
+        # duplicate is an annoyance and a silence is the system quietly giving
+        # up. This is the same ordering, and the same trade, as
+        # FeatureOwnerNotifier on the Wiz side.
+        sent = self.notify(
             render_rolled_back(incident, reason=reason, persona=self.persona),
             severity=Severity.CRITICAL,
         )
+        if sent:
+            self._remember(incident)
+        return sent
 
     def merge_attempt(
         self, incident: Incident, *, pr_number: int, head_sha: str, method: str

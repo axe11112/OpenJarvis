@@ -766,3 +766,110 @@ class TestProductionOutcomeMessages:
 
         assert len(notifier.sent) == 1
         assert notifier.sent[0].startswith("Sir, it's fixed.")
+
+
+class _FlakyNotifier(ConsoleNotifier):
+    """Fails the first ``fail_times`` sends, then behaves normally."""
+
+    def __init__(self, *, fail_times: int = 1) -> None:
+        super().__init__()
+        self._remaining = fail_times
+        self.attempts = 0
+
+    def send(self, message: str, *, severity: Severity = Severity.MEDIUM) -> bool:
+        self.attempts += 1
+        if self._remaining > 0:
+            self._remaining -= 1
+            return False
+        return super().send(message, severity=severity)
+
+
+class _RecordingLedger:
+    """The real ledger's contract, in memory: record once, suppress after."""
+
+    def __init__(self) -> None:
+        self.recorded: list = []
+
+    def should_notify(self, incident, *, ask=None) -> bool:
+        return incident.id not in self.recorded
+
+    def record(self, incident, *, ask=None) -> None:
+        self.recorded.append(incident.id)
+
+
+class TestAFailedSendIsNotRecordedAsTold:
+    """A transient send failure must not permanently silence an escalation.
+
+    The ledger was written before the send. One blip -- Telegram down for a
+    moment, a network hiccup -- was therefore recorded as "told them", and
+    _is_news saw that entry on every retry afterwards and never tried again.
+    The owner was never told this system needed them, permanently, because of a
+    momentary failure. This is the same defect, and the same fix, as
+    FeatureOwnerNotifier on the Wiz side (commit cfda657).
+    """
+
+    def _router(self, notifier, ledger, **kwargs):
+        _ManualTimer.created = []
+        return NotificationRouter(
+            notifier=notifier,
+            min_severity=Severity.LOW,
+            dedup_window_seconds=0,
+            clock=_FakeClock(),
+            scheduler=_ManualTimer,
+            ledger=ledger,
+            **kwargs,
+        )
+
+    def test_a_failed_escalation_is_retried_rather_than_swallowed(self):
+        notifier = _FlakyNotifier(fail_times=1)
+        ledger = _RecordingLedger()
+        router = self._router(notifier, ledger)
+        incident = _incident(severity=Severity.CRITICAL)
+
+        first = router.human_required(
+            incident, reason="repair is disabled", attempts=3, max_attempts=3
+        )
+        assert first is False, "the send failed, so this did not notify anyone"
+        assert ledger.recorded == [], (
+            "a failed send was written down as told; every retry will now be "
+            "suppressed and the owner will never learn this needs them"
+        )
+
+        second = router.human_required(
+            incident, reason="repair is disabled", attempts=3, max_attempts=3
+        )
+        assert second is True
+        assert notifier.sent, "the retry never reached the owner"
+        assert "I need your help" in notifier.sent[0]
+        assert ledger.recorded == [incident.id]
+
+    def test_a_successful_escalation_is_still_said_only_once(self):
+        """The other half: fixing the silence must not cause a repeat."""
+        notifier = _FlakyNotifier(fail_times=0)
+        ledger = _RecordingLedger()
+        router = self._router(notifier, ledger)
+        incident = _incident(severity=Severity.CRITICAL)
+
+        assert (
+            router.human_required(
+                incident, reason="repair is disabled", attempts=3, max_attempts=3
+            )
+            is True
+        )
+        router.human_required(
+            incident, reason="repair is disabled", attempts=3, max_attempts=3
+        )
+
+        assert len(notifier.sent) == 1, f"told twice: {notifier.sent}"
+        assert ledger.recorded == [incident.id]
+
+    def test_a_failed_rollback_notice_is_also_retried(self):
+        notifier = _FlakyNotifier(fail_times=1)
+        ledger = _RecordingLedger()
+        router = self._router(notifier, ledger)
+        incident = _incident(severity=Severity.CRITICAL)
+
+        assert router.rolled_back(incident, reason="production got worse") is False
+        assert ledger.recorded == []
+        assert router.rolled_back(incident, reason="production got worse") is True
+        assert notifier.sent
