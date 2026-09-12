@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from openjarvis.core.proclock import production_change_lease
 from openjarvis.wiz.approvals import ApprovalStore
 from openjarvis.wiz.features.acceptance import Viewport
 from openjarvis.wiz.features.engineer import ClaudeCodeEngineeringAgent
@@ -33,7 +34,6 @@ from openjarvis.wiz.features.queue import DevelopmentQueue
 from openjarvis.wiz.features.store import FeatureStore
 from openjarvis.wiz.features.workspace import FeatureWorkspace
 from openjarvis.wiz.memory import ProductMemory
-from openjarvis.wiz.proclock import ProcessLease
 from openjarvis.wiz.product import ProductVerbs
 from openjarvis.wiz.settings import SETTINGS_FILENAME, WizSettings, load_settings
 
@@ -113,9 +113,17 @@ def assemble(
         postship=_postship(config, profile, verifier),
         # Cross-process guard on top of the pipeline's own in-process
         # _ship_lock — see ProcessLease and FeaturePipeline.ship()'s
-        # docstring. Lives alongside the journal and feature DB, not inside
-        # the git checkout: it guards this machine's Wiz state, not the repo.
-        ship_lease=ProcessLease(root / "ship.lock", owner=f"wiz@{profile.name}"),
+        # docstring.
+        #
+        # This is the shared production-change lease at the config root, not a
+        # Wiz-private "ship.lock". Shipping a feature is not the only thing
+        # that changes production: the reliability repair loop merges to the
+        # same default branch, and a lease only Wiz took would have serialised
+        # Wiz against itself while leaving the more dangerous pairing — a
+        # feature ship and a repair merge, each then reading one shared
+        # production to judge its own change — completely unguarded. Same file,
+        # both callers. See openjarvis.core.proclock.production_change_lease.
+        ship_lease=production_change_lease(owner=f"wiz@{profile.name}"),
     )
 
     return ProductVerbs(

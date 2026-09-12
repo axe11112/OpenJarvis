@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
 
+from openjarvis.core.proclock import LeaseTimeout
 from openjarvis.reliability.briefing import (
     BriefingRefusedError,
     build_briefing,
@@ -225,6 +226,24 @@ class RepairLoop:
     #: Production URL to re-check against before handing an incident to a human.
     #: Empty disables the re-check, which is the previous behaviour.
     production_url: str = ""
+    #: The cross-process production-change lease, from
+    #: :func:`openjarvis.core.proclock.production_change_lease`. ``None`` — the
+    #: default, and what the tests use — keeps the previous behaviour of no
+    #: cross-process serialisation at all.
+    #:
+    #: The repair loop's concurrency guard in ``watch.py`` is a
+    #: ``threading.RLock``, which is correct within one process and worthless
+    #: between two. Nothing stopped a watcher merging a repair while a Wiz
+    #: shipper merged a feature, or a second watcher merging a second repair;
+    #: both then read one shared production to judge their own change, and
+    #: either could attribute the other's deployment to itself. This lease is
+    #: what makes "at most one production change at a time" true across
+    #: processes rather than merely within one.
+    production_lease: Any = None
+    #: How long to wait for :attr:`production_lease` before refusing. Bounded
+    #: on purpose: a repair that waits forever behind a stuck holder is an
+    #: outage for every incident behind it.
+    production_lease_timeout: float = 900.0
 
     def __post_init__(self) -> None:
         if self.checks is None:
@@ -619,21 +638,17 @@ class RepairLoop:
         # RESOLVED on the strength of a preview of a commit that no longer
         # exists. Nothing downstream could then tell a verified production from
         # an unexamined one.
-        merge_record = self._maybe_merge(incident, pull_request_url)
-        merged = bool(getattr(merge_record, "merged", False))
-
-        if merged:
-            # Live on the default branch, unproven in production. The incident
-            # is neither resolved nor failed until production says so.
-            self._transition(
-                incident,
-                IncidentState.MERGED,
-                f"merged at {str(getattr(merge_record, 'merge_commit_sha', ''))[:12]}; "
-                "production not yet verified",
-            )
-            return self._verify_production(
-                incident, attempt, verification, merge_record, pull_request_url, spec
-            )
+        # Merging and then reading production to judge the merge is one
+        # critical section, not two. Holding the lease only across the merge
+        # would still let a feature ship's deployment land between this merge
+        # and the production check that interprets it, and this incident would
+        # then be resolved or failed on somebody else's deploy. So the lease
+        # spans both, and is released only once production has been judged.
+        merge_outcome = self._merge_and_verify_production(
+            incident, attempt, verification, pull_request_url, spec
+        )
+        if merge_outcome is not None:
+            return merge_outcome
 
         # Not merged — refused by the gates, not configured, or no pull request.
         # The pull request is the deliverable, exactly as before.
@@ -805,6 +820,83 @@ class RepairLoop:
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("could not send the CRITICAL post-merge notification")
+
+    def _merge_and_verify_production(
+        self,
+        incident: Incident,
+        attempt: RepairAttempt,
+        verification: Any,
+        pull_request_url: str,
+        spec: ProbeSpec,
+    ) -> Optional[RepairOutcome]:
+        """Merge and then prove production, as one indivisible production change.
+
+        Returns the outcome when a merge landed, or ``None`` when nothing was
+        merged, so the caller falls through to its pull-request-is-the-
+        deliverable path exactly as before.
+
+        The whole body runs under the cross-process production-change lease
+        when one is configured. A caller that cannot get the lease does not
+        merge: it returns ``None``, which reads downstream as "not merged" —
+        the same safe direction :meth:`_maybe_merge` already takes for an
+        unknown outcome. The pull request still exists and the incident is
+        still repaired; the merge is simply someone's next attempt rather than
+        a coin flip against whoever else is changing production right now.
+        """
+        if self.production_lease is None:
+            return self._merge_and_verify_locked(
+                incident, attempt, verification, pull_request_url, spec
+            )
+        try:
+            with self.production_lease.acquire(
+                timeout=self.production_lease_timeout,
+                reason=f"repair merge for {incident.id}",
+            ):
+                return self._merge_and_verify_locked(
+                    incident, attempt, verification, pull_request_url, spec
+                )
+        except LeaseTimeout as exc:
+            # Not a repair failure and not a merge refusal by the gates: the
+            # production change could not be attempted at all. Said plainly,
+            # with the holder's identity, rather than recorded as a gate
+            # decision this loop never actually reached.
+            logger.warning("did not attempt the merge for %s: %s", incident.id, exc)
+            self._add_note(
+                incident,
+                "Merge deferred: another production change is in progress",
+                content=(
+                    f"{exc}\n\n"
+                    "The repair is verified and the pull request is ready. The "
+                    "merge was not attempted, so nothing landed on the default "
+                    "branch and nothing about production was concluded. It can "
+                    "be retried once the holder above is done."
+                ),
+            )
+            return None
+
+    def _merge_and_verify_locked(
+        self,
+        incident: Incident,
+        attempt: RepairAttempt,
+        verification: Any,
+        pull_request_url: str,
+        spec: ProbeSpec,
+    ) -> Optional[RepairOutcome]:
+        """The body of :meth:`_merge_and_verify_production`, lease already held."""
+        merge_record = self._maybe_merge(incident, pull_request_url)
+        if not bool(getattr(merge_record, "merged", False)):
+            return None
+        # Live on the default branch, unproven in production. The incident is
+        # neither resolved nor failed until production says so.
+        self._transition(
+            incident,
+            IncidentState.MERGED,
+            f"merged at {str(getattr(merge_record, 'merge_commit_sha', ''))[:12]}; "
+            "production not yet verified",
+        )
+        return self._verify_production(
+            incident, attempt, verification, merge_record, pull_request_url, spec
+        )
 
     def _maybe_merge(self, incident: Incident, pull_request_url: str) -> Any:
         """Hand a freshly opened pull request to the merge gates, if configured.

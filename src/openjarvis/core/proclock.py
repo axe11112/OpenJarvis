@@ -231,7 +231,9 @@ class ProcessLease:
             return None
 
 
-def production_change_lease(*, owner: str = "", root: Optional[Path] = None) -> "ProcessLease":
+def production_change_lease(
+    *, owner: str = "", root: Optional[Path] = None
+) -> "ProcessLease":
     """The one lease every production-changing operation must hold.
 
     Two subsystems can put a commit on the production default branch:
@@ -272,4 +274,6 @@ def production_change_lease(*, owner: str = "", root: Optional[Path] = None) -> 
         from openjarvis.core.paths import get_config_dir
 
         root = Path(get_config_dir())
-    return ProcessLease(Path(root) / PRODUCTION_CHANGE_LOCK, owner=owner or "production-change")
+    return ProcessLease(
+        Path(root) / PRODUCTION_CHANGE_LOCK, owner=owner or "production-change"
+    )

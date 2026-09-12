@@ -36,6 +36,7 @@ _STATE_STYLE = {
 
 class _DummyNotifier:
     """Bridge TelegramChannel to TelegramOwnerDoor.channel expectation."""
+
     def __init__(self, channel):
         self.channel = channel
 
@@ -410,6 +411,8 @@ def _build_supervised_monitor(config: Any, store: Any) -> tuple:
 
 def _build_repair_loop(config: Any, store: Any, sources: list) -> Any:
     """Build the repair loop, or ``None`` when repair is disabled."""
+    from openjarvis.core.proclock import production_change_lease
+
     rc = config.reliability
     if not rc.repair.enabled:
         return None
@@ -499,6 +502,12 @@ def _build_repair_loop(config: Any, store: Any, sources: list) -> Any:
         # So a fault that cleared while JARVIS was working on it is closed
         # rather than handed to a person. Empty disables the re-check.
         production_url=_resolve_production_url(config),
+        # The shared production-change lease -- the same file Wiz's feature
+        # shipper takes. Wired here rather than defaulted inside RepairLoop so
+        # that a bare RepairLoop in a test still has none, and so that the one
+        # place that decides where OpenJarvis state lives is the only place
+        # that resolves this path.
+        production_lease=production_change_lease(owner="reliability-repair"),
     )
 
 
@@ -813,10 +822,11 @@ def reliability_watch(once: bool, poll_interval: float) -> None:
         from openjarvis.channels.telegram import TelegramChannel
 
         telegram_channel = None
-        if (rc.notify.enabled and
-            getattr(rc.notify, "accept_owner_commands", False) and
-            rc.notify.channel == "telegram"):
-
+        if (
+            rc.notify.enabled
+            and getattr(rc.notify, "accept_owner_commands", False)
+            and rc.notify.channel == "telegram"
+        ):
             telegram_channel = TelegramChannel(
                 bot_token=config.channel.telegram.bot_token,
                 allowed_chat_ids=config.channel.telegram.allowed_chat_ids,

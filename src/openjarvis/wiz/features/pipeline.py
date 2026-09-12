@@ -43,6 +43,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from openjarvis.core.proclock import LeaseTimeout, ProcessLease
 from openjarvis.reliability.briefing import has_critical_secret
 from openjarvis.reliability.checks import CheckResult
 from openjarvis.wiz.approvals import ApprovalError, ApprovalStore
@@ -73,7 +74,6 @@ from openjarvis.wiz.features.preview import PreviewObserver
 from openjarvis.wiz.features.profile import EngineeringProfile
 from openjarvis.wiz.features.provision import PROVISION_CHECK_NAME, provision_check
 from openjarvis.wiz.features.risk import classify, classify_paths
-from openjarvis.wiz.proclock import LeaseTimeout, ProcessLease
 from openjarvis.wiz.features.verification import (
     CriterionOutcome,
     FeatureVerifier,
@@ -182,10 +182,26 @@ class FeaturePipeline:
     #: ``None`` in tests that construct a bare pipeline (they run alone, so a
     #: cross-process guard has nothing to protect against); the real Wiz
     #: always wires one in — see :func:`~openjarvis.wiz.assemble.assemble`.
-    #: See :mod:`openjarvis.wiz.proclock` for why this is a kernel ``flock``
+    #: See :mod:`openjarvis.core.proclock` for why this is a kernel ``flock``
     #: lease rather than a second, hand-rolled PID/TTL scheme.
+    #:
+    #: The real wiring passes the shared *production-change* lease, which the
+    #: reliability repair loop takes too — not a Wiz-private lock. What must be
+    #: serialised is changing production, and Wiz is only one of the two things
+    #: that does.
     ship_lease: Optional[ProcessLease] = None
-    ship_lease_timeout: float = 30.0
+    #: How long to wait for :attr:`ship_lease` before refusing the ship.
+    #:
+    #: Generous, because of what now shares this lease. Thirty seconds was
+    #: right for a lock only another Wiz ship could hold; the repair loop holds
+    #: it across its merge *and* its post-merge production verification, which
+    #: legitimately waits on a real deployment for minutes. Left at thirty this
+    #: would have turned "a repair is deploying" into "the ship was refused" —
+    #: broadening the lease to cover the real hazard while making the common
+    #: case fail. Still bounded: waiting forever behind a stuck holder is an
+    #: outage for every feature behind it, and a refusal here costs nothing
+    #: (the feature stays READY and the same call can be made again).
+    ship_lease_timeout: float = 900.0
 
     def __post_init__(self) -> None:
         if self.provision_factory is None:
@@ -323,15 +339,15 @@ class FeaturePipeline:
         )
         self.store.save(feature)
         self._record(
-            feature, "feature.reopened_for_planning", reason or "reopened by the operator"
+            feature,
+            "feature.reopened_for_planning",
+            reason or "reopened by the operator",
         )
         if self.queue is not None:
             self.queue.submit(feature)
         return feature
 
-    def reopen_for_deploy(
-        self, feature_id: str, *, reason: str = ""
-    ) -> FeatureRequest:
+    def reopen_for_deploy(self, feature_id: str, *, reason: str = "") -> FeatureRequest:
         """Give a feature whose attempts were exhausted by infrastructure,
         not by its own diff, another run at the check suite — without a new
         Claude session.
@@ -461,13 +477,11 @@ class FeaturePipeline:
             )
         head_sha = feature.attempts[-1].commit_sha
         outstanding = sorted(
-            (feature.metadata.get("verification") or {}).get("awaiting_a_person")
-            or []
+            (feature.metadata.get("verification") or {}).get("awaiting_a_person") or []
         )
         if not outstanding:
             raise ApprovalError(
-                f"{feature_id} has no outstanding manual-verification items "
-                "to approve"
+                f"{feature_id} has no outstanding manual-verification items to approve"
             )
         approval = self.approvals.issue(
             capability="feature.ship_manual_items",
@@ -722,7 +736,7 @@ class FeaturePipeline:
         moment — the exact race the paragraph above describes, just between
         processes instead of threads. When ``self.ship_lease`` is configured
         (the real deployment always sets one; see
-        :mod:`openjarvis.wiz.proclock`), it is acquired *outside*
+        :mod:`openjarvis.core.proclock`), it is acquired *inside*
         ``_ship_lock`` and held for the same critical section, so a second
         process blocks — and eventually refuses with a named holder, never
         silently proceeds — while this one is shipping anything at all. A
@@ -731,7 +745,9 @@ class FeaturePipeline:
         """
         with self._ship_lock:
             if self.ship_lease is None:
-                return self._ship_locked(feature_id, operator_approved=operator_approved)
+                return self._ship_locked(
+                    feature_id, operator_approved=operator_approved
+                )
             try:
                 with self.ship_lease.acquire(
                     timeout=self.ship_lease_timeout,
@@ -1277,7 +1293,9 @@ class FeaturePipeline:
                 if provision_result.output
                 else provision_result.summary
             )
-            return self._retry_or_stop(feature, attempt, f"### {PROVISION_CHECK_NAME} failed\n\n{evidence}")
+            return self._retry_or_stop(
+                feature, attempt, f"### {PROVISION_CHECK_NAME} failed\n\n{evidence}"
+            )
 
         suite = self.check_suite_factory(self.profile)
         result = suite.run(workspace=worktree.path)
@@ -1653,7 +1671,9 @@ class FeaturePipeline:
         if attempts > self.max_attempts:
             return self._stop(feature, reason, kind="feature.plan_capacity_exhausted")
 
-        return StepResult(feature, message="Claude Code is at its usage limit; retrying...")
+        return StepResult(
+            feature, message="Claude Code is at its usage limit; retrying..."
+        )
 
     def _retry_or_stop(
         self, feature: FeatureRequest, attempt: FeatureAttempt, evidence: str
@@ -2130,7 +2150,9 @@ def _default_provision(profile: EngineeringProfile, workspace: str) -> CheckResu
     the project pins none.
     """
     node_bin_dir = profile.resolve_node_bin_dir()
-    return provision_check(workspace, path_prepend=[node_bin_dir] if node_bin_dir else None)
+    return provision_check(
+        workspace, path_prepend=[node_bin_dir] if node_bin_dir else None
+    )
 
 
 def _checks_record(result: Any) -> Dict[str, Any]:
@@ -2210,10 +2232,18 @@ def _paths_mentioned(plan: str) -> List[str]:
     for i, line in enumerate(lines):
         match = _HEADING_LINE.match(line)
         if match:
-            headings.append((i, (match.group("hash") or match.group("bold") or "").strip()))
+            headings.append(
+                (i, (match.group("hash") or match.group("bold") or "").strip())
+            )
 
     sections = [
-        "\n".join(lines[line_no + 1 : (headings[idx + 1][0] if idx + 1 < len(headings) else len(lines))])
+        "\n".join(
+            lines[
+                line_no + 1 : (
+                    headings[idx + 1][0] if idx + 1 < len(headings) else len(lines)
+                )
+            ]
+        )
         for idx, (line_no, heading) in enumerate(headings)
         if _FILES_TO_CHANGE_HEADING.search(heading) and "unchang" not in heading.lower()
     ]

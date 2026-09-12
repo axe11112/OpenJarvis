@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from openjarvis.core.proclock import LeaseTimeout
 from openjarvis.reliability.code_agent import CodeAgentResult, FakeCodeAgent
 from openjarvis.reliability.policy import SafetyPolicy
 from openjarvis.reliability.probes.spec import parse_probe
@@ -1169,3 +1170,206 @@ class TestRecheckBeforeEscalating:
         loop.run(critical, _spec())
         # attempts_exhausted needs a human, but production is fine now.
         assert critical.state is IncidentState.RESOLVED
+
+
+# ---------------------------------------------------------------------------
+# The production-change lease: repair merges and feature ships are one queue
+# ---------------------------------------------------------------------------
+
+
+def _hold_production_lease(path_str, ready_event, release_event):
+    """Hold the production-change lease in a genuinely separate process.
+
+    A thread would prove nothing here: the whole point is that the guard has
+    to be the kernel's, not this interpreter's.
+    """
+    from openjarvis.core.proclock import ProcessLease
+
+    lease = ProcessLease(path_str, owner="wiz@feature-ship")
+    with lease.acquire(timeout=10.0):
+        ready_event.set()
+        release_event.wait(timeout=30.0)
+
+
+class TestProductionChangeLease:
+    """One production change at a time, across processes -- not across threads.
+
+    Before this, the repair loop's only concurrency guard was a
+    ``threading.RLock`` in ``watch.py``. A watcher merging a repair and a Wiz
+    shipper merging a feature therefore raced by construction, and each then
+    read one shared production to decide whether *its own* change was good.
+    """
+
+    def test_a_repair_does_not_merge_while_a_feature_ship_holds_the_lease(
+        self, store, incident, tmp_path
+    ):
+        import multiprocessing
+
+        from openjarvis.core.proclock import ProcessLease
+
+        lease_path = tmp_path / "production-change.lock"
+        ready = multiprocessing.Event()
+        release = multiprocessing.Event()
+        holder = multiprocessing.Process(
+            target=_hold_production_lease,
+            args=(str(lease_path), ready, release),
+        )
+        holder.start()
+        try:
+            assert ready.wait(timeout=10.0), "the other process never took the lease"
+
+            merger = _FakeMerger()
+            post_merge = _FakePostMerge(verified=True)
+            agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+            loop = _loop(
+                store,
+                agent,
+                verifier=_verifier([True]),
+                github=_MergingGitHub(),
+                auto_merger=merger,
+                post_merge_verifier=post_merge,
+                production_lease=ProcessLease(lease_path, owner="repair-watcher"),
+                production_lease_timeout=0.4,
+            )
+
+            outcome = loop.run(incident, _spec())
+
+            # The merge was not attempted at all -- not attempted and refused
+            # by the gates, which would have been recorded as a gate decision
+            # this loop never actually reached.
+            assert merger.calls == 0, "merged while another process held the lease"
+            # And production was never consulted, so nothing was concluded
+            # about it from somebody else's deployment.
+            assert post_merge.calls == 0
+            states = _states(store, incident.id)
+            assert "MERGED" not in states
+            # The repair itself still succeeded: the pull request is the
+            # deliverable, exactly as when merging is not configured.
+            assert outcome.resolved
+            # And the reason is on the incident, for whoever retries it.
+            evidence = " ".join(
+                (e.summary or "") + " " + (e.content or "")
+                for e in store.get(incident.id).evidence
+            )
+            assert "another production change is in progress" in evidence
+            assert "wiz@feature-ship" in evidence
+        finally:
+            release.set()
+            holder.join(timeout=10.0)
+            if holder.is_alive():  # pragma: no cover - defensive
+                holder.terminate()
+                holder.join(timeout=5.0)
+
+    def test_a_repair_merges_normally_once_the_lease_is_free(
+        self, store, incident, tmp_path
+    ):
+        """The refusal above is contention, not a new permanent gate."""
+        from openjarvis.core.proclock import ProcessLease
+
+        merger = _FakeMerger()
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([True]),
+            github=_MergingGitHub(),
+            auto_merger=merger,
+            post_merge_verifier=_FakePostMerge(verified=True),
+            production_lease=ProcessLease(
+                tmp_path / "production-change.lock", owner="repair-watcher"
+            ),
+            production_lease_timeout=5.0,
+        )
+
+        outcome = loop.run(incident, _spec())
+
+        assert merger.calls == 1
+        assert outcome.resolved
+        assert outcome.final_state is IncidentState.RESOLVED
+
+    def test_the_lease_is_released_after_a_repair_merge(
+        self, store, incident, tmp_path
+    ):
+        """A merge must not leave production locked behind it."""
+        from openjarvis.core.proclock import ProcessLease
+
+        lease_path = tmp_path / "production-change.lock"
+        agent = FakeCodeAgent([CodeAgentResult(claim="c", changed_files=["a.ts"])])
+        loop = _loop(
+            store,
+            agent,
+            verifier=_verifier([True]),
+            github=_MergingGitHub(),
+            auto_merger=_FakeMerger(),
+            post_merge_verifier=_FakePostMerge(verified=True),
+            production_lease=ProcessLease(lease_path, owner="repair-watcher"),
+            production_lease_timeout=5.0,
+        )
+        loop.run(incident, _spec())
+
+        # Whoever wants production next can have it immediately.
+        with ProcessLease(lease_path, owner="next").acquire(timeout=0.5):
+            pass
+
+    def test_wiz_and_the_repair_loop_resolve_the_same_lock_file(self, tmp_path):
+        """The two callers must not each get their own private lease.
+
+        This is the failure the whole change exists to prevent, and it is a
+        one-line mistake to reintroduce: a lease per subsystem serialises each
+        subsystem against itself and leaves the dangerous pairing unguarded.
+        """
+        from openjarvis.core.proclock import (
+            PRODUCTION_CHANGE_LOCK,
+            production_change_lease,
+        )
+
+        wiz_side = production_change_lease(owner="wiz@target", root=tmp_path)
+        repair_side = production_change_lease(owner="repair-watcher", root=tmp_path)
+
+        assert wiz_side.path == repair_side.path
+        assert wiz_side.path.name == PRODUCTION_CHANGE_LOCK
+        # And it really is mutual exclusion, not two objects agreeing on a name.
+        with wiz_side.acquire(timeout=1.0):
+            with pytest.raises(LeaseTimeout):
+                with repair_side.acquire(timeout=0.3):
+                    pass
+
+
+class TestProductionLeaseIsActuallyWired:
+    """A lease nothing passes is a lease nothing holds.
+
+    This suite exists because of a sibling bug found in the same audit:
+    ``DevelopmentQueue(production_busy=...)`` and ``_reliability_busy()`` form a
+    complete, tested, plumbed-looking production-deferral gate in which no
+    caller ever supplies ``production_busy``, so it defaults to
+    ``lambda: False`` and the entire chain is a permanent no-op. Its unit tests
+    pass, because they inject a fake pipeline rather than build a real one.
+    Nothing here should be able to fail the same way quietly.
+    """
+
+    def test_the_repair_factory_passes_a_production_lease(self):
+        """The real construction site, not a hand-made RepairLoop."""
+        import inspect
+
+        from openjarvis.cli import reliability_cmd
+
+        source = inspect.getsource(reliability_cmd._build_repair_loop)
+        assert "production_lease=" in source, (
+            "the repair loop is constructed without a production-change lease, "
+            "so repair merges are again unserialised against feature ships"
+        )
+
+    def test_wiz_ships_under_the_shared_lease_not_a_private_one(self):
+        import inspect
+
+        from openjarvis.wiz import assemble as assemble_mod
+
+        source = inspect.getsource(assemble_mod.assemble)
+        assert "production_change_lease" in source, (
+            "Wiz is shipping under a lease of its own again; it must take the "
+            "shared production-change lease so a repair merge contends with it"
+        )
+        assert 'ProcessLease(root / "ship.lock"' not in source, (
+            "the Wiz-private ship.lock is back, which serialises Wiz against "
+            "itself and leaves feature-ship-versus-repair-merge unguarded"
+        )
