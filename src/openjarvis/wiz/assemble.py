@@ -85,6 +85,38 @@ def assemble(
     )
 
     engineer = ClaudeCodeEngineeringAgent()
+
+    # The production-deferral gate, finally connected to something.
+    #
+    # DevelopmentQueue.admit_next() refuses to start feature work while
+    # production_busy() is true, and _reliability_busy() below answers the same
+    # question for auto_ship_if_eligible by reading it back out of the queue's
+    # snapshot. Both were a closed loop: the snapshot value came from this
+    # callback, no caller of assemble() ever passed one, so it defaulted to
+    # `lambda: False` and the entire deferral answered "not busy" forever. The
+    # queue's own tests pass because they construct a DevelopmentQueue with a
+    # callback themselves; _reliability_busy's tests pass because they hand it
+    # a fake pipeline. Nothing tested the wiring, because there was none.
+    #
+    # The source of truth is the cross-process production-change lease -- the
+    # same lease FeaturePipeline.ship() and the reliability repair loop both
+    # take. If anyone holds it, a production change is in flight, in this
+    # process or any other.
+    #
+    # Asked with is_held(), which asks the kernel, and never with
+    # current_holder(), which reads a record a SIGKILLed holder leaves behind:
+    # that would answer "busy" forever after one crash and stall every feature
+    # permanently, which is exactly the failure the lease was chosen to survive
+    # cleanly.
+    #
+    # Advisory, deliberately. This decides "should I start new work now?", and
+    # a lease released the instant after it is asked costs nothing worse than
+    # one deferred admission. It is not the safety gate and must never be read
+    # as one -- serialisation is the lease being *held* across the merge, which
+    # ship() and the repair loop do.
+    if production_busy is None:
+        _production_lease = production_change_lease(owner="wiz-queue-probe")
+        production_busy = _production_lease.is_held
     queue = DevelopmentQueue(max_concurrent=1, production_busy=production_busy)
 
     # In memory, and deliberately so: an approval that survives a restart is

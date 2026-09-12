@@ -215,12 +215,55 @@ class ProcessLease:
         except (OSError, ValueError):
             return None
 
+    def is_held(self) -> bool:
+        """Whether anyone holds this lease right now, asked of the kernel.
+
+        Not :meth:`current_holder`, and the difference is the whole point.
+        The holder record is written after the lock is taken and truncated
+        before it is released, so a process killed with SIGKILL leaves its
+        record behind while the kernel drops its ``flock`` immediately. A
+        caller that decided "is production busy?" by reading that record would
+        answer yes forever after one crash -- a permanent, silent stall of
+        everything that defers to it, caused by the very failure the lease was
+        built to survive cleanly.
+
+        This asks the only authority there is: it tries to take the lock
+        without blocking and, if it gets it, gives it straight back. A "no" is
+        therefore always true at the instant it is asked. A "yes" is
+        necessarily a snapshot -- the holder can release the moment after this
+        returns -- so this is for advisory decisions ("should I start new work
+        now?"), never for mutual exclusion. Only :meth:`acquire` provides that,
+        by holding the lock for as long as the work takes.
+        """
+        if not self._path.exists():
+            return False
+        try:
+            handle = open(self._path, "a+")
+        except OSError:
+            return False
+        try:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    return True
+                raise
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            return False
+        finally:
+            handle.close()
+
     def current_holder(self) -> Optional[LeaseInfo]:
         """Best-effort snapshot of who holds this lease right now, if anyone.
 
         For status/dashboard display. Racy by nature (the holder can change
         the instant after this returns) and therefore never used to gate a
         decision — only :meth:`acquire` does that, via the kernel.
+
+        It also *over*-reports: the record is truncated on an orderly release,
+        so a process killed with SIGKILL leaves one behind that outlives its
+        lock. Never ask this whether a lease is held — ask :meth:`is_held`,
+        which asks the kernel. This answers only "who last said they had it".
         """
         if not self._path.exists():
             return None

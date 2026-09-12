@@ -156,3 +156,87 @@ def test_exception_inside_the_block_still_releases(tmp_path):
             raise RuntimeError("boom")
     with ProcessLease(path, owner="b").acquire(timeout=1.0):
         pass
+
+
+def _hold_until_killed(path_str, ready):
+    import time
+
+    from openjarvis.core.proclock import ProcessLease
+
+    with ProcessLease(path_str, owner="doomed").acquire(timeout=5.0):
+        ready.set()
+        time.sleep(60)
+
+
+class TestIsHeld:
+    """`is_held` asks the kernel; `current_holder` reads a record.
+
+    The difference decides whether one crash stalls the system forever. The
+    holder record is written after the lock is taken and truncated before it is
+    released, so a SIGKILLed process leaves its record behind while the kernel
+    drops its flock immediately. Anything that answered "is production busy?"
+    from that record would say yes for the rest of the machine's uptime.
+    """
+
+    def test_a_free_lease_is_not_held(self, tmp_path):
+        assert ProcessLease(tmp_path / "p.lock", owner="a").is_held() is False
+
+    def test_a_lease_that_was_never_taken_is_not_held(self, tmp_path):
+        """No file at all is the first-run case, not an error."""
+        assert ProcessLease(tmp_path / "never.lock", owner="a").is_held() is False
+
+    def test_a_held_lease_is_held(self, tmp_path):
+        path = tmp_path / "p.lock"
+        with ProcessLease(path, owner="holder").acquire(timeout=1.0):
+            assert ProcessLease(path, owner="asker").is_held() is True
+
+    def test_it_is_free_again_after_release(self, tmp_path):
+        path = tmp_path / "p.lock"
+        with ProcessLease(path, owner="holder").acquire(timeout=1.0):
+            pass
+        assert ProcessLease(path, owner="asker").is_held() is False
+
+    def test_asking_does_not_take_the_lease(self, tmp_path):
+        """A probe that left the lock held would deadlock the next real caller."""
+        path = tmp_path / "p.lock"
+        probe = ProcessLease(path, owner="asker")
+        assert probe.is_held() is False
+        # Still immediately acquirable by someone who actually wants it.
+        with ProcessLease(path, owner="real").acquire(timeout=0.5):
+            pass
+
+    def test_a_sigkilled_holder_does_not_leave_it_held_forever(self, tmp_path):
+        """The trap. current_holder() still names the dead holder; is_held()
+        must not, or one crash stalls every deferral permanently."""
+        import multiprocessing
+        import os
+        import signal
+        import time
+
+        path = tmp_path / "p.lock"
+        ready = multiprocessing.Event()
+        holder = multiprocessing.Process(
+            target=_hold_until_killed, args=(str(path), ready)
+        )
+        holder.start()
+        try:
+            assert ready.wait(timeout=10.0), "the holder never took the lease"
+            probe = ProcessLease(path, owner="probe")
+            assert probe.is_held() is True
+
+            os.kill(holder.pid, signal.SIGKILL)
+            holder.join(timeout=10.0)
+            time.sleep(0.2)
+
+            assert probe.is_held() is False, (
+                "a SIGKILLed holder left the lease reading as held; anything "
+                "deferring to it would stall for the rest of this machine's "
+                "uptime"
+            )
+            # And the record really does still name the dead holder, which is
+            # why is_held() must not be built on it.
+            assert probe.current_holder() is not None
+        finally:
+            if holder.is_alive():  # pragma: no cover - defensive
+                holder.terminate()
+                holder.join(timeout=5.0)

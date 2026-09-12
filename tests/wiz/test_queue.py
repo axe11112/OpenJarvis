@@ -126,3 +126,100 @@ class TestInspection:
         assert queue.cancel("FEAT-1")
         assert queue.waiting() == []
         assert not queue.cancel("FEAT-nonexistent")
+
+
+class TestProductionBusyIsConnectedToSomething:
+    """The deferral was a closed loop answering "not busy" forever.
+
+    DevelopmentQueue.admit_next() refuses to start feature work while
+    production_busy() is true, and assemble._reliability_busy() answers the
+    same question for auto_ship_if_eligible by reading it back out of the
+    queue's snapshot -- where it had come from this same callback. No caller of
+    assemble() ever passed one, so it defaulted to `lambda: False` and the
+    whole mechanism was inert. Every test above passes because it constructs
+    the queue with a callback itself; nothing tested the wiring, because there
+    was none.
+
+    The source of truth is the cross-process production-change lease, so these
+    drive a real one.
+    """
+
+    def test_a_held_production_lease_defers_feature_work(self, tmp_path):
+        from openjarvis.core.proclock import production_change_lease
+
+        lease = production_change_lease(owner="a-ship-in-progress", root=tmp_path)
+        probe = production_change_lease(owner="wiz-queue-probe", root=tmp_path)
+        queue = DevelopmentQueue(production_busy=probe.is_held)
+        queue.submit(_feature("FEAT-1"))
+
+        with lease.acquire(timeout=2.0):
+            decision = queue.admit_next()
+            assert not decision.admitted, (
+                "feature work started while a production change was in flight"
+            )
+            assert "reliability" in decision.reason
+
+        assert queue.admit_next().admitted, (
+            "feature work did not resume once production was free again"
+        )
+
+    def test_a_crashed_holder_does_not_stall_feature_work_forever(self, tmp_path):
+        """The trap this must not be built on.
+
+        The lease's holder *record* outlives a SIGKILLed process; its lock does
+        not. A probe reading the record would defer every feature for the rest
+        of the machine's uptime after one crash -- silently, and with no way to
+        tell it from "production is legitimately busy".
+        """
+        import multiprocessing
+        import os
+        import signal
+        import time
+
+        from openjarvis.core.proclock import production_change_lease
+        from tests.wiz.test_proclock import _hold_until_killed
+
+        lease_path = production_change_lease(owner="x", root=tmp_path).path
+        ready = multiprocessing.Event()
+        holder = multiprocessing.Process(
+            target=_hold_until_killed, args=(str(lease_path), ready)
+        )
+        holder.start()
+        try:
+            assert ready.wait(timeout=10.0)
+            probe = production_change_lease(owner="wiz-queue-probe", root=tmp_path)
+            queue = DevelopmentQueue(production_busy=probe.is_held)
+            queue.submit(_feature("FEAT-1"))
+            assert not queue.admit_next().admitted
+
+            os.kill(holder.pid, signal.SIGKILL)
+            holder.join(timeout=10.0)
+            time.sleep(0.2)
+
+            assert queue.admit_next().admitted, (
+                "a crashed production change stalled every feature permanently"
+            )
+        finally:
+            if holder.is_alive():  # pragma: no cover - defensive
+                holder.terminate()
+                holder.join(timeout=5.0)
+
+    def test_assemble_supplies_a_default_production_busy(self):
+        """Asserted at the wiring, because the wiring is what was missing."""
+        import inspect
+
+        from openjarvis.wiz import assemble as assemble_mod
+
+        source = inspect.getsource(assemble_mod.assemble)
+        assert "production_busy = _production_lease.is_held" in source, (
+            "assemble() no longer supplies a production_busy source, so the "
+            "queue's production deferral is inert again"
+        )
+        code = [
+            line for line in source.splitlines() if not line.lstrip().startswith("#")
+        ]
+        assert not any("current_holder" in line for line in code), (
+            "production_busy must not be built on current_holder(): a "
+            "SIGKILLed holder's record outlives its lock and would stall "
+            "feature work forever"
+        )
