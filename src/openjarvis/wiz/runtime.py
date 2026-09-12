@@ -307,9 +307,36 @@ class WizRuntime:
         if self.journal is not None:
             chain_ok, chain_break = self.journal.verify()
 
+        # What feature work actually needs from the authority policy. Reported
+        # because the policy is now genuinely enforced on the build and ship
+        # paths (see build_wiz), and AuthorityPolicy.default() deliberately
+        # grants none of these -- writing code is an opt-in an operator makes on
+        # purpose, not something that happens when they forget a config file.
+        # Without this, a machine with no authority.json would refuse every
+        # build with a message that reads like a bug, and "authority_policy:
+        # loaded" below would keep insisting everything was fine.
+        needed = {
+            Channel.CONTROL_CENTER: (
+                Authority.CODE_WRITE,
+                Authority.PR_WRITE,
+                Authority.PRODUCTION_CHANGE,
+            ),
+            Channel.CLI: (Authority.CODE_WRITE,),
+        }
+        authority_gaps = [
+            f"{channel.value} is missing {authority.value}"
+            for channel, required in needed.items()
+            for authority in required
+            if authority not in self.policy.granted_to(channel)
+        ]
+
         return {
             # Kept for callers of the previous shape.
             "authority_policy": "loaded",
+            "authority_granted": self.policy.to_mapping(),
+            # Empty means feature work is fully authorised here. Anything in it
+            # is a build or a ship that will be refused, named before it is.
+            "authority_gaps": authority_gaps,
             "capabilities_declared": len(self.registry),
             "capabilities_implemented": len(self.wiz.verbs()),
             "journal": {
@@ -551,6 +578,33 @@ def build_wiz(
             if notifier is not None:
                 pipeline.owner_notifier = notifier
 
+        # One authority policy for the whole assistant, for the same reason as
+        # the journal above -- and this one is a safety boundary, not just an
+        # audit trail.
+        #
+        # assemble() built the pipeline and the shipper without it, and both
+        # read their authority collaborator as Optional and skip the check when
+        # it is None:
+        #
+        #   FeaturePipeline._authority_denial: `if self.policy is None: return ""`
+        #   evaluate_shipping:                 `if authority is not None:`
+        #
+        # So in the assembled system the channel ceiling did not exist. The
+        # gate that is supposed to stop a request arriving over Telegram or
+        # voice from having code written for it, and the gate that is supposed
+        # to stop one reaching a production merge, were both structurally
+        # absent -- while every test of them passes, because the tests
+        # construct the pipeline and the shipper with an AuthorityPolicy
+        # themselves. The policy was loaded here and simply never handed down.
+        #
+        # Assigned only when unset, like the journal, so a caller that passed
+        # its own stays authoritative.
+        if pipeline is not None and getattr(pipeline, "policy", None) is None:
+            pipeline.policy = resolved_policy
+        shipper = getattr(pipeline, "shipper", None)
+        if shipper is not None and getattr(shipper, "authority", None) is None:
+            shipper.authority = resolved_policy
+
     # Declared whether or not the product side is assembled, and *unavailable*
     # when it is not.
     #
@@ -574,9 +628,7 @@ def build_wiz(
     from openjarvis.wiz.browser import BrowserVerbs
     from openjarvis.wiz.browser.url_safety import URLValidator
 
-    browser_base_url = getattr(
-        getattr(config, "reliability", None), "site", None
-    )
+    browser_base_url = getattr(getattr(config, "reliability", None), "site", None)
     browser_base_url = getattr(browser_base_url, "base_url", "")
     browser_verbs = None
     if browser_base_url:
