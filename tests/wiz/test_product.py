@@ -92,9 +92,26 @@ class FakePipeline:
         if feature is None:
             raise KeyError(feature_id)
         if feature.state is FeatureState.RECEIVED:
-            feature.transition(
-                FeatureState.READY, at="2026-08-19T10:05:00+00:00", reason="built"
-            )
+            # Walked step by step rather than jumped. RECEIVED -> READY is not
+            # a legal transition and never was: this fake raised
+            # InvalidFeatureTransition for every caller, and nothing noticed
+            # because the routes tests that exercise it need FastAPI and were
+            # being skipped wherever the server extra was not installed. A fake
+            # that cannot make the moves the real object makes does not "match
+            # FeaturePipeline.run's contract", it just fails differently.
+            for step in (
+                FeatureState.UNDERSTANDING,
+                FeatureState.PLANNING,
+                FeatureState.APPROVED_FOR_BUILD,
+                FeatureState.BUILDING,
+                FeatureState.TESTING,
+                FeatureState.PREVIEWING,
+                FeatureState.VERIFYING,
+                FeatureState.READY,
+            ):
+                feature.transition(
+                    step, at="2026-08-19T10:05:00+00:00", reason="built"
+                )
             self.store.save(feature)
         return feature
 
