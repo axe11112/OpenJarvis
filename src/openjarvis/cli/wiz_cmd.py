@@ -758,3 +758,157 @@ def listen() -> None:
         console.print("\nStopped.")
     finally:
         listener.stop()
+
+
+# ---------------------------------------------------------------------------
+# Operator recovery verbs
+#
+# FeaturePipeline grew five operator verbs -- reopen_for_planning,
+# reopen_for_deploy, reopen_for_owner_authorized_rebuild,
+# approve_manual_acceptance and reverify_against_current_base -- each written to
+# break a specific lifecycle deadlock, each tested, and none of them reachable
+# from anything an owner can actually run. Every reference to them outside their
+# own definitions was a docstring cross-reference. So the deadlocks they close
+# stayed closed only for someone willing to open a Python REPL against the live
+# feature store, which is the opposite of what a recovery path is for.
+#
+# They live on the CLI rather than on the dashboard on purpose. These are the
+# most privileged verbs in the product -- one of them spends a fresh Claude
+# session past an exhausted attempt budget, another records the owner's personal
+# acceptance of a criterion no machine could measure -- and the dashboard is a
+# network-reachable surface whose authority is deliberately narrow. The CLI is
+# the owner at their own machine, which is the right ceiling for these.
+#
+# None of them reimplement anything: each is a thin call onto the canonical
+# pipeline method, so the state machine, the journal and the approval store stay
+# the single source of truth.
+# ---------------------------------------------------------------------------
+
+
+def _pipeline_or_exit() -> Any:
+    """The assembled feature pipeline, or explain why there is not one."""
+    runtime = _runtime()
+    if runtime.product is None:
+        _explain_unconfigured()
+    return runtime.product.pipeline
+
+
+def _report_feature(feature: Any, *, did: str) -> None:
+    """Say what happened, in the terms the owner asked in."""
+    console = _console()
+    console.print(f"[green]{feature.id}: {did}[/green]")
+    console.print(f"[dim]It is now {feature.state.value}.[/dim]")
+
+
+@wiz.command("reopen")
+@click.argument("feature_id")
+@click.option(
+    "--for",
+    "target",
+    type=click.Choice(["planning", "deploy", "rebuild"]),
+    required=True,
+    help=(
+        "planning: never wrote code, try planning again. "
+        "deploy: the diff is fine, the infrastructure was not -- re-run the "
+        "checks with no new Claude session. "
+        "rebuild: spend one fresh Claude session past an exhausted budget."
+    ),
+)
+@click.option(
+    "--reason",
+    default="",
+    help="Why. Required for --for rebuild, which is a one-off owner decision.",
+)
+def reopen(feature_id: str, target: str, reason: str) -> None:
+    """Restart a stopped feature, choosing exactly how much to spend on it.
+
+    The three are deliberately separate verbs rather than one "retry", because
+    they cost different things and are right in different situations.
+    """
+    console = _console()
+    pipeline = _pipeline_or_exit()
+
+    if target == "rebuild" and not reason.strip():
+        # No default, deliberately: this is the only verb that spends an
+        # attempt past max_attempts, and it is once per feature. An owner who
+        # cannot say why probably wants --for deploy.
+        console.print(
+            "[red]--reason is required for --for rebuild: it spends a fresh "
+            "Claude session past the attempt budget, once per feature.[/red]"
+        )
+        raise SystemExit(1)
+
+    try:
+        if target == "planning":
+            feature = pipeline.reopen_for_planning(feature_id, reason=reason)
+            did = "reopened for planning"
+        elif target == "deploy":
+            feature = pipeline.reopen_for_deploy(feature_id, reason=reason)
+            did = "reopened for the check suite, with no new Claude session"
+        else:
+            feature = pipeline.reopen_for_owner_authorized_rebuild(
+                feature_id, reason=reason
+            )
+            did = "granted one owner-authorized rebuild"
+    except Exception as exc:  # noqa: BLE001 - the refusal is the useful output
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
+
+    _report_feature(feature, did=did)
+
+
+@wiz.command("accept")
+@click.argument("feature_id")
+@click.option(
+    "--reason", required=True, help="What you checked, and what you concluded."
+)
+def accept(feature_id: str, reason: str) -> None:
+    """Accept the outstanding items only a person can judge, and let it finish.
+
+    For a feature whose automated checks all passed and whose only remaining
+    gap is something structurally unmeasurable -- a layout that has no selector
+    to compile against, typically. It cannot paper over a failed automated
+    check: the approval is bound to this feature's current outstanding
+    awaiting-a-person items at its current verified head SHA, so it stops
+    matching the moment either changes.
+    """
+    console = _console()
+    pipeline = _pipeline_or_exit()
+    try:
+        feature = pipeline.approve_manual_acceptance(feature_id, reason=reason)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
+    _report_feature(feature, did="accepted the outstanding items you judged")
+
+
+@wiz.command("refresh-base")
+@click.argument("feature_id")
+@click.option(
+    "--expected-head-sha",
+    required=True,
+    help=(
+        "The commit you mean, in full. Required so this cannot act on a "
+        "feature that moved between you reading it and running this."
+    ),
+)
+@click.option("--reason", required=True, help="Why the base is being refreshed.")
+def refresh_base(feature_id: str, expected_head_sha: str, reason: str) -> None:
+    """Re-verify a stalled feature against a base branch that has moved.
+
+    For the feature that was READY, and then main moved underneath it. Merges
+    the current base into the existing commit and re-verifies; it never calls
+    the coding engine and never spends a build attempt, so it is safe to run
+    repeatedly as main keeps moving. A textual conflict stops for a person
+    rather than guessing.
+    """
+    console = _console()
+    pipeline = _pipeline_or_exit()
+    try:
+        feature = pipeline.reverify_against_current_base(
+            feature_id, expected_head_sha=expected_head_sha, reason=reason
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
+    _report_feature(feature, did="re-verified against the current base")
