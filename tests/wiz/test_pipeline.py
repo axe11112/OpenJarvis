@@ -3977,3 +3977,107 @@ class TestAnInterruptedShipCanBeReconciled:
 
         again = pipeline.reconcile_after_ship(feature.id, reason="again")
         assert again.state is FeatureState.COMPLETE
+
+
+class TestReconcileIsNotTheExternalMergePath:
+    """`jarvis wiz reconcile` must not quietly finish a merge nobody authorised.
+
+    postship.reconcile_external_merge() exists precisely to refuse that by
+    default, and its docstring says why in as many words: "Reusing
+    reverify_production for this would let an unauthorized merge complete
+    through the same quiet path as an ordinary flaky retry, which is exactly the
+    outcome this function exists to refuse by default." It requires the pull
+    request number to be passed in rather than trusted from the feature, demands
+    an explicit owner_acknowledged, and stamps shipping_path as
+    "external_bypass_reconciled" so the history is never erased.
+
+    reconcile_after_ship() calls reverify_production(), so without a guard it
+    became exactly that quiet path -- the real FEAT-00030 case was a coding
+    session's own shell running `gh pr merge` on a pull request the pipeline had
+    opened, so feature.pr_number is set and GitHub reports it merged.
+
+    The evidence that distinguishes the two is the feature's own history:
+    MERGING is a state only ship() puts a feature into.
+    """
+
+    def _human_required_with_a_merged_pr(self, tmp_path, clock, *, via_ship: bool):
+        github = TestAnInterruptedShipCanBeReconciled.MergedGitHub()
+        pipeline, feature = TestShip()._ready(
+            tmp_path,
+            clock,
+            shipper=TestShip()._shipper(github),
+            postship=TestShip.FakePostShip(verified=True),
+        )
+        if via_ship:
+            pipeline._transition(feature, FeatureState.MERGING, "merged the PR")
+            pipeline._transition(feature, FeatureState.DEPLOYING, "deploying")
+        feature.transition(
+            FeatureState.HUMAN_REQUIRED, at=pipeline.clock(), reason="stopped"
+        )
+        pipeline.store.save(feature)
+        return pipeline, feature
+
+    def test_a_merge_this_pipeline_never_made_is_refused(self, tmp_path, clock):
+        """The bypass. READY -> HUMAN_REQUIRED, never through MERGING."""
+        from openjarvis.wiz.approvals import ApprovalError
+
+        pipeline, feature = self._human_required_with_a_merged_pr(
+            tmp_path, clock, via_ship=False
+        )
+
+        with pytest.raises(ApprovalError, match="no record of this pipeline merging"):
+            pipeline.reconcile_after_ship(feature.id, reason="finish it off")
+
+        assert pipeline.store.get(feature.id).state is FeatureState.HUMAN_REQUIRED, (
+            "an unauthorised merge was completed through the retry path"
+        )
+
+    def test_a_merge_this_pipeline_did_make_is_still_reconcilable(
+        self, tmp_path, clock
+    ):
+        """The guard must not break the case reverify_production is FOR:
+        ship() merged, the post-ship check flaked, the owner fixed it."""
+        pipeline, feature = self._human_required_with_a_merged_pr(
+            tmp_path, clock, via_ship=True
+        )
+
+        reconciled = pipeline.reconcile_after_ship(
+            feature.id, reason="the flake is fixed"
+        )
+
+        assert reconciled.state is FeatureState.COMPLETE
+
+    def test_the_evidence_survives_a_restart(self, tmp_path, clock):
+        """It is read from durable history, not from anything in memory --
+        which matters, since the point of reconciling is that something died."""
+        pipeline, feature = self._human_required_with_a_merged_pr(
+            tmp_path, clock, via_ship=True
+        )
+        reloaded = pipeline.store.get(feature.id)
+        assert pipeline._this_pipeline_merged(reloaded) is True
+
+        _, never = self._human_required_with_a_merged_pr(
+            tmp_path, clock, via_ship=False
+        )
+        assert pipeline._this_pipeline_merged(pipeline.store.get(never.id)) is False
+
+    def test_a_refusal_that_did_nothing_reaches_the_caller(self, tmp_path, clock):
+        """reverify_production reports structured refusals; discarding them
+        made every one read as a quiet success."""
+        from openjarvis.wiz.approvals import ApprovalError
+
+        github = TestAnInterruptedShipCanBeReconciled.MergedGitHub(merged=False)
+        pipeline, feature = TestShip()._ready(
+            tmp_path,
+            clock,
+            shipper=TestShip()._shipper(github),
+            postship=TestShip.FakePostShip(verified=True),
+        )
+        pipeline._transition(feature, FeatureState.MERGING, "merged the PR")
+        feature.transition(
+            FeatureState.HUMAN_REQUIRED, at=pipeline.clock(), reason="stopped"
+        )
+        pipeline.store.save(feature)
+
+        with pytest.raises(ApprovalError, match="not merged"):
+            pipeline.reconcile_after_ship(feature.id, reason="try again")

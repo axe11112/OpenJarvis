@@ -766,6 +766,27 @@ class FeaturePipeline:
         reaches COMPLETE the same way an uninterrupted ship would.
         """
         feature = self._load(feature_id)
+        if not self._this_pipeline_merged(feature):
+            # The distinction postship.reconcile_external_merge() exists to
+            # draw, and the one this method must not blur. reverify_production()
+            # covers a merge the pipeline itself performed, where only the
+            # post-ship check flaked; the merge's legitimacy was never in
+            # question. A merge this package never authorized -- a coding
+            # session's own shell running `gh pr merge`, found on FEAT-00030 --
+            # is the opposite case, and its own function's docstring says
+            # plainly that "reusing reverify_production for this would let an
+            # unauthorized merge complete through the same quiet path as an
+            # ordinary flaky retry".
+            #
+            # So this refuses rather than guesses. The evidence required is the
+            # feature's own history: MERGING is a state only ship() puts it in.
+            raise ApprovalError(
+                f"{feature_id} has no record of this pipeline merging it, so I "
+                f"cannot treat a merged pull request as mine to finish. If the "
+                f"merge happened outside ship(), it needs the external-merge "
+                f"path and your explicit acknowledgement -- it is not an "
+                f"ordinary retry."
+            )
         if feature.state in self.IN_FLIGHT_SHIP_STATES:
             interrupted = feature.state.value
             feature.transition(
@@ -784,7 +805,42 @@ class FeaturePipeline:
                 (f"found stranded in {interrupted}. {reason}").strip()[:1000],
             )
             self._release(feature)
+            # The strand above already changed something and said so, in the
+            # state and in the journal. A reverification that then declines --
+            # most often because the merge never landed -- is the honest end of
+            # this call, not an error: the feature is HUMAN_REQUIRED and the
+            # owner can see why. Logged rather than raised so the caller still
+            # gets the feature back.
+            try:
+                return self.reverify_production(feature_id, reason=reason)
+            except ApprovalError as exc:
+                logger.info("reconciliation of %s stopped: %s", feature_id, exc)
+                self._record(
+                    feature, "feature.reconcile_incomplete", str(exc)[:1000]
+                )
+                return self._load(feature_id)
+        # Nothing was stranded, so nothing has been done yet. Here a refusal is
+        # the whole outcome and must reach the caller rather than be swallowed
+        # into a feature that looks unchanged because it is.
         return self.reverify_production(feature_id, reason=reason)
+
+    def _this_pipeline_merged(self, feature: FeatureRequest) -> bool:
+        """Whether ship() is on record as having merged this feature.
+
+        MERGING is a state only :meth:`ship` moves a feature into, and
+        :meth:`FeatureRequest.transition` records every move in ``history``. So
+        the history is the evidence, and it survives a restart -- which matters,
+        because the whole point of asking is that this runs after a crash.
+
+        A feature currently sitting in one of the in-flight states counts for
+        the same reason.
+        """
+        if feature.state in self.IN_FLIGHT_SHIP_STATES:
+            return True
+        in_flight = {state.value for state in self.IN_FLIGHT_SHIP_STATES}
+        return any(
+            str(entry.get("to", "")) in in_flight for entry in feature.history
+        )
 
     def reverify_production(
         self, feature_id: str, *, reason: str = ""
@@ -806,7 +862,7 @@ class FeaturePipeline:
                 "re-verifying production needs both a shipper and a post-ship "
                 "verifier; neither is configured here"
             )
-        _reverify_production(
+        result = _reverify_production(
             feature_id,
             store=self.store,
             github=self.shipper.github,
@@ -816,6 +872,19 @@ class FeaturePipeline:
             reason=reason,
             owner_notifier=self.owner_notifier,
         )
+        # The refusals are the useful half. reverify_production() reports
+        # not_found, wrong_state, no_pull_request, pull_request_unreadable,
+        # pull_request_not_merged and no_merge_commit_sha as structured
+        # RecoveryRefusals; discarding them and returning the unchanged feature
+        # made every one of those read to the caller as a quiet success, which
+        # is the shape of bug this session spent its time removing.
+        refusals = list(getattr(result, "refusals", ()) or ())
+        if refusals and not getattr(result, "recovered", False):
+            detail = "; ".join(
+                f"{getattr(r, 'code', '?')}: {getattr(r, 'detail', '')}"
+                for r in refusals
+            )
+            raise ApprovalError(f"{feature_id} could not be reconciled -- {detail}")
         return self._load(feature_id)
 
     def ship(

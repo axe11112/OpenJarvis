@@ -41,6 +41,16 @@ nothing downstream re-checks it.
 A caller that cannot get the lease does not merge. It records why, names the
 holder, and leaves the pull request as the deliverable.
 
+**Scope, precisely.** The lease covers the two paths that *perform* a production
+merge. It does not cover `reverify_production()` / `jarvis wiz reconcile`, which
+merges nothing and only re-reads a merge that already happened. That is a
+deliberate gap and not a harmless one: the production observation it runs can
+still interleave with another subsystem's deploy, so a reconciliation run during
+someone else's deployment can read the wrong production. It is bounded by
+requiring evidence that this pipeline performed the merge (§9), and by the fact
+that it changes nothing in production itself. Closing it properly means taking
+the lease there too.
+
 - `openjarvis/core/proclock.py`, `wiz/features/pipeline.py::ship`,
   `reliability/repair.py::_merge_and_verify_production`
 - `tests/reliability/test_repair.py::TestProductionChangeLease` — real
@@ -165,6 +175,21 @@ GitHub via `reverify_production()`: only a real `merged` answer carrying a real
 merge commit counts as evidence there is anything to check. A merge that never
 landed is reported, not assumed. Production that still fails does not become
 `COMPLETE`.
+
+**It refuses a merge this pipeline did not perform.** That is the line
+`reconcile_external_merge()` exists to hold, and its own docstring says reusing
+`reverify_production()` for an unauthorised merge "would let an unauthorized
+merge complete through the same quiet path as an ordinary flaky retry". The
+evidence required is the feature's own durable `history`: `MERGING` is a state
+only `ship()` puts a feature into. A merge that arrived any other way — a coding
+session's shell running `gh pr merge`, the real FEAT-00030 case — needs the
+external-merge path, which demands the pull-request number explicitly, an
+explicit owner acknowledgement, and stamps `shipping_path` so the history is
+never erased.
+
+A refusal that did nothing raises rather than returning an unchanged feature; a
+refusal *after* the strand transition is the honest end of the call, and is
+journalled as `feature.reconcile_incomplete`.
 
 - `wiz/features/pipeline.py::reconcile_after_ship`, `wiz/features/postship.py`
 - `tests/wiz/test_pipeline.py::TestAnInterruptedShipCanBeReconciled`
@@ -324,7 +349,10 @@ Stated because a document that lists only what holds is a marketing document.
 5. **`ProcessLease` is not reentrant.** A second `acquire()` of the same lease in
    one process blocks against itself until the timeout. No current path nests,
    and nothing should be written that does.
-6. **The channel ceiling is checked against the feature's stored `source`**, not
+6. **`reverify_production()` runs outside the production-change lease** — see
+   §1. It performs no merge, but its production observation can interleave with
+   another subsystem's deploy.
+7. **The channel ceiling is checked against the feature's stored `source`**, not
    the actor causing the merge. Not currently reachable — only the Control
    Center route and the internal auto-ship path call `ship()` — but a future
    ship verb on a low-authority channel would inherit the wrong actor.
