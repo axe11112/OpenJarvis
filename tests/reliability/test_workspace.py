@@ -7,7 +7,9 @@ point is to keep a coding agent away from a checkout a human is using.
 
 from __future__ import annotations
 
+import os
 import shutil
+import socket
 import subprocess
 from pathlib import Path
 
@@ -22,6 +24,18 @@ from openjarvis.reliability.workspace import (
 pytestmark = pytest.mark.skipif(
     shutil.which("git") is None, reason="git is not installed"
 )
+
+
+def _a_pid_that_does_not_exist() -> int:
+    """A pid with no live process, found rather than guessed."""
+    for candidate in range(99000, 99999):
+        try:
+            os.kill(candidate, 0)
+        except ProcessLookupError:
+            return candidate
+        except OSError:
+            continue
+    raise AssertionError("could not find an unused pid")
 
 
 def _run(args, cwd):
@@ -391,58 +405,171 @@ class TestRepairCommitIdentity:
         assert author == "Test <t@example.com>"
 
 
+def _lock_reason(repo, path) -> str:
+    """The lock reason git records for *path*, or '' when it is not locked."""
+    listing = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    current = None
+    for line in listing.splitlines():
+        if line.startswith("worktree "):
+            current = line[len("worktree ") :].strip()
+        elif line.startswith("locked") and current == str(path):
+            return line[len("locked") :].strip()
+    return ""
+
+
+def _relock(repo, path, reason: str) -> None:
+    """Replace whatever lock is on *path* with one carrying *reason*."""
+    subprocess.run(
+        ["git", "worktree", "unlock", str(path)],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+    )
+    _run(["git", "worktree", "lock", str(path), "--reason", reason], repo)
+
+
+class TestWorktreeOwnershipIsCrossProcess:
+    """Two processes must not fight over one incident's worktree.
+
+    The worktree path is derived from the incident id and ownership was not
+    established across processes at all. A second watcher, or a hand-run
+    `jarvis reliability repair`, reaching the same incident went straight into
+    create(), found the directory, and force-deleted the tree the first one was
+    actively writing in -- a live Claude session's work gone, with nothing
+    recorded anywhere.
+
+    create() now claims the worktree with `git worktree lock`, stamping the
+    owning pid and host into git's own lock reason so any process can read it.
+    Real git throughout: this subsystem has destroyed real work twice before.
+    """
+
+    def test_create_claims_the_worktree(self, manager, repo):
+        wt = manager.create("INC-00001")
+        reason = _lock_reason(repo, wt.path)
+        assert reason.startswith("openjarvis-repair"), (
+            f"the worktree was not claimed; lock reason was {reason!r}"
+        )
+        assert f"pid={os.getpid()}" in reason
+        assert "incident=INC-00001" in reason
+
+    def test_its_own_worktree_is_still_removable(self, manager):
+        """The claim must not stop the owner cleaning up after itself."""
+        wt = manager.create("INC-00001")
+        manager.remove(wt, succeeded=True)
+        assert not Path(wt.path).exists()
+
+    def test_another_live_process_cannot_destroy_it(self, manager, repo):
+        """The defect, stated directly."""
+        wt = manager.create("INC-00001")
+        (Path(wt.path) / "work-in-progress.py").write_text("VALUE = 2\n")
+        # A live repair in another process: a pid that exists but is not ours.
+        _relock(
+            repo,
+            wt.path,
+            f"openjarvis-repair pid=1 host={socket.gethostname()} incident=INC-00001",
+        )
+
+        manager.remove(wt, succeeded=True)
+
+        assert Path(wt.path).exists(), (
+            "another process's live repair worktree was deleted"
+        )
+        assert (Path(wt.path) / "work-in-progress.py").exists(), (
+            "the other repair's uncommitted work was destroyed"
+        )
+
+    def test_a_lock_from_another_host_is_left_alone(self, manager, repo):
+        """Liveness cannot be checked across hosts, so it is never assumed."""
+        wt = manager.create("INC-00001")
+        _relock(
+            repo,
+            wt.path,
+            f"openjarvis-repair pid={os.getpid()} host=some-other-mac "
+            "incident=INC-00001",
+        )
+        manager.remove(wt, succeeded=True)
+        assert Path(wt.path).exists()
+
+    def test_a_crashed_owner_does_not_leak_the_worktree_forever(
+        self, manager, repo
+    ):
+        """Fail-closed must not mean fail-forever.
+
+        A repair killed mid-run leaves its claim behind. Refusing to clean that
+        up would leave the incident permanently unrepairable, so a lock naming
+        a dead process on this host is broken -- and only that case is.
+        """
+        wt = manager.create("INC-00001")
+        dead_pid = _a_pid_that_does_not_exist()
+        _relock(
+            repo,
+            wt.path,
+            f"openjarvis-repair pid={dead_pid} host={socket.gethostname()} "
+            "incident=INC-00001",
+        )
+
+        manager.remove(wt, succeeded=True)
+
+        assert not Path(wt.path).exists(), (
+            "a crashed repair's worktree was never reclaimed, so this incident "
+            "can never be repaired again"
+        )
+
+    def test_a_lock_this_module_did_not_write_is_respected(self, manager, repo):
+        """A person who locked a worktree by hand meant it."""
+        wt = manager.create("INC-00001")
+        _relock(repo, wt.path, "do not touch, I am debugging this")
+        manager.remove(wt, succeeded=True)
+        assert Path(wt.path).exists()
+
+    def test_create_refuses_rather_than_stealing_a_live_worktree(
+        self, manager, repo, tmp_path
+    ):
+        """What a second process actually experiences: a loud failure.
+
+        Not a silent reuse (which would mix two repairs) and not a deletion.
+        """
+        wt = manager.create("INC-00001")
+        (Path(wt.path) / "work-in-progress.py").write_text("VALUE = 2\n")
+        _relock(
+            repo,
+            wt.path,
+            f"openjarvis-repair pid=1 host={socket.gethostname()} incident=INC-00001",
+        )
+
+        second = RepairWorkspace(repo_path=str(repo), root=str(tmp_path / "worktrees"))
+        with pytest.raises(WorkspaceError):
+            second.create("INC-00001")
+
+        assert (Path(wt.path) / "work-in-progress.py").exists(), (
+            "the second process destroyed the first's work on its way to failing"
+        )
+
+
 class TestDestructiveCleanupFailsClosed:
     """A worktree git is protecting must not be deleted anyway.
 
     _remove_path ran `worktree remove --force` with check=False -- discarding
     whether git had agreed -- and then deleted the directory with
-    shutil.rmtree(ignore_errors=True) regardless. So every reason git can have
-    for refusing was overridden by a recursive delete, `git worktree lock`
-    included: the one mechanism whose entire purpose is to say "do not remove
-    this", and which --force alone is specifically documented not to override.
-
-    Real git throughout. This subsystem has destroyed real work twice before
-    (commits aa778c0 and 5a207d0), and a mock cannot tell us what git actually
-    refuses.
+    shutil.rmtree(ignore_errors=True) regardless. Every reason git can have for
+    refusing was overridden by a recursive delete.
     """
-
-    def test_a_locked_worktree_is_left_alone(self, manager, repo):
-        wt = manager.create("INC-00001")
-        (Path(wt.path) / "work-in-progress.py").write_text("VALUE = 2\n")
-        _run(["git", "worktree", "lock", wt.path], repo)
-
-        manager.remove(wt, succeeded=True)
-
-        assert Path(wt.path).exists(), (
-            "a locked worktree was deleted anyway; git worktree lock is the "
-            "one mechanism that says 'do not remove this'"
-        )
-        assert (Path(wt.path) / "work-in-progress.py").exists(), (
-            "the work inside the locked worktree was destroyed"
-        )
-
-    def test_a_locked_worktree_can_still_be_removed_after_unlocking(
-        self, manager, repo
-    ):
-        """Fail-closed must not mean fail-forever: unlocking is the way out."""
-        wt = manager.create("INC-00001")
-        _run(["git", "worktree", "lock", wt.path], repo)
-        manager.remove(wt, succeeded=True)
-        assert Path(wt.path).exists()
-
-        _run(["git", "worktree", "unlock", wt.path], repo)
-        manager.remove(wt, succeeded=True)
-        assert not Path(wt.path).exists()
 
     def test_a_stale_directory_git_never_registered_is_still_removed(
         self, manager, tmp_path
     ):
         """The case the rmtree was written for, and the reason it cannot go.
 
-        A directory left behind by a killed process: git declines to remove it
-        because it is not a working tree, and the next `worktree add` fails
-        until it is gone. Identified from git's own answer now, rather than
-        assumed for every refusal.
+        A directory left by a killed process: git declines to remove it because
+        it is not a working tree, and the next `worktree add` fails until it is
+        gone. Identified from git's own answer now, rather than assumed for
+        every refusal.
         """
         stale = tmp_path / "worktrees" / "stale-from-a-killed-process"
         stale.mkdir(parents=True)
@@ -451,8 +578,8 @@ class TestDestructiveCleanupFailsClosed:
         manager._remove_path(str(stale))
 
         assert not stale.exists(), (
-            "a stale directory git never tracked was left behind, which is "
-            "what makes the next worktree add fail"
+            "a stale directory git never tracked was left behind, which is what "
+            "makes the next worktree add fail"
         )
 
     def test_an_ordinary_dirty_worktree_is_still_removed(self, manager):
@@ -469,7 +596,11 @@ class TestDestructiveCleanupFailsClosed:
     def test_a_refusal_does_not_drop_the_branch(self, manager, repo):
         """Leaving the tree but deleting its branch would be the worst of both."""
         wt = manager.create("INC-00001")
-        _run(["git", "worktree", "lock", wt.path], repo)
+        _relock(
+            repo,
+            wt.path,
+            f"openjarvis-repair pid=1 host={socket.gethostname()} incident=INC-00001",
+        )
 
         manager.remove(wt, succeeded=True)
 

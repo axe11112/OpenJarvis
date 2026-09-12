@@ -22,7 +22,9 @@ log can say exactly what the repair was based on rather than inferring it later.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
+import socket
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -290,6 +292,11 @@ class RepairWorkspace:
         # commit on its own, so setting this only at commit_all would leave a
         # hole the agent walks straight through.
         self._apply_git_identity(str(path))
+        # Claimed for this process, so a second watcher or a hand-run
+        # `jarvis reliability repair` that reaches the same incident cannot
+        # delete the tree this one is writing in. _remove_path reads this and
+        # refuses; git itself refuses a plain `worktree remove`.
+        self._lock_worktree(str(path), incident_id)
         logger.info(
             "prepared repair worktree for %s: %s @ %s",
             incident_id,
@@ -541,6 +548,89 @@ class RepairWorkspace:
             return
         self._remove_path(worktree.path, branch=worktree.branch)
 
+    #: Marks a worktree as belonging to one live repair, in git's own lock
+    #: reason so any process can read it. Worktree ownership was previously not
+    #: established across processes at all: the path is derived from the
+    #: incident id, so a second watcher (or a hand-run
+    #: `jarvis reliability repair`) picking up the same incident went straight
+    #: into ``create()``, found the directory, and force-deleted the tree the
+    #: first one was actively writing in -- a live Claude session's work, gone,
+    #: with nothing recorded anywhere.
+    _LOCK_PREFIX = "openjarvis-repair"
+
+    def _lock_reason(self, incident_id: str) -> str:
+        return (
+            f"{self._LOCK_PREFIX} pid={os.getpid()} host={socket.gethostname()} "
+            f"incident={incident_id}"
+        )
+
+    def _lock_worktree(self, path: str, incident_id: str) -> None:
+        """Claim this worktree for this process, for as long as it is in use."""
+        git_output(
+            ["worktree", "lock", path, "--reason", self._lock_reason(incident_id)],
+            cwd=self.repo_path,
+            check=False,
+        )
+
+    def _lock_holder(self, path: str) -> Optional[str]:
+        """The lock reason on *path*, or ``None`` when it is not locked.
+
+        Read from ``git worktree list --porcelain``, which reports a ``locked``
+        line carrying the reason verbatim.
+        """
+        try:
+            listing = git_output(
+                ["worktree", "list", "--porcelain"], cwd=self.repo_path, check=False
+            )
+        except WorkspaceError:  # pragma: no cover - defensive
+            return None
+        target = str(Path(path))
+        current: Optional[str] = None
+        for line in listing.splitlines():
+            if line.startswith("worktree "):
+                current = str(Path(line[len("worktree ") :].strip()))
+            elif line.startswith("locked") and current == target:
+                reason = line[len("locked") :].strip()
+                return reason or ""
+        return None
+
+    def _may_break_lock(self, reason: str) -> bool:
+        """Whether a lock this process did not take is safe to break.
+
+        Only one case is: a lock this module took, naming a process on *this*
+        host that is no longer alive. That is a crashed repair, and refusing to
+        clean up after it forever would leave the incident permanently
+        unrepairable.
+
+        Anything else is left alone. A lock from another host cannot be checked
+        for liveness from here, and a lock nobody here wrote is not this
+        module's to break.
+        """
+        if not reason.startswith(self._LOCK_PREFIX):
+            return False
+        fields = dict(
+            part.split("=", 1)
+            for part in reason.split()
+            if "=" in part
+        )
+        if fields.get("host") != socket.gethostname():
+            return False
+        try:
+            pid = int(fields.get("pid", ""))
+        except ValueError:
+            return False
+        if pid == os.getpid():
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True  # the owner is gone; its lock is not protecting anything
+        except PermissionError:
+            return False  # alive, just not ours to signal
+        except OSError:  # pragma: no cover - defensive
+            return False
+        return False
+
     #: The one git refusal that means "there is nothing here I am tracking",
     #: and therefore the one that makes deleting the directory outright safe.
     #: Matched on git's own wording for `worktree remove` against a path it
@@ -566,6 +656,22 @@ class RepairWorkspace:
         destroyed real work twice before; unexplained is not the same as
         unwanted.
         """
+        holder = self._lock_holder(path)
+        if holder is not None:
+            if not self._may_break_lock(holder):
+                logger.error(
+                    "refusing to remove worktree %s: it is locked by another "
+                    "live repair (%s). Left in place.",
+                    path,
+                    holder or "no reason recorded",
+                )
+                return
+            # Ours, or a crashed owner on this host. Release our own claim so
+            # the removal below can proceed.
+            git_output(
+                ["worktree", "unlock", path], cwd=self.repo_path, check=False
+            )
+
         removed = False
         refusal = ""
         try:
