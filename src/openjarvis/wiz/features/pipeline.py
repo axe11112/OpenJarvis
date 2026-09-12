@@ -727,6 +727,97 @@ class FeaturePipeline:
             self.queue.submit(feature)
         return feature
 
+    #: The window between "the merge was issued" and "production was judged".
+    #: A feature here is a change that may already be live and is certainly not
+    #: proven, which makes it the most consequential place in the lifecycle for
+    #: a process to die.
+    IN_FLIGHT_SHIP_STATES = (
+        FeatureState.MERGING,
+        FeatureState.DEPLOYING,
+        FeatureState.PRODUCTION_VERIFYING,
+    )
+
+    def reconcile_after_ship(
+        self, feature_id: str, *, reason: str = ""
+    ) -> FeatureRequest:
+        """Work out what really happened to a feature that was mid-ship.
+
+        ``ship`` walks a feature MERGING -> DEPLOYING -> PRODUCTION_VERIFYING
+        -> COMPLETE. If the process dies anywhere in that window, the feature
+        stays in whichever of those three states it had reached, and nothing in
+        the system will ever look at it again: ``ship`` refuses it because it is
+        not READY, :class:`~.recovery.FeatureRecovery` excludes all three
+        states from ``_RECOVERABLE_STATES`` as "already past the point recovery
+        exists to bridge", and no operator verb reaches it. Being past that
+        point is not a reason to stop caring -- it is what makes this the one
+        window where a change is live and unproven.
+
+        Two steps, neither of which guesses. First, a feature still sitting in
+        one of those states is moved to HUMAN_REQUIRED saying exactly that: the
+        ship was interrupted and whether the merge landed is not yet known.
+        That is the same honest answer ``ship`` itself gives when it finds a
+        pull request already merged and cannot tell who merged it. Second, the
+        truth is established from GitHub rather than assumed, by
+        :func:`~.postship.reverify_production` -- which re-reads the pull
+        request, treats only a real ``merged`` answer with a real merge commit
+        as evidence there is anything to check, and then runs the ordinary
+        post-ship verification against it. A feature whose merge never landed
+        is told so and left for a person; one whose production is now good
+        reaches COMPLETE the same way an uninterrupted ship would.
+        """
+        feature = self._load(feature_id)
+        if feature.state in self.IN_FLIGHT_SHIP_STATES:
+            interrupted = feature.state.value
+            feature.transition(
+                FeatureState.HUMAN_REQUIRED,
+                at=self.clock(),
+                reason=(
+                    f"the ship was interrupted while {interrupted}; I do not "
+                    "know whether the merge landed or whether production was "
+                    "checked, so I am not assuming either"
+                ),
+            )
+            self.store.save(feature)
+            self._record(
+                feature,
+                "feature.ship_interrupted",
+                (f"found stranded in {interrupted}. {reason}").strip()[:1000],
+            )
+            self._release(feature)
+        return self.reverify_production(feature_id, reason=reason)
+
+    def reverify_production(
+        self, feature_id: str, *, reason: str = ""
+    ) -> FeatureRequest:
+        """Re-check an already-merged feature's production state.
+
+        A thin wiring of :func:`~.postship.reverify_production` onto this
+        pipeline's own collaborators. That function is careful, complete and
+        was reachable from nothing: a feature whose merge landed and whose
+        post-ship check did not agree -- a real regression, or a flake since
+        cleared -- had no way back in.
+        """
+        from openjarvis.wiz.features.postship import (
+            reverify_production as _reverify_production,
+        )
+
+        if self.shipper is None or self.postship is None:
+            raise RuntimeError(
+                "re-verifying production needs both a shipper and a post-ship "
+                "verifier; neither is configured here"
+            )
+        _reverify_production(
+            feature_id,
+            store=self.store,
+            github=self.shipper.github,
+            postship=self.postship,
+            journal=self.journal,
+            clock=self.clock,
+            reason=reason,
+            owner_notifier=self.owner_notifier,
+        )
+        return self._load(feature_id)
+
     def ship(
         self, feature_id: str, *, operator_approved: bool = False
     ) -> FeatureRequest:

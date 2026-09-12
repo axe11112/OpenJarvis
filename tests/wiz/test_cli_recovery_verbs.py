@@ -30,6 +30,8 @@ OPERATOR_VERBS: Dict[str, str] = {
     "reopen_for_owner_authorized_rebuild": "reopen",
     "approve_manual_acceptance": "accept",
     "reverify_against_current_base": "refresh-base",
+    "reconcile_after_ship": "reconcile",
+    "reverify_production": "reconcile",
 }
 
 
@@ -97,7 +99,7 @@ class TestTheVerbsAreReachable:
         suspicious = {
             name
             for name in vars(FeaturePipeline)
-            if name.startswith(("reopen_for_", "approve_", "reverify_"))
+            if name.startswith(("reopen_for_", "approve_", "reverify_", "reconcile_"))
             and not name.startswith("_")
         }
         missing = suspicious - set(OPERATOR_VERBS)

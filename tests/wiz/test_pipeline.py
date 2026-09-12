@@ -3835,3 +3835,145 @@ class TestManualAcceptanceSurvivesTheProcessThatRecordedIt:
             pipeline.approve_manual_acceptance(feature.id, reason="ship it anyway")
 
         assert "manual_acceptance" not in pipeline.store.get(feature.id).metadata
+
+
+class TestAnInterruptedShipCanBeReconciled:
+    """The one window where a change is live and nothing will look at it again.
+
+    ship() walks MERGING -> DEPLOYING -> PRODUCTION_VERIFYING -> COMPLETE. A
+    process that dies anywhere in there leaves the feature in whichever of
+    those three states it reached, and nothing revisits it: ship() refuses it
+    for not being READY, FeatureRecovery excludes all three from
+    _RECOVERABLE_STATES as "already past the point recovery exists to bridge",
+    and no operator verb reached it. Past that point is not past caring -- it
+    is precisely the window in which a merge may already be live and unproven.
+    """
+
+    class MergedGitHub(TestShip.FakeGitHub):
+        """A pull request GitHub reports as already merged."""
+
+        def __init__(self, *, merged=True, merge_commit_sha="d" * 40):
+            super().__init__()
+            self.merged = merged
+            self.merge_commit_sha = merge_commit_sha
+
+        def get_pull_request(self, number):
+            pr = dict(super().get_pull_request(number))
+            pr["merged"] = self.merged
+            pr["state"] = "closed" if self.merged else "open"
+            if self.merged:
+                pr["merge_commit_sha"] = self.merge_commit_sha
+            return pr
+
+    def _pipeline_mid_ship(self, tmp_path, clock, state, *, github=None):
+        github = github or TestShip.FakeGitHub()
+        pipeline, feature = TestShip()._ready(
+            tmp_path,
+            clock,
+            shipper=TestShip()._shipper(github),
+            postship=TestShip.FakePostShip(verified=True),
+        )
+        # Exactly where a crash mid-ship leaves it.
+        pipeline._transition(feature, FeatureState.MERGING, "merged the PR")
+        if state is not FeatureState.MERGING:
+            pipeline._transition(feature, FeatureState.DEPLOYING, "waiting on deploy")
+        if state is FeatureState.PRODUCTION_VERIFYING:
+            pipeline._transition(
+                feature, FeatureState.PRODUCTION_VERIFYING, "checking production"
+            )
+        assert pipeline.store.get(feature.id).state is state
+        return pipeline, feature, github
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            FeatureState.MERGING,
+            FeatureState.DEPLOYING,
+            FeatureState.PRODUCTION_VERIFYING,
+        ],
+    )
+    def test_ship_and_recovery_both_refuse_it(self, tmp_path, clock, state):
+        """The gap itself, stated as a test so it cannot quietly come back."""
+        from openjarvis.wiz.features.recovery import _RECOVERABLE_STATES
+
+        pipeline, feature, github = self._pipeline_mid_ship(tmp_path, clock, state)
+        assert state not in _RECOVERABLE_STATES
+
+        unchanged = pipeline.ship(feature.id)
+        assert unchanged.state is state, "ship() acted on an in-flight feature"
+        assert not github.merge_calls, "ship() merged an already-merging feature"
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            FeatureState.MERGING,
+            FeatureState.DEPLOYING,
+            FeatureState.PRODUCTION_VERIFYING,
+        ],
+    )
+    def test_reconciling_a_landed_merge_completes_it(self, tmp_path, clock, state):
+        """GitHub says the merge landed and production agrees: finish it."""
+        github = self.MergedGitHub()
+        pipeline, feature, _ = self._pipeline_mid_ship(
+            tmp_path, clock, state, github=github
+        )
+
+        reconciled = pipeline.reconcile_after_ship(
+            feature.id, reason="the watcher was restarted mid-ship"
+        )
+
+        assert reconciled.state is FeatureState.COMPLETE, (
+            f"a landed, verified merge was left at {reconciled.state.value}"
+        )
+
+    def test_reconciling_a_merge_that_never_landed_stops_for_a_person(
+        self, tmp_path, clock
+    ):
+        """The honest answer when the merge did not happen: do not guess."""
+        github = self.MergedGitHub(merged=False)
+        pipeline, feature, _ = self._pipeline_mid_ship(
+            tmp_path, clock, FeatureState.MERGING, github=github
+        )
+
+        reconciled = pipeline.reconcile_after_ship(feature.id, reason="crashed")
+
+        assert reconciled.state is FeatureState.HUMAN_REQUIRED, (
+            "an unlanded merge was completed or left in flight"
+        )
+
+    def test_production_still_failing_does_not_complete_it(self, tmp_path, clock):
+        """A real regression must not be reconciled away."""
+        github = self.MergedGitHub()
+        pipeline, feature, _ = self._pipeline_mid_ship(
+            tmp_path, clock, FeatureState.DEPLOYING, github=github
+        )
+        pipeline.postship = TestShip.FakePostShip(verified=False)
+
+        reconciled = pipeline.reconcile_after_ship(feature.id, reason="crashed")
+
+        assert reconciled.state is not FeatureState.COMPLETE, (
+            "production said no and the feature was completed anyway"
+        )
+
+    def test_the_interruption_is_journalled(self, tmp_path, clock):
+        """An unexplained state change in the ship window is the worst kind."""
+        github = self.MergedGitHub(merged=False)
+        pipeline, feature, _ = self._pipeline_mid_ship(
+            tmp_path, clock, FeatureState.MERGING, github=github
+        )
+        pipeline.reconcile_after_ship(feature.id, reason="the watcher was restarted")
+
+        kinds = [e.kind for e in pipeline.journal.tail(50)]
+        assert "feature.ship_interrupted" in kinds
+
+    def test_an_already_complete_feature_is_left_alone(self, tmp_path, clock):
+        """Idempotent: running it twice must not re-ship anything."""
+        github = self.MergedGitHub()
+        pipeline, feature, _ = self._pipeline_mid_ship(
+            tmp_path, clock, FeatureState.MERGING, github=github
+        )
+        first = pipeline.reconcile_after_ship(feature.id, reason="crashed")
+        assert first.state is FeatureState.COMPLETE
+
+        again = pipeline.reconcile_after_ship(feature.id, reason="again")
+        assert again.state is FeatureState.COMPLETE

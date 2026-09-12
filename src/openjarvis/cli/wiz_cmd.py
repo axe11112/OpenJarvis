@@ -912,3 +912,29 @@ def refresh_base(feature_id: str, expected_head_sha: str, reason: str) -> None:
         console.print(f"[red]{exc}[/red]")
         raise SystemExit(1) from exc
     _report_feature(feature, did="re-verified against the current base")
+
+
+@wiz.command("reconcile")
+@click.argument("feature_id")
+@click.option("--reason", default="", help="What you know about the interruption.")
+def reconcile(feature_id: str, reason: str) -> None:
+    """Work out what really happened to a feature that was mid-ship.
+
+    For the feature that was merging, deploying or being checked in production
+    when something died. Nothing else in the system will look at it again:
+    ``ship`` refuses it because it is not READY, and crash recovery skips those
+    states deliberately. This establishes the truth from GitHub rather than
+    assuming it -- if the merge landed and production is good it finishes the
+    feature, and if it cannot tell it says so and leaves it for you.
+
+    Also the way back in for a feature whose merge landed but whose production
+    check did not agree, once whatever was wrong has been fixed.
+    """
+    console = _console()
+    pipeline = _pipeline_or_exit()
+    try:
+        feature = pipeline.reconcile_after_ship(feature_id, reason=reason)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
+    _report_feature(feature, did="reconciled against what production actually says")
