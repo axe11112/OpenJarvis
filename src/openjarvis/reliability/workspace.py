@@ -541,20 +541,57 @@ class RepairWorkspace:
             return
         self._remove_path(worktree.path, branch=worktree.branch)
 
+    #: The one git refusal that means "there is nothing here I am tracking",
+    #: and therefore the one that makes deleting the directory outright safe.
+    #: Matched on git's own wording for `worktree remove` against a path it
+    #: does not know about: ``fatal: '<path>' is not a working tree``.
+    _NOT_A_WORKTREE = "is not a working tree"
+
     def _remove_path(self, path: str, *, branch: str = "") -> None:
-        """Remove a worktree directory and git's record of it."""
+        """Remove a worktree directory and git's record of it, or refuse to.
+
+        Fails closed. It used to run ``worktree remove --force`` with
+        ``check=False`` -- discarding whether git had agreed -- and then delete
+        the directory with ``shutil.rmtree(ignore_errors=True)`` regardless. So
+        every reason git can have for refusing was overridden by a recursive
+        delete, including ``git worktree lock``, which exists for the sole
+        purpose of saying "do not remove this" and which ``--force`` alone is
+        specifically documented not to override.
+
+        The rmtree is still needed for the case its comment named: a directory
+        left by a killed process that git never registered, which
+        ``worktree remove`` declines to touch. That case is now identified from
+        git's own answer instead of assumed, so a worktree git is protecting is
+        left alone and reported rather than deleted. This subsystem has
+        destroyed real work twice before; unexplained is not the same as
+        unwanted.
+        """
+        removed = False
+        refusal = ""
         try:
-            git_output(
-                ["worktree", "remove", "--force", path],
-                cwd=self.repo_path,
-                check=False,
-            )
-        except WorkspaceError:  # pragma: no cover - defensive
-            logger.exception("could not remove worktree %s", path)
-        # `worktree remove` leaves the directory behind if it was never
-        # registered (e.g. a stale directory from a killed process).
+            git_output(["worktree", "remove", "--force", path], cwd=self.repo_path)
+            removed = True
+        except WorkspaceError as exc:
+            refusal = str(exc)
+
         if Path(path).exists():
-            shutil.rmtree(path, ignore_errors=True)
+            if removed or self._NOT_A_WORKTREE in refusal:
+                # Either git removed its record and left the directory, or git
+                # never had a record of it. Nothing is protecting this.
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                # git refused for a reason of its own -- a lock, most likely.
+                # Leaving a directory behind costs disk. Deleting one git is
+                # protecting costs whatever was in it.
+                logger.error(
+                    "refusing to delete worktree %s: git would not remove it "
+                    "(%s). Left in place; unlock it or remove it by hand.",
+                    path,
+                    refusal or "no reason given",
+                )
+                git_output(["worktree", "prune"], cwd=self.repo_path, check=False)
+                return
+
         git_output(["worktree", "prune"], cwd=self.repo_path, check=False)
         if branch:
             self._delete_branch_if_present(branch)

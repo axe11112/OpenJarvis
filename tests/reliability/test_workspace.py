@@ -389,3 +389,98 @@ class TestRepairCommitIdentity:
             check=True,
         ).stdout.strip()
         assert author == "Test <t@example.com>"
+
+
+class TestDestructiveCleanupFailsClosed:
+    """A worktree git is protecting must not be deleted anyway.
+
+    _remove_path ran `worktree remove --force` with check=False -- discarding
+    whether git had agreed -- and then deleted the directory with
+    shutil.rmtree(ignore_errors=True) regardless. So every reason git can have
+    for refusing was overridden by a recursive delete, `git worktree lock`
+    included: the one mechanism whose entire purpose is to say "do not remove
+    this", and which --force alone is specifically documented not to override.
+
+    Real git throughout. This subsystem has destroyed real work twice before
+    (commits aa778c0 and 5a207d0), and a mock cannot tell us what git actually
+    refuses.
+    """
+
+    def test_a_locked_worktree_is_left_alone(self, manager, repo):
+        wt = manager.create("INC-00001")
+        (Path(wt.path) / "work-in-progress.py").write_text("VALUE = 2\n")
+        _run(["git", "worktree", "lock", wt.path], repo)
+
+        manager.remove(wt, succeeded=True)
+
+        assert Path(wt.path).exists(), (
+            "a locked worktree was deleted anyway; git worktree lock is the "
+            "one mechanism that says 'do not remove this'"
+        )
+        assert (Path(wt.path) / "work-in-progress.py").exists(), (
+            "the work inside the locked worktree was destroyed"
+        )
+
+    def test_a_locked_worktree_can_still_be_removed_after_unlocking(
+        self, manager, repo
+    ):
+        """Fail-closed must not mean fail-forever: unlocking is the way out."""
+        wt = manager.create("INC-00001")
+        _run(["git", "worktree", "lock", wt.path], repo)
+        manager.remove(wt, succeeded=True)
+        assert Path(wt.path).exists()
+
+        _run(["git", "worktree", "unlock", wt.path], repo)
+        manager.remove(wt, succeeded=True)
+        assert not Path(wt.path).exists()
+
+    def test_a_stale_directory_git_never_registered_is_still_removed(
+        self, manager, tmp_path
+    ):
+        """The case the rmtree was written for, and the reason it cannot go.
+
+        A directory left behind by a killed process: git declines to remove it
+        because it is not a working tree, and the next `worktree add` fails
+        until it is gone. Identified from git's own answer now, rather than
+        assumed for every refusal.
+        """
+        stale = tmp_path / "worktrees" / "stale-from-a-killed-process"
+        stale.mkdir(parents=True)
+        (stale / "leftover.txt").write_text("junk\n")
+
+        manager._remove_path(str(stale))
+
+        assert not stale.exists(), (
+            "a stale directory git never tracked was left behind, which is "
+            "what makes the next worktree add fail"
+        )
+
+    def test_an_ordinary_dirty_worktree_is_still_removed(self, manager):
+        """--force is still --force: a dirty tree is not a refusal.
+
+        The fix must not turn every uncommitted change into a permanent
+        leftover -- that is what keep_on_failure is for, decided by the caller.
+        """
+        wt = manager.create("INC-00001")
+        (Path(wt.path) / "app.py").write_text("VALUE = 999\n")
+        manager.remove(wt, succeeded=True)
+        assert not Path(wt.path).exists()
+
+    def test_a_refusal_does_not_drop_the_branch(self, manager, repo):
+        """Leaving the tree but deleting its branch would be the worst of both."""
+        wt = manager.create("INC-00001")
+        _run(["git", "worktree", "lock", wt.path], repo)
+
+        manager.remove(wt, succeeded=True)
+
+        branches = subprocess.run(
+            ["git", "branch", "--list", wt.branch],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert wt.branch in branches, (
+            "the worktree was preserved but its branch was deleted, leaving a "
+            "tree on a branch that no longer exists"
+        )
