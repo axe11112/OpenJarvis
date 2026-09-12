@@ -137,7 +137,9 @@ class ScriptedEngineer(ClaudeCodeEngineeringAgent):
     the operator's machine runs.
     """
 
-    def __init__(self, *, plan_claim="I would edit Summary.tsx", plans=None, builds=None):
+    def __init__(
+        self, *, plan_claim="I would edit Summary.tsx", plans=None, builds=None
+    ):
         super().__init__(agent_factory=self._never_called)
         self.plan_claim = plan_claim
         self.plans = list(plans or [])
@@ -730,6 +732,7 @@ class TestPathsMentionedInAPlan:
         plan = "I will edit src/lib/language.ts to fix the wording."
         assert _paths_mentioned(plan) == ["src/lib/language.ts"]
 
+
 class TestTheIterativeLoop:
     def test_a_failing_gate_produces_another_attempt_rather_than_a_message(
         self, tmp_path, clock
@@ -867,7 +870,9 @@ class TestPlanTransientCapacityFailure:
             messages.append(step.message)
         # "Sir, ... is ready" is the legitimate success notice once the retry
         # works; what must not appear is a failure notice about it.
-        assert not any("tried" in m or "usage limit" in m for m in messages if m.startswith("Sir,"))
+        assert not any(
+            "tried" in m or "usage limit" in m for m in messages if m.startswith("Sir,")
+        )
 
     def test_exhausting_the_bound_stops_with_the_real_reason(self, tmp_path, clock):
         transient = EngineeringSession(
@@ -887,7 +892,9 @@ class TestPlanTransientCapacityFailure:
         assert "session limit" in reason
         assert "could not work out how to build this" not in reason
 
-    def test_a_non_transient_plan_failure_still_stops_immediately(self, tmp_path, clock):
+    def test_a_non_transient_plan_failure_still_stops_immediately(
+        self, tmp_path, clock
+    ):
         engineer = ScriptedEngineer(
             plans=[
                 EngineeringSession(
@@ -900,8 +907,9 @@ class TestPlanTransientCapacityFailure:
         result = pipeline.run(feature.id)
         assert result.state is FeatureState.HUMAN_REQUIRED
         assert len(engineer.plan_calls) == 1
-        assert "could not work out how to build this: ambiguous request" in (
-            result.history[-1]["reason"]
+        assert (
+            "could not work out how to build this: ambiguous request"
+            in (result.history[-1]["reason"])
         )
 
 
@@ -937,7 +945,9 @@ class TestReopenForPlanning:
         pipeline.reopen_for_planning(feature.id, reason="fixed since")
 
         entries = [
-            e for e in pipeline.journal.tail(50) if e.detail.get("feature_id") == feature.id
+            e
+            for e in pipeline.journal.tail(50)
+            if e.detail.get("feature_id") == feature.id
         ]
         assert any(e.kind == "feature.reopened_for_planning" for e in entries)
 
@@ -1003,7 +1013,9 @@ class TestReopenForDeploy:
         # same diff; only the provisioning outcome changes.
         pipeline.provision_factory = _passing_provision
 
-        reopened = pipeline.reopen_for_deploy(feature.id, reason="node_modules fix landed")
+        reopened = pipeline.reopen_for_deploy(
+            feature.id, reason="node_modules fix landed"
+        )
         assert reopened.state is FeatureState.TESTING
 
         result = pipeline.run(feature.id)
@@ -1087,7 +1099,9 @@ class TestReopenForDeploy:
             tmp_path,
             clock,
             engineer=ScriptedEngineer(
-                plans=[EngineeringSession(mode="plan", succeeded=False, error="ambiguous")]
+                plans=[
+                    EngineeringSession(mode="plan", succeeded=False, error="ambiguous")
+                ]
             ),
         )
         feature = pipeline.submit(REQUEST, actor=operator_actor())
@@ -1119,7 +1133,9 @@ class TestReopenForDeploy:
         pipeline.reopen_for_deploy(feature.id, reason="node_modules fix landed")
 
         entries = [
-            e for e in pipeline.journal.tail(50) if e.detail.get("feature_id") == feature.id
+            e
+            for e in pipeline.journal.tail(50)
+            if e.detail.get("feature_id") == feature.id
         ]
         assert any(e.kind == "feature.reopened_for_deploy" for e in entries)
 
@@ -1168,7 +1184,9 @@ class TestReopenForOwnerAuthorizedRebuild:
 
         result = pipeline.run(feature.id)
         assert result.state is FeatureState.READY
-        assert len(engineer.build_calls) == first_build_calls + 1  # a new Claude session
+        assert (
+            len(engineer.build_calls) == first_build_calls + 1
+        )  # a new Claude session
         assert result.attempts_used == 2  # prior attempt preserved, not reset
 
     def test_a_second_owner_authorized_rebuild_is_refused(self, tmp_path, clock):
@@ -1183,7 +1201,9 @@ class TestReopenForOwnerAuthorizedRebuild:
         feature = pipeline.submit(REQUEST, actor=operator_actor())
         pipeline.run(feature.id)
         pipeline.provision_factory = self._always_failing_provision
-        pipeline.reopen_for_owner_authorized_rebuild(feature.id, reason="first exception")
+        pipeline.reopen_for_owner_authorized_rebuild(
+            feature.id, reason="first exception"
+        )
         stopped_again = pipeline.run(feature.id)
         assert stopped_again.state is FeatureState.HUMAN_REQUIRED
 
@@ -1210,10 +1230,14 @@ class TestReopenForOwnerAuthorizedRebuild:
         feature = pipeline.submit(REQUEST, actor=operator_actor())
         pipeline.run(feature.id)
         pipeline.provision_factory = _passing_provision
-        pipeline.reopen_for_owner_authorized_rebuild(feature.id, reason="the owner said so")
+        pipeline.reopen_for_owner_authorized_rebuild(
+            feature.id, reason="the owner said so"
+        )
 
         entries = [
-            e for e in pipeline.journal.tail(50) if e.detail.get("feature_id") == feature.id
+            e
+            for e in pipeline.journal.tail(50)
+            if e.detail.get("feature_id") == feature.id
         ]
         assert any(e.kind == "feature.owner_authorized_rebuild" for e in entries)
 
@@ -2402,9 +2426,7 @@ class TestAwaitingItemsOneOffShipApproval:
         shipped = pipeline.ship(feature.id)
         assert shipped.state is FeatureState.COMPLETE
         assert github.merge_calls
-        assert (
-            shipped.metadata["ship_manual_approved_head_sha"] == TestShip.HEAD_SHA
-        )
+        assert shipped.metadata["ship_manual_approved_head_sha"] == TestShip.HEAD_SHA
         assert "ship_manual_approval_token" not in shipped.metadata
 
     def test_approval_for_a_different_set_of_items_is_refused(self, tmp_path, clock):
@@ -2892,7 +2914,9 @@ class TestReverifyAgainstCurrentBase:
             tmp_path,
             clock,
             engineer=ScriptedEngineer(
-                plans=[EngineeringSession(mode="plan", succeeded=False, error="ambiguous")]
+                plans=[
+                    EngineeringSession(mode="plan", succeeded=False, error="ambiguous")
+                ]
             ),
         )
         feature = pipeline.submit(REQUEST, actor=operator_actor())
@@ -2942,7 +2966,9 @@ class TestReverifyAgainstCurrentBase:
         assert shipped.state is FeatureState.HUMAN_REQUIRED
         assert not github.merge_calls
 
-    def test_repeatable_a_second_base_move_can_be_refreshed_again(self, tmp_path, clock):
+    def test_repeatable_a_second_base_move_can_be_refreshed_again(
+        self, tmp_path, clock
+    ):
         github = self.FakeGitHub(base_sha=self.NEW_BASE)
         pipeline, feature, github, workspace, engineer = self._ready(
             tmp_path, clock, github=github
@@ -3005,7 +3031,9 @@ class TestReverifyAgainstCurrentBase:
         session and no new attempt spent, exactly like the READY path.
         """
         github = self.FakeGitHub(base_sha=self.NEW_BASE)
-        failing_suite = FakeSuite([FakeCheckResult(passed=False, summary="still broken")])
+        failing_suite = FakeSuite(
+            [FakeCheckResult(passed=False, summary="still broken")]
+        )
         workspace = FakeWorkspace(tmp_path)
         # Attempts already exhausted by the time reverify runs, exactly as
         # they were for real on FEAT-00031 -- so the post-reverify TESTING
@@ -3040,7 +3068,9 @@ class TestReverifyAgainstCurrentBase:
         workspace.merge_outcome = MergeOutcome(merged=True, new_sha=self.MERGED_SHA_2)
 
         refreshed = pipeline.reverify_against_current_base(
-            feature.id, expected_head_sha=exhausted_head, reason="second move, fix landed"
+            feature.id,
+            expected_head_sha=exhausted_head,
+            reason="second move, fix landed",
         )
         assert refreshed.state is FeatureState.TESTING
         assert refreshed.attempts[-1].commit_sha == self.MERGED_SHA_2
@@ -3071,7 +3101,9 @@ class TestReverifyAgainstCurrentBase:
         BUILDING -> BUILDING.
         """
         github = self.FakeGitHub(base_sha=self.NEW_BASE)
-        failing_suite = FakeSuite([FakeCheckResult(passed=False, summary="still broken")])
+        failing_suite = FakeSuite(
+            [FakeCheckResult(passed=False, summary="still broken")]
+        )
         workspace = FakeWorkspace(tmp_path)
         pipeline, feature, github, workspace, engineer = self._ready(
             tmp_path, clock, github=github, workspace=workspace, max_attempts=1
@@ -3097,7 +3129,9 @@ class TestReverifyAgainstCurrentBase:
             error="<<<<<<< HEAD",
         )
         result = pipeline.reverify_against_current_base(
-            feature.id, expected_head_sha=exhausted_head, reason="second move, real conflict"
+            feature.id,
+            expected_head_sha=exhausted_head,
+            reason="second move, real conflict",
         )
         assert result.state is FeatureState.HUMAN_REQUIRED
         assert "src/lib/language.ts" in result.history[-1]["reason"]
@@ -3119,7 +3153,9 @@ class TestReverifyAgainstCurrentBase:
         # Reached HUMAN_REQUIRED for a reason with nothing to do with the
         # base -- an ordinary owner cancellation, say.
         feature.transition(
-            FeatureState.HUMAN_REQUIRED, at=clock(), reason="operator paused this for review"
+            FeatureState.HUMAN_REQUIRED,
+            at=clock(),
+            reason="operator paused this for review",
         )
         pipeline.store.save(feature)
 
@@ -3479,7 +3515,9 @@ class TestProvisioningRunsBeforeTheCheckSuite:
                     summary="failed (exit 127)",
                     output="sh: tsc: command not found",
                 )
-            return CheckResult(name="provision", ran=True, passed=True, summary="provisioned")
+            return CheckResult(
+                name="provision", ran=True, passed=True, summary="provisioned"
+            )
 
         engineer = ScriptedEngineer()
         pipeline = build_pipeline(
@@ -3667,3 +3705,133 @@ class TestRecoveringFromAMess:
         second = workspace.create("FEAT-00001", title="a thing")
         assert second.branch == first.branch
         assert Path(second.path).is_dir()
+
+
+class TestManualAcceptanceSurvivesTheProcessThatRecordedIt:
+    """The owner's yes has to outlive the command they typed it into.
+
+    ``approve_manual_acceptance`` is an *operator* verb: the person runs
+    ``jarvis wiz accept``, which is its own short-lived process. It issued the
+    approval into an ``ApprovalStore`` that is in memory on purpose, persisted
+    only the bearer token onto the feature, and exited -- taking the only
+    record that could redeem that token with it. The watcher process that
+    later runs ``_finish`` or ``ship`` then found a token it had never issued
+    and refused, with a message indistinguishable from "you never approved".
+
+    The fix is the distinction the rest of this module already draws and this
+    one verb did not: an owner's *decision* is a durable fact about a feature
+    (``metadata["manual_acceptance"]``, validated against the feature's current
+    head SHA and current outstanding items every time it is read), while a
+    bearer token is a single-use capability that may stay in memory. Making the
+    decision durable does not make it a standing yes -- it stops matching the
+    moment the commit or the outstanding items change.
+    """
+
+    def _approvals(self):
+        from openjarvis.wiz.approvals import ApprovalStore
+
+        return ApprovalStore(clock=lambda: 0.0, ttl_seconds=900)
+
+    def _feature_awaiting_a_person(self, tmp_path, clock, approvals):
+        github = TestShip.FakeGitHub()
+        pipeline = build_pipeline(tmp_path, clock, approvals=approvals)
+        pipeline.shipper = TestAwaitingItemsOneOffShipApproval()._shipper(github)
+        pipeline.postship = TestShip.FakePostShip(verified=True)
+        submitted = pipeline.submit(REQUEST, actor=operator_actor())
+        feature = pipeline.run(submitted.id)
+        assert feature.state is FeatureState.READY
+        feature.metadata["verification"]["awaiting_a_person"] = [
+            "/ renders without layout overflow"
+        ]
+        pipeline.store.save(feature)
+        return pipeline, feature, github
+
+    def test_the_approval_outlives_a_restart(self, tmp_path, clock):
+        """Approve in one process; ship from a process that shares only disk."""
+        pipeline, feature, _ = self._feature_awaiting_a_person(
+            tmp_path, clock, self._approvals()
+        )
+
+        # Process A: `jarvis wiz accept`. It records the owner's yes and exits.
+        pipeline.approve_manual_acceptance(feature.id, reason="I looked at it")
+
+        # Process B: the watcher. Same state directory, brand new everything
+        # else -- which is exactly what a second process, or the same process
+        # after a restart, has.
+        github_b = TestShip.FakeGitHub()
+        restarted = build_pipeline(tmp_path, clock, approvals=self._approvals())
+        restarted.shipper = TestAwaitingItemsOneOffShipApproval()._shipper(github_b)
+        restarted.postship = TestShip.FakePostShip(verified=True)
+
+        shipped = restarted.ship(feature.id)
+
+        assert shipped.state is FeatureState.COMPLETE, (
+            "the owner's manual acceptance did not survive the process that "
+            "recorded it, so `jarvis wiz accept` cannot work at all"
+        )
+        assert github_b.merge_calls
+
+    def test_it_still_stops_matching_when_the_commit_changes(self, tmp_path, clock):
+        """Durable is not the same as standing: a new commit invalidates it."""
+        pipeline, feature, _ = self._feature_awaiting_a_person(
+            tmp_path, clock, self._approvals()
+        )
+        pipeline.approve_manual_acceptance(feature.id, reason="I looked at it")
+
+        moved = pipeline.store.get(feature.id)
+        moved.metadata["manual_acceptance"]["head_sha"] = "f" * 40
+        pipeline.store.save(moved)
+
+        github_b = TestShip.FakeGitHub()
+        restarted = build_pipeline(tmp_path, clock, approvals=self._approvals())
+        restarted.shipper = TestAwaitingItemsOneOffShipApproval()._shipper(github_b)
+        restarted.postship = TestShip.FakePostShip(verified=True)
+
+        shipped = restarted.ship(feature.id)
+        assert shipped.state is FeatureState.READY
+        assert not github_b.merge_calls
+
+    def test_it_still_stops_matching_when_the_items_change(self, tmp_path, clock):
+        pipeline, feature, _ = self._feature_awaiting_a_person(
+            tmp_path, clock, self._approvals()
+        )
+        pipeline.approve_manual_acceptance(feature.id, reason="I looked at it")
+
+        changed = pipeline.store.get(feature.id)
+        changed.metadata["verification"]["awaiting_a_person"] = [
+            "a completely different thing nobody has looked at"
+        ]
+        pipeline.store.save(changed)
+
+        github_b = TestShip.FakeGitHub()
+        restarted = build_pipeline(tmp_path, clock, approvals=self._approvals())
+        restarted.shipper = TestAwaitingItemsOneOffShipApproval()._shipper(github_b)
+        restarted.postship = TestShip.FakePostShip(verified=True)
+
+        shipped = restarted.ship(feature.id)
+        assert shipped.state is FeatureState.READY
+        assert not github_b.merge_calls
+
+    def test_it_refuses_to_record_a_yes_over_a_failed_automated_check(
+        self, tmp_path, clock
+    ):
+        """The invariant this whole mechanism rests on.
+
+        A person may accept what no machine could measure. They may not accept
+        a Playwright assertion that actually failed -- and since the decision
+        is now durable, the guard has to live at the moment it is recorded, not
+        only in the one caller that used to read it.
+        """
+        from openjarvis.wiz.approvals import ApprovalError
+
+        pipeline, feature, _ = self._feature_awaiting_a_person(
+            tmp_path, clock, self._approvals()
+        )
+        broken = pipeline.store.get(feature.id)
+        broken.metadata["verification"]["passed"] = False
+        pipeline.store.save(broken)
+
+        with pytest.raises(ApprovalError, match="did not pass"):
+            pipeline.approve_manual_acceptance(feature.id, reason="ship it anyway")
+
+        assert "manual_acceptance" not in pipeline.store.get(feature.id).metadata

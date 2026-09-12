@@ -476,6 +476,20 @@ class FeaturePipeline:
                 f"{feature_id} has no verified commit to bind this approval to"
             )
         head_sha = feature.attempts[-1].commit_sha
+        verification = feature.metadata.get("verification") or {}
+        if verification.get("passed") is not True:
+            # The invariant the whole mechanism rests on, enforced where the
+            # decision is *recorded* rather than only where it is read. A
+            # person may accept what no machine could measure; they may not
+            # accept a check that actually ran and failed. _finish tests this
+            # before it looks at any approval, but _finish is no longer the
+            # only way this record comes to exist, and a durable fact written
+            # over a real failure would be honoured later by a caller with no
+            # way left to tell the difference.
+            raise ApprovalError(
+                f"{feature_id} did not pass its automated checks, so there is "
+                f"nothing here a person is allowed to accept"
+            )
         outstanding = sorted(
             (feature.metadata.get("verification") or {}).get("awaiting_a_person") or []
         )
@@ -492,6 +506,29 @@ class FeaturePipeline:
             summary=reason[:1000],
         )
         feature.metadata["ship_manual_approval_token"] = approval.token
+        # The durable half, and the half that actually works. This verb is an
+        # *operator* verb: the person runs it from their own short-lived
+        # process, which then exits and takes the in-memory ApprovalStore --
+        # in memory on purpose, see its docstring -- with it. A token alone
+        # was therefore unredeemable by the watcher that later runs _finish or
+        # ship: it saw a token it had never issued and refused, with a message
+        # indistinguishable from "you never approved". So the owner's
+        # *decision* is written down as a fact about the feature, in exactly
+        # the shape _finish already records and _manual_acceptance_still_valid
+        # already validates.
+        #
+        # Durable is not standing. The record names this head SHA and this
+        # exact set of outstanding items, and every reader recomputes both
+        # from the feature as it actually is; a new commit or a changed set of
+        # items stops it matching, the same way it stops the token matching.
+        # The token is still issued, for the approval journal's account of who
+        # said yes and when.
+        feature.metadata["manual_acceptance"] = {
+            "head_sha": head_sha,
+            "items": list(outstanding),
+            "owner_confirmed": True,
+            "confirmed_at": self.clock(),
+        }
         self.store.save(feature)
         self._record(feature, "feature.manual_acceptance_approved", reason[:1000])
         return feature
@@ -1469,7 +1506,25 @@ class FeaturePipeline:
             # against whatever this feature's outstanding items and head
             # SHA actually are right now, so it can never stand in for a
             # different set of items or a different commit.
+            # Token first, durable record second -- and the order matters.
+            # This is where a single-use token is *spent*: redeeming it is
+            # what consumes it, so checking the durable record first would
+            # short-circuit past the redemption and leave a live bearer
+            # capability lying on the feature. The durable record is the
+            # fallback for the case the token cannot cover: an owner who ran
+            # approve_manual_acceptance in their own process, whose in-memory
+            # ApprovalStore went away when that process exited. Both are bound
+            # to this feature, this head SHA and this exact set of outstanding
+            # items, so neither stands in for the other's absence.
+            #
+            # ship() asks the same two questions in the opposite order, for
+            # the opposite reason: by the time it runs, this method has
+            # already spent the token, and re-redeeming it there always failed
+            # -- which is what made ship() refuse every feature that had ever
+            # needed a person to look at it.
             manual_approved = self._awaiting_items_approved(
+                feature, head_sha=attempt.commit_sha
+            ) or self._manual_acceptance_still_valid(
                 feature, head_sha=attempt.commit_sha
             )
             if not manual_approved:
