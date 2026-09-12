@@ -637,15 +637,24 @@ class RepairWorkspace:
         and the feature became unretryable with a git error an operator cannot
         act on. That is precisely the bug pruning was added to prevent.
 
-        So the lock is released first, but only for a registration whose
-        directory no longer exists. That is the one case where the owner's
-        identity does not matter at all: a worktree with no directory cannot be
-        protecting anybody's work, whoever claimed it. A registration whose
-        directory is still there is left completely alone, lock and all --
+        So the lock is released first, but only for a registration that is both
+        (a) locked by *this module* and (b) missing its directory. Both
+        conditions are load-bearing.
+
+        A registration whose directory still exists is left alone, lock and all:
         that may be a live repair in another process.
+
+        A lock this module did not write is left alone even when the directory is
+        gone, because "the directory is gone" is exactly the situation
+        ``git worktree lock`` is documented for -- a worktree on a portable
+        device or a network share that is not always mounted. Stripping that lock
+        and pruning the registration would destroy the record the lock existed to
+        protect, which is the opposite of the point. An operator who wants such a
+        worktree gone can unlock it by hand, and the same asymmetry already
+        governs removal (see :meth:`_may_break_lock`).
         """
         for path, locked in self._registered_worktrees():
-            if locked is None:
+            if locked is None or not locked.startswith(self._LOCK_PREFIX):
                 continue
             if Path(path).exists():
                 continue  # someone may be working in it; never touch the lock

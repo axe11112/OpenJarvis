@@ -4081,3 +4081,61 @@ class TestReconcileIsNotTheExternalMergePath:
 
         with pytest.raises(ApprovalError, match="not merged"):
             pipeline.reconcile_after_ship(feature.id, reason="try again")
+
+
+class TestTheOwnersDecisionKeepsItsOwnTimestamp:
+    """`confirmed_at` answers "when did a person say yes", so it belongs to the
+    decision and not to the last time something read it.
+
+    Once _finish could be satisfied by an existing manual_acceptance record,
+    reassigning that record unconditionally stamped a fresh confirmed_at over
+    the moment the owner actually decided -- on every run, using the record's own
+    authority to backdate itself forward. An audit field that moves whenever it
+    is read is not an audit field.
+    """
+
+    def _accepted(self, tmp_path, clock):
+        helper = TestManualAcceptanceSurvivesTheProcessThatRecordedIt()
+        return helper._feature_awaiting_a_person(
+            tmp_path, clock, helper._approvals()
+        )
+
+    def test_finish_does_not_restamp_a_matching_record(self, tmp_path, clock):
+        pipeline, feature, _ = self._accepted(tmp_path, clock)
+        pipeline.approve_manual_acceptance(feature.id, reason="I looked at it")
+        recorded = pipeline.store.get(feature.id).metadata["manual_acceptance"]
+        original_at = recorded["confirmed_at"]
+        assert original_at
+
+        # Anything that reads the record again must not move its timestamp.
+        again = pipeline.store.get(feature.id)
+        pipeline._manual_acceptance_still_valid(
+            again, head_sha=recorded["head_sha"]
+        )
+        assert (
+            pipeline.store.get(feature.id).metadata["manual_acceptance"][
+                "confirmed_at"
+            ]
+            == original_at
+        )
+
+    def test_a_record_for_a_different_commit_is_replaced_not_kept(
+        self, tmp_path, clock
+    ):
+        """Not restamping must not become never updating."""
+        pipeline, feature, _ = self._accepted(tmp_path, clock)
+        pipeline.approve_manual_acceptance(feature.id, reason="I looked at it")
+
+        stale = pipeline.store.get(feature.id)
+        stale.metadata["manual_acceptance"]["head_sha"] = "0" * 40
+        pipeline.store.save(stale)
+
+        # A record naming a different commit does not describe this feature's
+        # current state and must not be treated as still covering it.
+        assert (
+            pipeline._manual_acceptance_still_valid(
+                pipeline.store.get(feature.id),
+                head_sha=stale.attempts[-1].commit_sha,
+            )
+            is False
+        )

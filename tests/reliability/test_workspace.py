@@ -677,12 +677,37 @@ class TestPruningStillWorksWithOwnershipLocks:
             "a prune released a live repair's claim on its worktree"
         )
 
-    def test_a_foreign_lock_on_a_vanished_directory_is_still_cleared(
+    def test_a_foreign_lock_on_a_vanished_directory_is_respected(
         self, manager, repo
     ):
-        """Ownership does not matter when there is nothing left to own."""
+        """A missing directory is exactly what `git worktree lock` is FOR.
+
+        git documents it for a worktree on a portable device or a network share
+        that is not always mounted. Stripping such a lock because the directory
+        is absent would destroy the registration the lock exists to protect --
+        the opposite of the point. Only locks this module wrote are released.
+        """
         wt = manager.create("INC-00001")
-        _relock(repo, wt.path, "somebody else entirely, from another machine")
+        _relock(repo, wt.path, "on the external drive, back on Monday")
+        shutil.rmtree(wt.path)
+
+        manager.prune_stale_worktrees()
+
+        listing = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert str(Path(wt.path).resolve()) in listing, (
+            "a lock this module did not write was stripped and its registration "
+            "pruned, destroying what the lock existed to protect"
+        )
+
+    def test_our_own_lock_on_a_vanished_directory_is_cleared(self, manager, repo):
+        """The case that must keep working: our own crashed repair."""
+        wt = manager.create("INC-00001")
         shutil.rmtree(wt.path)
 
         manager.prune_stale_worktrees()

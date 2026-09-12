@@ -1706,12 +1706,27 @@ class FeaturePipeline:
             # itself is never touched — it stays exactly what was actually
             # measured, permanently; this is a second, independent reason
             # the pipeline may still proceed despite it.
-            feature.metadata["manual_acceptance"] = {
-                "head_sha": attempt.commit_sha,
-                "items": list(verification.awaiting_a_person),
-                "owner_confirmed": True,
-                "confirmed_at": self.clock(),
-            }
+            # Written, not rewritten. Now that this method can be satisfied by
+            # an existing manual_acceptance record (see manual_approved above),
+            # reassigning it unconditionally would stamp a fresh confirmed_at
+            # over the moment the owner actually decided -- every time _finish
+            # runs, using the record's own authority to backdate itself forward.
+            # confirmed_at is the audit answer to "when did a person say yes",
+            # so it belongs to the decision, not to the last time something read
+            # it.
+            existing = feature.metadata.get("manual_acceptance") or {}
+            already_recorded = (
+                existing.get("head_sha") == attempt.commit_sha
+                and sorted(existing.get("items") or [])
+                == sorted(verification.awaiting_a_person)
+            )
+            if not already_recorded:
+                feature.metadata["manual_acceptance"] = {
+                    "head_sha": attempt.commit_sha,
+                    "items": list(verification.awaiting_a_person),
+                    "owner_confirmed": True,
+                    "confirmed_at": self.clock(),
+                }
             self.store.save(feature)
             self._record(
                 feature,

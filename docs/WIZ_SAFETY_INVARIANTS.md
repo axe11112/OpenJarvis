@@ -132,6 +132,18 @@ consent granted to something the operator has not seen since.
 Durable is not standing. A new commit or a changed set of items stops the record
 matching, exactly as it would stop a token matching.
 
+**It has no expiry, and that is a choice rather than an omission.** The bearer
+token it replaced carried a 900-second TTL, and while both SHA and item set are
+unchanged the record is honoured however long ago the owner recorded it. Two
+reasons. The binding that matters is to a *commit and a set of items*, not to a
+clock: if neither has moved, the owner's judgement about that exact commit has
+not gone stale. And the 900 seconds was already the wrong bound — the pipeline's
+own latency between issuing and redeeming (a preview deploy, a browser run, an
+optional review session) could consume it, so the TTL expired approvals that
+were still perfectly valid. A reader should not infer single-use semantics from
+the word "approval" here: this is a fact about a commit, and it is reusable for
+exactly as long as that commit and those items are what the owner looked at.
+
 - `wiz/approvals.py`, `wiz/features/pipeline.py::_manual_acceptance_still_valid`
 - `tests/wiz/test_pipeline.py::TestManualAcceptanceSurvivesTheProcessThatRecordedIt`
 
@@ -300,9 +312,18 @@ indicator reporting a guarantee nothing enforces is worse than no indicator.
 
 ## 17. Feature work defers to a production change in flight
 
-**enforced.** `DevelopmentQueue.admit_next()` refuses while the
-production-change lease is held, asked through `ProcessLease.is_held()` — which
-asks the kernel. Never through `current_holder()`, which reads a record a
+**enforced for automatic shipping.** The reachable gate is
+`auto_ship_if_eligible()`, which asks `_reliability_busy()` — the queue's
+snapshot — and declines with a journalled `feature.auto_ship_skipped`, leaving
+the feature safely at `READY`. It is asked through `ProcessLease.is_held()` —
+which asks the kernel.
+
+`DevelopmentQueue.admit_next()` carries the same refusal and is the more
+complete one, but it has **no caller in `src/`**, so it enforces nothing today;
+see §19. Nothing automatically retries a deferred auto-ship either: the feature
+waits at `READY` for the dashboard's Ship button or the next call. That is the
+safe direction — `READY` is a resting state and the lease is bounded — but it is
+a reduction in autonomy, not a no-op. Never through `current_holder()`, which reads a record a
 SIGKILLed holder leaves behind and would stall every feature for the rest of the
 machine's uptime after one crash.
 
@@ -349,10 +370,14 @@ Stated because a document that lists only what holds is a marketing document.
 5. **`ProcessLease` is not reentrant.** A second `acquire()` of the same lease in
    one process blocks against itself until the timeout. No current path nests,
    and nothing should be written that does.
-6. **`reverify_production()` runs outside the production-change lease** — see
+6. **`DevelopmentQueue.admit_next()` has no caller.** The queue's own
+   production-deferral and concurrency refusal are therefore unreachable; only
+   the `auto_ship_if_eligible` path in §17 actually defers. Features are
+   submitted to the queue and finished on it, but nothing admits from it.
+7. **`reverify_production()` runs outside the production-change lease** — see
    §1. It performs no merge, but its production observation can interleave with
    another subsystem's deploy.
-7. **The channel ceiling is checked against the feature's stored `source`**, not
+8. **The channel ceiling is checked against the feature's stored `source`**, not
    the actor causing the merge. Not currently reachable — only the Control
    Center route and the internal auto-ship path call `ship()` — but a future
    ship verb on a low-authority channel would inherit the wrong actor.
