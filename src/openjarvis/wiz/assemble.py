@@ -33,6 +33,7 @@ from openjarvis.wiz.features.queue import DevelopmentQueue
 from openjarvis.wiz.features.store import FeatureStore
 from openjarvis.wiz.features.workspace import FeatureWorkspace
 from openjarvis.wiz.memory import ProductMemory
+from openjarvis.wiz.proclock import ProcessLease
 from openjarvis.wiz.product import ProductVerbs
 from openjarvis.wiz.settings import SETTINGS_FILENAME, WizSettings, load_settings
 
@@ -110,6 +111,11 @@ def assemble(
         shipper=_shipper(resolved, config, profile),
         # journal likewise set by build_wiz, once construction has succeeded.
         postship=_postship(config, profile, verifier),
+        # Cross-process guard on top of the pipeline's own in-process
+        # _ship_lock — see ProcessLease and FeaturePipeline.ship()'s
+        # docstring. Lives alongside the journal and feature DB, not inside
+        # the git checkout: it guards this machine's Wiz state, not the repo.
+        ship_lease=ProcessLease(root / "ship.lock", owner=f"wiz@{profile.name}"),
     )
 
     return ProductVerbs(

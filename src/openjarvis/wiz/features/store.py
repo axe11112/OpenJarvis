@@ -10,6 +10,17 @@ The whole request is stored as one JSON document with a few columns lifted out
 for querying. The document is the record of what happened, and its shape is
 allowed to grow as the pipeline learns to record more; the columns exist only so
 "show me everything building right now" does not mean deserialising everything.
+
+SQLite's own file locking already keeps two processes from corrupting a single
+row's *bytes* — a write from each commits or blocks, never interleaves. It does
+nothing about two processes both reading the same feature, both deciding what
+its next state should be, and both calling :meth:`save`: the second commit
+would silently overwrite everything the first one added (a whole build attempt,
+a state transition, an approval token — an ordinary last-writer-wins race, not
+a storage bug). :meth:`save` guards against exactly that with a version column,
+checked and incremented atomically in the same statement: a save whose expected
+version no longer matches raises :class:`ConcurrentModificationError` rather
+than winning silently.
 """
 
 from __future__ import annotations
@@ -25,7 +36,7 @@ from openjarvis.wiz.features.model import FeatureRequest, FeatureState
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["FeatureStore"]
+__all__ = ["FeatureStore", "ConcurrentModificationError"]
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS features (
@@ -38,7 +49,8 @@ CREATE TABLE IF NOT EXISTS features (
     source       TEXT NOT NULL DEFAULT '',
     created_at   TEXT NOT NULL DEFAULT '',
     updated_at   TEXT NOT NULL DEFAULT '',
-    document     TEXT NOT NULL
+    document     TEXT NOT NULL,
+    version      INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS features_state ON features(state);
 CREATE INDEX IF NOT EXISTS features_priority ON features(priority);
@@ -55,6 +67,27 @@ CREATE TABLE IF NOT EXISTS counters (
 """
 
 
+class ConcurrentModificationError(RuntimeError):
+    """Raised by :meth:`FeatureStore.save` when the row moved under it.
+
+    Means exactly one thing: some other saver — another thread, another
+    process, another Wiz entirely against the same state directory —
+    persisted this feature after this caller last read it. Whatever this
+    caller was about to write is built on a stale view and must not be
+    committed blindly on top; the caller should re-read the feature, decide
+    whether its change still makes sense, and retry.
+    """
+
+    def __init__(self, feature_id: str, *, expected_version: int, actual_version: int):
+        self.feature_id = feature_id
+        self.expected_version = expected_version
+        self.actual_version = actual_version
+        super().__init__(
+            f"{feature_id} was saved by someone else first (expected version "
+            f"{expected_version}, found {actual_version}) — reload and retry"
+        )
+
+
 class FeatureStore:
     """Feature requests on disk."""
 
@@ -66,6 +99,21 @@ class FeatureStore:
         self._conn.row_factory = sqlite3.Row
         with self._conn:
             self._conn.executescript(_SCHEMA)
+            self._migrate_locked()
+
+    def _migrate_locked(self) -> None:
+        """Add columns a database created before they existed is missing.
+
+        ``CREATE TABLE IF NOT EXISTS`` does nothing for a table that already
+        exists, so a ``features.db`` written by an older version of this
+        store never gets ``version`` from the schema above — it has to be
+        added explicitly, once, here.
+        """
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(features)")}
+        if "version" not in columns:
+            self._conn.execute(
+                "ALTER TABLE features ADD COLUMN version INTEGER NOT NULL DEFAULT 1"
+            )
 
     @property
     def path(self) -> Path:
@@ -119,23 +167,46 @@ class FeatureStore:
             self._conn.execute(
                 "INSERT INTO features "
                 "(id, title, state, priority, risk, target, source, "
-                " created_at, updated_at, document) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " created_at, updated_at, document, version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
                 self._row(feature),
             )
+        feature.store_version = 1
         return feature
 
     def save(self, feature: FeatureRequest) -> FeatureRequest:
-        """Write *feature* back, refusing to invent one that was never created."""
+        """Write *feature* back, refusing to invent one that was never created.
+
+        Optimistically concurrent: the row is only updated if its version is
+        still what this ``feature`` was loaded with, and the check-and-bump
+        happens in the one statement so nothing can race between them. A
+        feature not loaded through this store (``store_version`` still its
+        dataclass default of ``0``) saves against version 0 — which matches
+        no row a real ``create()``/``get()`` ever produces, so such a save
+        only succeeds by chance-matching an already-corrupt row, never by
+        silently bypassing the check.
+        """
+        expected = feature.store_version
         with self._lock, self._conn:
             cursor = self._conn.execute(
                 "UPDATE features SET title=?, state=?, priority=?, risk=?, "
-                "target=?, source=?, created_at=?, updated_at=?, document=? "
-                "WHERE id=?",
-                self._row(feature)[1:] + (feature.id,),
+                "target=?, source=?, created_at=?, updated_at=?, document=?, "
+                "version=version+1 "
+                "WHERE id=? AND version=?",
+                self._row(feature)[1:] + (feature.id, expected),
             )
             if cursor.rowcount == 0:
-                raise KeyError(f"no feature request {feature.id!r} to save")
+                current = self._conn.execute(
+                    "SELECT version FROM features WHERE id=?", (feature.id,)
+                ).fetchone()
+                if current is None:
+                    raise KeyError(f"no feature request {feature.id!r} to save")
+                raise ConcurrentModificationError(
+                    feature.id,
+                    expected_version=expected,
+                    actual_version=int(current["version"]),
+                )
+        feature.store_version = expected + 1
         return feature
 
     @staticmethod
@@ -162,7 +233,7 @@ class FeatureStore:
     def get(self, feature_id: str) -> Optional[FeatureRequest]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT document FROM features WHERE id=?", (feature_id,)
+                "SELECT document, version FROM features WHERE id=?", (feature_id,)
             ).fetchone()
         return self._hydrate(row)
 
@@ -172,7 +243,7 @@ class FeatureStore:
         states: Optional[Iterable[FeatureState]] = None,
         limit: int = 50,
     ) -> List[FeatureRequest]:
-        query = "SELECT document FROM features"
+        query = "SELECT document, version FROM features"
         params: List[Any] = []
         if states is not None:
             wanted = [FeatureState.parse(s).value for s in states]
@@ -205,10 +276,12 @@ class FeatureStore:
         if row is None:
             return None
         try:
-            return FeatureRequest.from_dict(json.loads(row["document"]))
+            feature = FeatureRequest.from_dict(json.loads(row["document"]))
         except (ValueError, TypeError) as exc:
             logger.error("a stored feature request could not be read: %s", exc)
             return None
+        feature.store_version = int(row["version"])
+        return feature
 
     def close(self) -> None:
         with self._lock:

@@ -334,6 +334,16 @@ class FeatureRequest:
 
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    #: Optimistic-concurrency bookkeeping, set by
+    #: :class:`~openjarvis.wiz.features.store.FeatureStore` when a feature is
+    #: created or loaded, consumed and bumped by its ``save()``. Not domain
+    #: state: never touched by :meth:`transition`, and deliberately excluded
+    #: from equality/repr and from :meth:`to_dict`/:meth:`from_dict` so it
+    #: never leaks into the journal or the stored document, and a feature
+    #: built directly — as every test in this codebase does — behaves
+    #: exactly as before unless it actually goes through the store.
+    store_version: int = field(default=0, compare=False, repr=False)
+
     # -- lifecycle ---------------------------------------------------------
 
     @property

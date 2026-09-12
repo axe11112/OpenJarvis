@@ -1,5 +1,17 @@
 """An append-only, hash-chained record of what Wiz decided and why.
 
+Appending is guarded two ways: a ``threading.Lock`` for ordering within this
+process, and a :class:`~openjarvis.wiz.proclock.ProcessLease` for ordering
+*between* processes. Both matter here specifically, more than in most of this
+codebase's other single-flight guards: the in-process lock alone would let
+two OpenJarvis processes each read the same tail, both compute the next
+sequence number and previous-hash from it, and both append — producing two
+entries claiming the same sequence, which :meth:`WizJournal.verify` cannot
+tell apart from tampering. An audit trail that cannot survive its own writer
+running twice is not much of an audit trail. See
+:mod:`openjarvis.wiz.proclock` for why a kernel ``flock`` lease rather than a
+hand-rolled scheme.
+
 This is the third hash chain in the system, and that is a deliberate choice
 rather than an oversight. The other two record different subjects and cannot
 absorb this one without being distorted: ``security/audit.py`` records scanner
@@ -30,6 +42,8 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+from openjarvis.wiz.proclock import ProcessLease
 
 logger = logging.getLogger(__name__)
 
@@ -142,12 +156,32 @@ class JournalEntry:
         )
 
 
+#: How long record() waits for another process's append before giving up.
+#: Short: a journal write happens on nearly every pipeline step, so a wedged
+#: holder should surface as a fast, loud failure (caught and logged by
+#: callers such as FeaturePipeline._record) rather than stalling the whole
+#: pipeline behind it.
+DEFAULT_LEASE_TIMEOUT = 10.0
+
+
 class WizJournal:
     """A JSONL file of :class:`JournalEntry`, chained and append-only."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        lease_timeout: float = DEFAULT_LEASE_TIMEOUT,
+    ) -> None:
         self._path = Path(path)
         self._lock = threading.Lock()
+        # Cross-process append ordering — see the module docstring. The
+        # lockfile sits next to the journal it protects, named distinctly so
+        # nothing that globs *.jsonl picks it up.
+        self._lease = ProcessLease(
+            self._path.with_name(self._path.name + ".lock"), owner="wiz-journal"
+        )
+        self._lease_timeout = lease_timeout
 
     @property
     def path(self) -> Path:
@@ -167,7 +201,9 @@ class WizJournal:
         detail: Optional[Dict[str, Any]] = None,
     ) -> JournalEntry:
         """Append one entry and return it, sealed."""
-        with self._lock:
+        with self._lock, self._lease.acquire(
+            timeout=self._lease_timeout, reason=f"journal.record: {kind}"
+        ):
             sequence, previous = self._tail_locked()
             entry = JournalEntry(
                 sequence=sequence + 1,
