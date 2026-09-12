@@ -385,6 +385,9 @@ def _build_supervised_monitor(config: Any, store: Any) -> tuple:
         gate=RepairGate(
             max_concurrent=rc.watch.max_concurrent_repairs,
             cooldown_seconds=float(rc.watch.cooldown_seconds),
+            # The durable emergency stop, so pulling it stops this watcher
+            # even though the operator pulled it from another process.
+            stop_engaged=lambda: _stop_flag_path(config).is_file(),
         ),
         flapping=FlappingDetector(
             window=rc.flapping.window,

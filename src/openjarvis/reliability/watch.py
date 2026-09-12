@@ -239,6 +239,22 @@ class RepairGate:
     #: existed.
     pending_pr_cooldown_seconds: float = 3600.0
     clock: Callable[[], float] = time.monotonic
+    #: Whether an operator has engaged the durable emergency stop, asked fresh
+    #: on every admission.
+    #:
+    #: ``_blocked`` below is an in-process bool that only ``stop()`` sets, so
+    #: it blocks repairs only for whoever holds this object. The emergency stop
+    #: an operator actually pulls is a file (see :func:`stop_flag_path`), and
+    #: nothing in this module ever read it: the Control Center displayed
+    #: "ENGAGED -- new repairs are blocked" from that file while this gate,
+    #: running in the watcher process, went on admitting repairs and merging
+    #: them to production. A safety indicator that reports a guarantee nothing
+    #: enforces is worse than no indicator.
+    #:
+    #: Checked per admission rather than cached, because the point of an
+    #: emergency stop is that it takes effect when it is pulled, not at the
+    #: next restart of a process that may be mid-outage and never restart.
+    stop_engaged: Callable[[], bool] = lambda: False
     _active: Dict[str, float] = field(default_factory=dict, repr=False)
     _cooldown_until: Dict[str, float] = field(default_factory=dict, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
@@ -256,11 +272,24 @@ class RepairGate:
         with self._lock:
             self._blocked = False
 
+    def _stop_engaged(self) -> bool:
+        """The durable stop flag, read defensively.
+
+        A probe that raises must not be read as "not stopped": if this cannot
+        tell whether an operator has pulled the stop, the safe answer is that
+        they have.
+        """
+        try:
+            return bool(self.stop_engaged())
+        except Exception:  # noqa: BLE001 - an unreadable stop is a stop
+            logger.exception("could not read the emergency stop; refusing repairs")
+            return True
+
     @property
     def blocked(self) -> bool:
-        """Whether new repairs are refused."""
+        """Whether new repairs are refused, for any reason."""
         with self._lock:
-            return self._blocked
+            return self._blocked or self._stop_engaged()
 
     # -- admission --------------------------------------------------------
 
@@ -274,6 +303,8 @@ class RepairGate:
         """
         with self._lock:
             if self._blocked:
+                return False, "new repairs are blocked (emergency stop)"
+            if self._stop_engaged():
                 return False, "new repairs are blocked (emergency stop)"
             if incident_id in self._active:
                 return False, "a repair for this incident is already running"
@@ -370,7 +401,10 @@ class RepairGate:
         with self._lock:
             now = self.clock()
             return {
-                "blocked": self._blocked,
+                # The property, not the bare field: a snapshot that reported
+                # "not blocked" while the durable stop flag was engaged would
+                # be the same false reassurance the Control Center was giving.
+                "blocked": self._blocked or self._stop_engaged(),
                 "active": sorted(self._active),
                 "max_concurrent": self.max_concurrent,
                 "cooling_down": {

@@ -631,3 +631,78 @@ class TestSupervisorStatus:
         supervisor.recover_interrupted_repairs()
 
         assert supervisor.status()["recovery_required"] == [incident.id]
+
+
+class TestTheDurableEmergencyStopActuallyStops:
+    """The stop an operator pulls is a file; the gate only knew about a bool.
+
+    RepairGate._blocked is set by WatchLoop.stop(), an in-process method call,
+    so it blocked repairs for whoever held that object and nobody else. The
+    emergency stop an operator actually engages is a flag file -- and nothing
+    in watch.py ever read it. The Control Center read it and displayed
+    "ENGAGED: new repairs are blocked", the Wiz routes read it and refused to
+    auto-ship, and the watcher process went on admitting repairs and merging
+    them to production. A safety indicator reporting a guarantee nothing
+    enforces is worse than no indicator at all.
+    """
+
+    def test_an_engaged_stop_refuses_a_repair(self, tmp_path):
+        flag = tmp_path / "STOP"
+        gate = RepairGate(stop_engaged=flag.is_file)
+        assert gate.may_start("INC-00001")[0] is True
+
+        flag.write_text("")
+
+        allowed, reason = gate.may_start("INC-00002")
+        assert allowed is False, (
+            "the watcher admitted a repair while the emergency stop was engaged"
+        )
+        assert "emergency stop" in reason
+
+    def test_it_takes_effect_without_a_restart(self, tmp_path):
+        """The whole point: a stop pulled mid-outage must apply now.
+
+        The process that needs stopping is the one that is busy, and it may
+        never restart on its own.
+        """
+        flag = tmp_path / "STOP"
+        gate = RepairGate(stop_engaged=flag.is_file)
+        assert gate.may_start("INC-00001")[0] is True
+        flag.write_text("")
+        assert gate.may_start("INC-00001")[0] is False
+        flag.unlink()
+        assert gate.may_start("INC-00001")[0] is True
+
+    def test_the_snapshot_does_not_claim_it_is_unblocked(self, tmp_path):
+        """The false reassurance, closed at the other end too."""
+        flag = tmp_path / "STOP"
+        gate = RepairGate(stop_engaged=flag.is_file)
+        flag.write_text("")
+        assert gate.blocked is True
+
+    def test_an_unreadable_stop_flag_refuses_repairs(self, tmp_path):
+        """Fail closed: if it cannot tell, the answer is that it is stopped."""
+
+        def _broken() -> bool:
+            raise OSError("the state directory is gone")
+
+        gate = RepairGate(stop_engaged=_broken)
+        allowed, reason = gate.may_start("INC-00001")
+        assert allowed is False
+        assert "emergency stop" in reason
+
+    def test_the_default_is_no_stop(self):
+        """A bare RepairGate must not refuse everything."""
+        assert RepairGate().may_start("INC-00001")[0] is True
+
+    def test_the_watcher_factory_wires_the_flag(self):
+        """Asserted at the wiring, because the wiring is what was missing."""
+        import inspect
+
+        from openjarvis.cli import reliability_cmd
+
+        source = inspect.getsource(reliability_cmd)
+        assert "stop_engaged=lambda: _stop_flag_path(config).is_file()" in source, (
+            "the watcher's RepairGate no longer reads the durable emergency "
+            "stop, so pulling it leaves repairs running"
+        )
