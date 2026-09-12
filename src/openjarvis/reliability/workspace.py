@@ -277,6 +277,15 @@ class RepairWorkspace:
         base_commit = self.resolve_commit(base_ref)
         branch = self.branch_name_for(incident_id)
         path = Path(self.root) / incident_id
+        # Drop registrations whose directories are already gone, before
+        # anything below tries to reuse their branch. A directory removed out
+        # from under its registration -- a killed process, a cleaned temp
+        # directory, an operator tidying up -- leaves the branch counting as
+        # checked out somewhere, so `branch -D` fails and `worktree add -b`
+        # fails, and the incident can never be repaired again. FeatureWorkspace
+        # has pruned first for exactly this reason since aa778c09; this side
+        # never did, and failed the same way.
+        self.prune_stale_worktrees()
         if path.exists():
             # A previous attempt left one behind; reuse would mix two repairs.
             self._remove_path(str(path), branch=branch)
@@ -572,6 +581,58 @@ class RepairWorkspace:
             check=False,
         )
 
+    def _registered_worktrees(self) -> List[tuple]:
+        """Every worktree git has a record of, as ``(path, lock_reason_or_None)``."""
+        try:
+            listing = git_output(
+                ["worktree", "list", "--porcelain"], cwd=self.repo_path, check=False
+            )
+        except WorkspaceError:  # pragma: no cover - defensive
+            return []
+        entries: List[tuple] = []
+        current: Optional[str] = None
+        locked: Optional[str] = None
+        for line in listing.splitlines():
+            if line.startswith("worktree "):
+                if current is not None:
+                    entries.append((current, locked))
+                current = line[len("worktree ") :].strip()
+                locked = None
+            elif line.startswith("locked") and current is not None:
+                locked = line[len("locked") :].strip()
+        if current is not None:
+            entries.append((current, locked))
+        return entries
+
+    def prune_stale_worktrees(self) -> None:
+        """Drop git's record of worktrees whose directories are gone.
+
+        ``git worktree prune`` silently skips a *locked* worktree -- it exits 0
+        and removes nothing. Since :meth:`create` locks every worktree it makes
+        (see :attr:`_LOCK_PREFIX`), a plain prune stopped working the moment
+        ownership was introduced: a directory removed out from under a
+        registration left the lock behind, the branch went on counting as
+        checked out somewhere, ``branch -D`` failed, ``worktree add -b`` failed,
+        and the feature became unretryable with a git error an operator cannot
+        act on. That is precisely the bug pruning was added to prevent.
+
+        So the lock is released first, but only for a registration whose
+        directory no longer exists. That is the one case where the owner's
+        identity does not matter at all: a worktree with no directory cannot be
+        protecting anybody's work, whoever claimed it. A registration whose
+        directory is still there is left completely alone, lock and all --
+        that may be a live repair in another process.
+        """
+        for path, locked in self._registered_worktrees():
+            if locked is None:
+                continue
+            if Path(path).exists():
+                continue  # someone may be working in it; never touch the lock
+            git_output(
+                ["worktree", "unlock", path], cwd=self.repo_path, check=False
+            )
+        git_output(["worktree", "prune"], cwd=self.repo_path, check=False)
+
     def _lock_holder(self, path: str) -> Optional[str]:
         """The lock reason on *path*, or ``None`` when it is not locked.
 
@@ -720,6 +781,9 @@ class RepairWorkspace:
         for child in sorted(root.iterdir()):
             if child.is_dir():
                 self._remove_path(str(child), branch=self.branch_name_for(child.name))
+        # And the registrations whose directories are already gone, which no
+        # loop over existing directories can reach.
+        self.prune_stale_worktrees()
 
 
 def find_repository_root(path: str) -> Optional[str]:

@@ -283,10 +283,13 @@ class FeatureWorkspace:
         touched: a worktree that still exists is not pruned, so a build in
         progress elsewhere is unaffected.
         """
-        from openjarvis.reliability.workspace import git_output
-
         try:
-            git_output(["worktree", "prune"], cwd=self.repo_path, check=False)
+            # Not a bare `worktree prune`: that silently skips a *locked*
+            # worktree, and every worktree this system creates is locked to
+            # claim it against other processes. Releasing the lock only for a
+            # registration whose directory is already gone is what keeps this
+            # method doing what its docstring says.
+            self._inner.prune_stale_worktrees()
         except Exception:  # pragma: no cover - defensive
             logger.debug("could not prune stale worktrees", exc_info=True)
 

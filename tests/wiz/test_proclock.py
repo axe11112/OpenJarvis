@@ -16,7 +16,15 @@ import time
 
 import pytest
 
-from openjarvis.wiz.proclock import LeaseTimeout, ProcessLease
+# Through the compatibility shim on purpose: this file predates the move to
+# core/, and keeping it importing the old path is what proves the shim still
+# re-exports everything its importers used.
+from openjarvis.wiz.proclock import (
+    PRODUCTION_CHANGE_LOCK,
+    LeaseTimeout,
+    ProcessLease,
+    production_change_lease,
+)
 
 
 def test_sequential_acquire_release(tmp_path):
@@ -240,3 +248,54 @@ class TestIsHeld:
             if holder.is_alive():  # pragma: no cover - defensive
                 holder.terminate()
                 holder.join(timeout=5.0)
+
+
+class TestEveryProductionChangeCallerGetsTheSameLock:
+    """One lock file, or the lease guards nothing.
+
+    Three call sites take the production-change lease: FeaturePipeline.ship()
+    (wired in wiz/assemble.py), the reliability repair loop (wired in
+    cli/reliability_cmd.py), and the development queue's is_held() probe. If any
+    of them resolved a different path the mutual exclusion would silently
+    evaporate -- each subsystem serialised against itself, which is exactly the
+    state this lease was introduced to fix.
+
+    The specific trap: wiz_home() is get_config_dir()/wiz, and the lease belongs
+    at get_config_dir(). A caller that reached for the Wiz root out of habit
+    would produce a second, private lock that looks identical in every log line.
+    """
+
+    def test_the_default_root_is_stable_across_calls(self):
+        first = production_change_lease(owner="a")
+        second = production_change_lease(owner="b")
+        assert first.path == second.path
+
+    def test_it_is_not_under_the_wiz_root(self):
+        """Where the repair loop, which knows nothing about Wiz, can find it."""
+        from openjarvis.wiz.runtime import wiz_home
+
+        path = production_change_lease(owner="a").path
+        assert wiz_home() not in path.parents, (
+            f"the production-change lease is inside the Wiz root ({path}); the "
+            "reliability side resolves it from the config root and would take a "
+            "different file"
+        )
+
+    def test_the_filename_is_the_shared_constant(self):
+        assert production_change_lease(owner="a").path.name == PRODUCTION_CHANGE_LOCK
+
+    def test_two_owners_on_the_default_root_really_exclude_each_other(
+        self, monkeypatch, tmp_path
+    ):
+        """Not just equal paths -- actual mutual exclusion through them."""
+        monkeypatch.setenv("OPENJARVIS_HOME", str(tmp_path))
+        shipper = production_change_lease(owner="wiz@target")
+        repairer = production_change_lease(owner="reliability-repair")
+        assert shipper.path == repairer.path
+
+        with shipper.acquire(timeout=1.0):
+            assert repairer.is_held() is True
+            with pytest.raises(LeaseTimeout):
+                with repairer.acquire(timeout=0.3):
+                    pass
+        assert repairer.is_held() is False

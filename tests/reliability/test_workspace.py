@@ -615,3 +615,77 @@ class TestDestructiveCleanupFailsClosed:
             "the worktree was preserved but its branch was deleted, leaving a "
             "tree on a branch that no longer exists"
         )
+
+
+class TestPruningStillWorksWithOwnershipLocks:
+    """`git worktree prune` silently skips a locked worktree.
+
+    It exits 0 and removes nothing. Since create() locks every worktree it
+    makes, a bare prune stopped working the moment ownership was introduced: a
+    directory removed out from under its registration left the lock behind, the
+    branch went on counting as checked out somewhere, `branch -D` failed,
+    `worktree add -b` failed, and the feature or incident became unretryable
+    with a git error an operator cannot act on. That is exactly the bug pruning
+    exists to prevent, reintroduced by the fix for a different one.
+
+    The rule that resolves it: a registration whose directory is gone cannot be
+    protecting anybody's work, whoever claimed it. One whose directory is still
+    there is never touched.
+    """
+
+    def test_a_vanished_directory_can_be_recreated(self, manager, repo):
+        """The end-to-end symptom: create, lose the directory, create again."""
+        first = manager.create("INC-00001")
+        shutil.rmtree(first.path)
+
+        second = manager.create("INC-00001")
+
+        assert second.branch == first.branch
+        assert Path(second.path).is_dir()
+
+    def test_the_stale_registration_is_actually_gone(self, manager, repo):
+        first = manager.create("INC-00001")
+        shutil.rmtree(first.path)
+
+        manager.prune_stale_worktrees()
+
+        listing = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert first.path not in listing, (
+            "the locked registration survived the prune, so the branch still "
+            "counts as checked out and cannot be reused"
+        )
+
+    def test_a_live_worktree_keeps_its_lock_through_a_prune(self, manager, repo):
+        """Pruning must not become a way to strip another repair's claim."""
+        wt = manager.create("INC-00001")
+        _relock(
+            repo,
+            wt.path,
+            f"openjarvis-repair pid=1 host={socket.gethostname()} incident=INC-00001",
+        )
+
+        manager.prune_stale_worktrees()
+
+        assert Path(wt.path).exists()
+        assert _lock_reason(repo, wt.path).startswith("openjarvis-repair"), (
+            "a prune released a live repair's claim on its worktree"
+        )
+
+    def test_a_foreign_lock_on_a_vanished_directory_is_still_cleared(
+        self, manager, repo
+    ):
+        """Ownership does not matter when there is nothing left to own."""
+        wt = manager.create("INC-00001")
+        _relock(repo, wt.path, "somebody else entirely, from another machine")
+        shutil.rmtree(wt.path)
+
+        manager.prune_stale_worktrees()
+
+        second = manager.create("INC-00001")
+        assert Path(second.path).is_dir()
