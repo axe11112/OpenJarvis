@@ -91,6 +91,27 @@ def git_output(
     return proc.stdout
 
 
+def _canonical(path: str | Path) -> str:
+    """A path in the form git reports, for comparing against its output.
+
+    ``git worktree list --porcelain`` prints *resolved* paths, so a plain string
+    comparison against the path this module was handed fails wherever a symlink
+    is involved -- and on macOS, the platform this actually runs on, it usually
+    is: ``/tmp`` is a symlink to ``/private/tmp`` and ``/var`` to
+    ``/private/var``. The consequence was not cosmetic. A worktree whose lock
+    this process could not recognise as its own looked like another process's
+    live claim, so the owner refused to tear down its own worktree, forever.
+
+    ``strict=False`` on purpose: this is asked about worktrees whose directories
+    have already been deleted, where the parent symlinks still resolve and the
+    leaf no longer needs to exist.
+    """
+    try:
+        return str(Path(path).resolve())
+    except OSError:  # pragma: no cover - defensive
+        return str(Path(path))
+
+
 def is_ancestor(candidate: str, descendant: str, *, cwd: str | Path) -> bool:
     """Whether *candidate* is reachable from *descendant* by walking parents.
 
@@ -645,11 +666,11 @@ class RepairWorkspace:
             )
         except WorkspaceError:  # pragma: no cover - defensive
             return None
-        target = str(Path(path))
+        target = _canonical(path)
         current: Optional[str] = None
         for line in listing.splitlines():
             if line.startswith("worktree "):
-                current = str(Path(line[len("worktree ") :].strip()))
+                current = _canonical(line[len("worktree ") :].strip())
             elif line.startswith("locked") and current == target:
                 reason = line[len("locked") :].strip()
                 return reason or ""

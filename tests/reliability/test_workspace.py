@@ -689,3 +689,58 @@ class TestPruningStillWorksWithOwnershipLocks:
 
         second = manager.create("INC-00001")
         assert Path(second.path).is_dir()
+
+
+class TestOwnershipWorksThroughASymlinkedRoot:
+    """`git worktree list --porcelain` prints resolved paths.
+
+    A plain string comparison against the path this module was handed therefore
+    fails wherever a symlink is involved — and on macOS, the platform this
+    actually runs on, it usually is: /tmp is a symlink to /private/tmp and /var
+    to /private/var. The consequence was not cosmetic. A worktree whose lock the
+    owning process could not recognise as its own looked exactly like another
+    process's live claim, so the owner refused to tear down its own worktree,
+    forever, on every removal.
+    """
+
+    @pytest.fixture
+    def symlinked(self, repo, tmp_path):
+        """A worktree root reached through a symlink, as macOS routinely does."""
+        real = tmp_path / "real-worktrees"
+        real.mkdir()
+        link = tmp_path / "linked-worktrees"
+        link.symlink_to(real)
+        return RepairWorkspace(repo_path=str(repo), root=str(link))
+
+    def test_the_owner_recognises_its_own_lock(self, symlinked, repo):
+        wt = symlinked.create("INC-00001")
+        holder = symlinked._lock_holder(wt.path)
+        assert holder is not None, (
+            "the lock this process just took was invisible through the symlink, "
+            "so the owner would read its own worktree as another process's"
+        )
+        assert f"pid={os.getpid()}" in holder
+
+    def test_the_owner_can_tear_down_its_own_worktree(self, symlinked):
+        """The symptom: routine teardown refusing, every time."""
+        wt = symlinked.create("INC-00001")
+        symlinked.remove(wt, succeeded=True)
+        assert not Path(wt.path).exists(), (
+            "the owner could not remove its own worktree through a symlinked root"
+        )
+
+    def test_another_process_is_still_refused_through_the_symlink(
+        self, symlinked, repo
+    ):
+        """Resolving paths must not resolve away the protection."""
+        wt = symlinked.create("INC-00001")
+        (Path(wt.path) / "work.py").write_text("VALUE = 2\n")
+        _relock(
+            repo,
+            Path(wt.path).resolve(),
+            f"openjarvis-repair pid=1 host={socket.gethostname()} incident=INC-00001",
+        )
+
+        symlinked.remove(wt, succeeded=True)
+
+        assert (Path(wt.path) / "work.py").exists()
