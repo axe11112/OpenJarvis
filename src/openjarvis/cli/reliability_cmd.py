@@ -2366,7 +2366,20 @@ def run_control_center(
         config,
         store=store,
         probe_verification=probe_verification,
-        auto_recover=auto_recover,
+        # Auto-recovery *is* watcher control, so --no-watcher-control has to
+        # switch it off too. allow_watcher_control below only guards the POST
+        # routes, and those are the well-guarded ones: they check the flag and
+        # then the control token. Auto-recovery runs inside
+        # DashboardService.watcher_state(), which GET /api/snapshot and
+        # GET /api/watcher both reach with no token and no flag check -- so an
+        # operator who asked for a dashboard that cannot touch the watcher got
+        # one where an unauthenticated read still asked launchd to start it,
+        # and the control token was bypassable by a plain GET.
+        #
+        # Recovery-on-open stays exactly as it was whenever watcher control is
+        # enabled, which is the default and the case the requirement was
+        # written for; --no-auto-recover still turns it off on its own.
+        auto_recover=auto_recover and watcher_control,
         wiz_snapshot=wiz_snapshot,
     )
     voice_endpoints = (

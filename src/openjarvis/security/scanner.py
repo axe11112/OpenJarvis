@@ -74,6 +74,41 @@ class SecretScanner(BaseScanner):
             ThreatLevel.HIGH,
             "Generic API key/secret",
         ),
+        # The credentials this deployment actually holds. Everything above
+        # catches somebody else's provider; the three services JARVIS is wired
+        # to -- Supabase, Telegram and Vercel -- matched no pattern here, so a
+        # redaction layer ran over a leaked service-role key, reported clean,
+        # and passed it through. Kept identical to the Rust table in
+        # rust/crates/openjarvis-security/src/scanner.rs; a parity test asserts
+        # that, because this table is the fallback used when the compiled
+        # extension is missing and a fallback that protects less than the
+        # primary is worse than no fallback at all.
+        "jwt": (
+            r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+            ThreatLevel.CRITICAL,
+            "JWT (Supabase anon/service_role key or similar bearer JWT)",
+        ),
+        "telegram_bot_token": (
+            r"\b[0-9]{8,10}:AA[A-Za-z0-9_-]{32,}",
+            ThreatLevel.CRITICAL,
+            "Telegram bot token",
+        ),
+        "vercel_token": (
+            r"\bvercel_[A-Za-z0-9]{16,}",
+            ThreatLevel.CRITICAL,
+            "Vercel token",
+        ),
+        "bearer_header": (
+            r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}",
+            ThreatLevel.HIGH,
+            "Bearer token in an Authorization header",
+        ),
+        "unquoted_api_key_assignment": (
+            r"(?i)(?:api[_-]?key|secret[_-]?key|auth[_-]?token|access[_-]?token"
+            r"|service[_-]?role[_-]?key)\s*[=:]\s*[A-Za-z0-9._~+/=-]{16,}",
+            ThreatLevel.HIGH,
+            "Credential assignment",
+        ),
     }
 
     def scan(self, text: str) -> ScanResult:

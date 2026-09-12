@@ -84,6 +84,47 @@ static SECRET_PATTERNS: Lazy<Vec<PatternDef>> = Lazy::new(|| {
             ThreatLevel::High,
             "Generic API key/secret"
         ),
+        // The credentials this deployment actually holds. Everything above
+        // catches somebody else's provider: the three services JARVIS is
+        // wired to -- Supabase, Telegram and Vercel -- were not matched by any
+        // pattern here, so a redaction layer ran over a leaked service-role
+        // key, reported clean, and passed it through.
+        pattern!(
+            "jwt",
+            r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}",
+            ThreatLevel::Critical,
+            "JWT (Supabase anon/service_role key or similar bearer JWT)"
+        ),
+        pattern!(
+            "telegram_bot_token",
+            r"\b[0-9]{8,10}:AA[A-Za-z0-9_-]{32,}",
+            ThreatLevel::Critical,
+            "Telegram bot token"
+        ),
+        pattern!(
+            "vercel_token",
+            r"\bvercel_[A-Za-z0-9]{16,}",
+            ThreatLevel::Critical,
+            "Vercel token"
+        ),
+        // A bare `Bearer <value>` header. The generic_api_key pattern above
+        // needs an assignment with quotes, so a credential that appears the
+        // way HTTP actually carries it went unmatched.
+        pattern!(
+            "bearer_header",
+            r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}",
+            ThreatLevel::High,
+            "Bearer token in an Authorization header"
+        ),
+        // Unquoted assignments, which is how a credential appears in an env
+        // file, a shell export, a CI log or a subprocess environment dump --
+        // every surface this scanner exists to guard.
+        pattern!(
+            "unquoted_api_key_assignment",
+            r"(?i)(?:api[_-]?key|secret[_-]?key|auth[_-]?token|access[_-]?token|service[_-]?role[_-]?key)\s*[=:]\s*[A-Za-z0-9._~+/=-]{16,}",
+            ThreatLevel::High,
+            "Credential assignment"
+        ),
     ]
 });
 

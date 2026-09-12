@@ -1505,3 +1505,62 @@ def test_an_incident_with_no_handover_gets_no_empty_panel():
         fingerprint="fp", severity=Severity.LOW, component="site", title="slow"
     )
     assert "handover" not in incident_detail(incident, [])
+
+
+class TestWatcherControlOffMeansOff:
+    """`--no-watcher-control` has to switch off auto-recovery as well.
+
+    allow_watcher_control guards only the POST routes, and those are the
+    well-guarded ones: they check the flag and then the control token.
+    Auto-recovery runs inside DashboardService.watcher_state(), which
+    GET /api/snapshot and GET /api/watcher both reach with no token and no flag
+    check. So an operator who asked for a dashboard that could not touch the
+    watcher got one where an unauthenticated read still asked launchd to start
+    it -- the control token bypassable by a plain GET, and the switch they set
+    quietly not covering the path that mattered.
+    """
+
+    def test_the_flag_reaches_auto_recover(self):
+        """Asserted at the wiring, because the bug was only ever in the wiring.
+
+        Both the service and the server behave correctly in isolation and have
+        tests proving it; what was wrong is that nothing connected the operator's
+        switch to the path that could act on it.
+        """
+        import inspect
+
+        from openjarvis.cli import reliability_cmd
+
+        source = inspect.getsource(reliability_cmd.run_control_center)
+        assert "auto_recover=auto_recover and watcher_control" in source, (
+            "--no-watcher-control no longer disables auto-recovery, so an "
+            "unauthenticated GET on /api/snapshot can start the watcher again"
+        )
+
+    def test_a_read_does_not_start_the_watcher_when_control_is_off(
+        self, config, store, supervisor, launchctl
+    ):
+        """The behaviour that wiring buys: the GET path stays inert."""
+        launchctl.state = "not running"
+        service = DashboardService(
+            config,
+            store=store,
+            supervisor=supervisor,
+            probe_verification="none",
+            # What `auto_recover and watcher_control` evaluates to once the
+            # operator has passed --no-watcher-control.
+            auto_recover=False,
+        )
+
+        state = service.watcher_state()
+
+        assert state.status is WatcherStatus.OFFLINE, (
+            "the dashboard reported a start it was not allowed to request"
+        )
+        assert not [c for c in launchctl.calls if c[1] == "kickstart"], (
+            "a read route asked launchd to start the watcher with watcher "
+            "control disabled"
+        )
+        # And the whole snapshot, which is what GET /api/snapshot serves.
+        service.snapshot()
+        assert not [c for c in launchctl.calls if c[1] == "kickstart"]
