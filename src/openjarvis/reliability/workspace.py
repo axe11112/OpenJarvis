@@ -40,6 +40,7 @@ _FALLBACK_AUTHOR_NAME = "JARVIS"
 _FALLBACK_AUTHOR_EMAIL = "jarvis@localhost"
 
 __all__ = [
+    "MergeOutcome",
     "RepairWorkspace",
     "WorkspaceError",
     "Worktree",
@@ -139,6 +140,16 @@ class Worktree:
         )
 
 
+@dataclass(slots=True)
+class MergeOutcome:
+    """What happened trying to reconcile a worktree with a moved base."""
+
+    merged: bool
+    new_sha: str = ""
+    conflicting_files: List[str] = field(default_factory=list)
+    error: str = ""
+
+
 @dataclass
 class RepairWorkspace:
     """Creates and destroys isolated worktrees for repair attempts.
@@ -189,6 +200,63 @@ class RepairWorkspace:
         if not sha:
             raise WorkspaceError(f"could not resolve ref {ref!r}")
         return sha
+
+    def checkout_existing(self, incident_id: str, *, branch: str) -> Worktree:
+        """Check out an *existing*, already-pushed branch fresh into a
+        worktree — fetched from origin first, never created new.
+
+        Unlike :meth:`create`, which always cuts a brand new branch from a
+        base ref: this reconnects to real work that already has a remote
+        history of its own, for a case ``create`` was never meant to
+        handle -- re-verifying a feature whose own worktree was already
+        torn down (routine cleanup once it reached READY, see
+        :meth:`~openjarvis.wiz.features.pipeline.FeaturePipeline.
+        _cleanup_worktree`) against a base branch that has since moved.
+        Reusing ``create`` here would silently start a *different* branch
+        or destroy the remote history this call exists to reconnect to.
+
+        ``-B`` (not ``-b``): the local branch of this name is very likely
+        already gone (:meth:`remove` deletes it on teardown), but if a
+        stale one somehow remains this resets it to match origin rather
+        than refusing — the worktree is always freshly checked out from
+        ``origin/<branch>`` regardless of anything a prior local branch
+        pointed at.
+        """
+        if not branch:
+            raise WorkspaceError("a branch name is required")
+        repo = Path(self.repo_path)
+        if not (repo / ".git").exists() and not (repo / "HEAD").exists():
+            raise WorkspaceError(f"{self.repo_path} is not a git repository")
+
+        path = Path(self.root) / incident_id
+        if path.exists():
+            self._remove_path(str(path))
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        git_output(["fetch", "origin", branch], cwd=self.repo_path)
+        git_output(
+            ["worktree", "add", "-B", branch, str(path), f"origin/{branch}"],
+            cwd=self.repo_path,
+        )
+        git_output(
+            ["branch", f"--set-upstream-to=origin/{branch}", branch],
+            cwd=str(path),
+        )
+        self._apply_git_identity(str(path))
+        base_commit = self.resolve_commit(f"origin/{branch}")
+        logger.info(
+            "checked out existing branch for %s: %s @ %s",
+            incident_id,
+            branch,
+            base_commit[:12],
+        )
+        return Worktree(
+            incident_id=incident_id,
+            path=str(path),
+            branch=branch,
+            base_commit=base_commit,
+            base_ref=f"origin/{branch}",
+        )
 
     def create(self, incident_id: str, *, base_ref: str = "HEAD") -> Worktree:
         """Cut a fresh worktree for *incident_id* from *base_ref*.
@@ -336,6 +404,48 @@ class RepairWorkspace:
     def has_changes(self, worktree: Worktree) -> bool:
         """Whether anything at all was modified."""
         return bool(self.changed_files(worktree))
+
+    def merge_base(self, worktree: Worktree, *, base_branch: str) -> MergeOutcome:
+        """Merge *base_branch* (freshly fetched from origin) into
+        *worktree*'s own branch, in place.
+
+        A real ``git merge --no-edit``, never a rebase and never
+        ``--force`` anything: the branch's existing commit is preserved
+        exactly as it was, and success produces one new merge commit whose
+        ancestry includes both. A conflict is detected and the merge is
+        aborted immediately, leaving the worktree exactly as clean as it
+        was before this was called -- never left half-resolved, and never
+        handed to a coding session to resolve automatically. The caller
+        decides what a feature that cannot be mechanically reconciled
+        means; this only ever reports the fact.
+        """
+        git_output(["fetch", "origin", base_branch], cwd=worktree.path)
+        proc = subprocess.run(
+            ["git", "merge", "--no-edit", f"origin/{base_branch}"],
+            cwd=worktree.path,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if proc.returncode == 0:
+            new_sha = git_output(["rev-parse", "HEAD"], cwd=worktree.path).strip()
+            return MergeOutcome(merged=True, new_sha=new_sha)
+
+        conflicting = [
+            line
+            for line in git_output(
+                ["diff", "--name-only", "--diff-filter=U"],
+                cwd=worktree.path,
+                check=False,
+            ).splitlines()
+            if line.strip()
+        ]
+        git_output(["merge", "--abort"], cwd=worktree.path, check=False)
+        return MergeOutcome(
+            merged=False,
+            conflicting_files=conflicting,
+            error=(proc.stdout + proc.stderr).strip()[:2000],
+        )
 
     # -- commit -----------------------------------------------------------
 

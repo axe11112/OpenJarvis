@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 import pytest
 
 from openjarvis.reliability.types import ProbeResult
+from openjarvis.reliability.workspace import MergeOutcome
 from openjarvis.wiz.approvals import ApprovalError, ApprovalStore
 from openjarvis.wiz.authority import Actor, Authority, AuthorityPolicy, Channel
 from openjarvis.wiz.features.acceptance import DESKTOP, MOBILE
@@ -65,6 +66,12 @@ class FakeWorkspace:
         #: files) so a test can simulate "already committed" -- has_changes()
         #: False even though the attempt genuinely has changed_files.
         self.changes_present = True
+        self.checkouts = []
+        self.merge_calls = []
+        #: A test overrides this to a MergeOutcome-shaped stand-in (merged
+        #: True/False, new_sha, conflicting_files) before calling
+        #: reverify_against_current_base.
+        self.merge_outcome = None
 
     def create(self, feature_id, *, title="", base_ref="HEAD"):
         path = self.tmp_path / f"wt-{feature_id}"
@@ -104,6 +111,19 @@ class FakeWorkspace:
 
     def head_sha(self, worktree):
         return self.commit_sha
+
+    def checkout_existing(self, feature_id, *, title="", branch):
+        path = self.tmp_path / f"wt-{feature_id}-refresh"
+        path.mkdir(parents=True, exist_ok=True)
+        worktree = FakeWorktree(
+            path=str(path), branch=branch, base_commit=self.commit_sha
+        )
+        self.checkouts.append(worktree)
+        return worktree
+
+    def merge_base(self, worktree, *, base_branch):
+        self.merge_calls.append((worktree, base_branch))
+        return self.merge_outcome
 
     def remove(self, worktree, *, succeeded=True):
         self.removed.append((worktree, succeeded))
@@ -190,8 +210,13 @@ class FakeSuite:
 
 
 class FakeVercel:
-    def __init__(self, state="READY"):
+    def __init__(self, state="READY", commit_sha=None):
         self.state = state
+        #: Mutable so a test can move it to match a commit produced mid-test
+        #: (e.g. after reverify_against_current_base() advances the head) --
+        #: the real Vercel deployment list always reflects whatever was
+        #: actually pushed, so this fake has to be steerable the same way.
+        self.commit_sha = commit_sha or "feedface" + "0" * 32
 
     def list_deployments(self, **kwargs):
         return [
@@ -201,7 +226,7 @@ class FakeVercel:
                 "target": "preview",
                 "url": "https://feature-preview.app",
                 "created_at": "2026-08-19T10:00:00+00:00",
-                "commit_sha": "feedface" + "0" * 32,
+                "commit_sha": self.commit_sha,
                 "branch": "wiz/feature/FEAT-00001",
             }
         ]
@@ -2506,6 +2531,51 @@ class TestManualAcceptanceLifecycle:
 
         assert "ship_manual_approval_token" not in result.metadata
 
+    def test_a_feature_that_reached_ready_this_way_can_actually_be_shipped(
+        self, tmp_path, clock
+    ):
+        """Found live shipping FEAT-00031: reaching READY via
+        approve_manual_acceptance() consumes the ship_manual_approval_token
+        (by design -- see that method's docstring, "consumed the moment it
+        is used"). ship()'s own nothing_awaiting_a_person gate used to
+        re-check that same token, independently, every time -- so it always
+        found the token already spent and refused to ship, for every
+        feature this whole mechanism exists for. The fix: ship() checks the
+        durable feature.metadata["manual_acceptance"] record _finish()
+        already left behind instead of re-redeeming a spent token.
+        """
+        approvals = ApprovalStore(clock=lambda: 0.0, ttl_seconds=900)
+        pipeline, feature, browser = self._pipeline_with_unmeasured_viewport(
+            tmp_path, clock, approvals=approvals
+        )
+        assert feature.state is FeatureState.HUMAN_REQUIRED
+
+        pipeline.approve_manual_acceptance(
+            feature.id, reason="looked at the desktop and mobile preview, both clean"
+        )
+        github = TestShip.FakeGitHub()
+        pipeline.shipper = FeatureShipper(
+            policy=FeatureShippingPolicy(merge_medium_risk=True),
+            github=github,
+            authority=AuthorityPolicy(
+                grants={
+                    Channel.CONTROL_CENTER: frozenset(
+                        {Authority.PR_WRITE, Authority.PRODUCTION_CHANGE}
+                    )
+                }
+            ),
+        )
+        pipeline.postship = TestShip.FakePostShip(verified=True)
+        pipeline.reopen_for_deploy(feature.id, reason="manual acceptance approved")
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert "ship_manual_approval_token" not in result.metadata  # spent
+        assert result.metadata["manual_acceptance"]["owner_confirmed"] is True
+
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.COMPLETE
+        assert github.merge_calls
+
     def test_the_approval_is_consumed_the_journal_records_both_steps(
         self, tmp_path, clock
     ):
@@ -2598,6 +2668,479 @@ class TestManualAcceptanceLifecycle:
         )
         with pytest.raises(ApprovalError):
             pipeline.approve_manual_acceptance(feature.id, reason="no store configured")
+
+
+class TestReverifyAgainstCurrentBase:
+    """The primitive ship()'s require_base_unmoved refusal has no other way
+    back into: a READY feature whose base has moved has nowhere to go
+    without this. Found on FEAT-00031.
+    """
+
+    HEAD_SHA = "feedface" + "0" * 32  # matches FakeWorkspace's default commit_sha
+    OLD_BASE = "base1234" + "0" * 32  # matches FakeWorkspace.create()'s default
+    NEW_BASE = "newbase1" + "0" * 32
+    MERGED_SHA = "merged01" + "0" * 32
+    NEW_BASE_2 = "newbase2" + "0" * 32
+    MERGED_SHA_2 = "merged02" + "0" * 32
+
+    class FakeGitHub(TestShip.FakeGitHub):
+        """Unlike TestShip.FakeGitHub, base_sha is mutable per test/per
+        call -- exactly what proving "the base moved" requires.
+        """
+
+        def __init__(self, *, base_sha=None, head_sha=None, **kwargs):
+            super().__init__(**kwargs)
+            self.base_sha = base_sha or TestReverifyAgainstCurrentBase.OLD_BASE
+            self.head_sha = head_sha or TestReverifyAgainstCurrentBase.HEAD_SHA
+
+        def get_pull_request(self, number):
+            return {
+                "number": number,
+                "head_sha": self.head_sha,
+                "base_sha": self.base_sha,
+                "state": "open",
+                "mergeable": True,
+            }
+
+    def _shipper(self, github):
+        return FeatureShipper(
+            policy=FeatureShippingPolicy(merge_medium_risk=True),
+            github=github,
+            authority=AuthorityPolicy(
+                grants={
+                    Channel.CONTROL_CENTER: frozenset(
+                        {Authority.PR_WRITE, Authority.PRODUCTION_CHANGE}
+                    )
+                }
+            ),
+        )
+
+    def _ready(self, tmp_path, clock, *, github=None, workspace=None, max_attempts=3):
+        github = github or self.FakeGitHub()
+        workspace = workspace or FakeWorkspace(tmp_path)
+        engineer = ScriptedEngineer()
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            workspace=workspace,
+            engineer=engineer,
+            max_attempts=max_attempts,
+        )
+        pipeline.shipper = self._shipper(github)
+        pipeline.postship = TestShip.FakePostShip(verified=True)
+        submitted = pipeline.submit(REQUEST, actor=operator_actor())
+        feature = pipeline.run(submitted.id)
+        assert feature.state is FeatureState.READY
+        return pipeline, feature, github, workspace, engineer
+
+    def test_ship_refuses_when_base_has_moved(self, tmp_path, clock):
+        github = self.FakeGitHub(base_sha=self.NEW_BASE)
+        pipeline, feature, github, workspace, engineer = self._ready(
+            tmp_path, clock, github=github
+        )
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.READY
+        assert not github.merge_calls
+
+    def test_unchanged_base_is_a_no_op(self, tmp_path, clock):
+        github = self.FakeGitHub(base_sha=self.OLD_BASE)
+        pipeline, feature, github, workspace, engineer = self._ready(
+            tmp_path, clock, github=github
+        )
+        result = pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=self.HEAD_SHA, reason="checking"
+        )
+        assert result.state is FeatureState.READY
+        assert not workspace.checkouts  # never even tried to reconcile
+
+    def test_moved_base_merges_cleanly_and_re_enters_testing(self, tmp_path, clock):
+        github = self.FakeGitHub(base_sha=self.NEW_BASE)
+        pipeline, feature, github, workspace, engineer = self._ready(
+            tmp_path, clock, github=github
+        )
+        workspace.merge_outcome = MergeOutcome(merged=True, new_sha=self.MERGED_SHA)
+
+        refreshed = pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=self.HEAD_SHA, reason="base moved"
+        )
+        assert refreshed.state is FeatureState.TESTING
+        assert workspace.checkouts  # a fresh worktree was checked out
+        assert workspace.merge_calls
+        assert refreshed.attempts[-1].commit_sha == self.MERGED_SHA
+        assert refreshed.base_sha == self.NEW_BASE
+        assert "manual_acceptance" not in refreshed.metadata
+        assert refreshed.attempts_used == 1  # no new attempt spent
+        assert len(engineer.build_calls) == 1  # unchanged -- no rebuild
+
+        # Re-entering TESTING drives fresh, real re-verification. The merge
+        # already landed and was pushed by reverify_against_current_base
+        # itself, so the worktree is clean going into this run -- exactly
+        # like a real git worktree is after a successful merge+push (see
+        # _deploy_preview's has_changes()/head_sha() branch). FakeWorkspace
+        # and FakeVercel have no real git/deployment state, so both need
+        # telling explicitly that the merged commit is now the one that
+        # exists.
+        workspace.changes_present = False
+        workspace.commit_sha = self.MERGED_SHA
+        pipeline.preview.vercel.commit_sha = self.MERGED_SHA
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert result.attempts[-1].commit_sha == self.MERGED_SHA
+        assert len(engineer.build_calls) == 1  # still no rebuild
+
+    def test_a_stale_expected_head_is_refused(self, tmp_path, clock):
+        github = self.FakeGitHub(base_sha=self.NEW_BASE)
+        pipeline, feature, github, workspace, engineer = self._ready(
+            tmp_path, clock, github=github
+        )
+        with pytest.raises(InvalidFeatureTransition):
+            pipeline.reverify_against_current_base(
+                feature.id,
+                expected_head_sha="not-the-real-head" + "0" * 20,
+                reason="x",
+            )
+        assert not workspace.checkouts
+
+    def test_no_pull_request_is_refused(self, tmp_path, clock):
+        pipeline = build_pipeline(tmp_path, clock)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)
+        with pytest.raises(InvalidFeatureTransition):
+            pipeline.reverify_against_current_base(
+                feature.id, expected_head_sha=self.HEAD_SHA, reason="x"
+            )
+
+    def test_not_ready_is_refused(self, tmp_path, clock):
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            engineer=ScriptedEngineer(
+                plans=[EngineeringSession(mode="plan", succeeded=False, error="ambiguous")]
+            ),
+        )
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        pipeline.run(feature.id)  # stops in planning, never reaches READY
+        with pytest.raises(InvalidFeatureTransition):
+            pipeline.reverify_against_current_base(
+                feature.id, expected_head_sha="x", reason="x"
+            )
+
+    def test_a_merge_conflict_stops_at_human_required_no_engineer_no_attempt(
+        self, tmp_path, clock
+    ):
+        github = self.FakeGitHub(base_sha=self.NEW_BASE)
+        pipeline, feature, github, workspace, engineer = self._ready(
+            tmp_path, clock, github=github
+        )
+        workspace.merge_outcome = MergeOutcome(
+            merged=False,
+            conflicting_files=["src/lib/language.ts"],
+            error="<<<<<<< HEAD",
+        )
+
+        result = pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=self.HEAD_SHA, reason="base moved"
+        )
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert "src/lib/language.ts" in result.history[-1]["reason"]
+        assert result.attempts_used == 1  # unchanged
+        assert len(engineer.build_calls) == 1  # never invoked again
+
+    def test_automated_failure_after_refresh_still_blocks_ship(self, tmp_path, clock):
+        github = self.FakeGitHub(base_sha=self.NEW_BASE)
+        suite = FakeSuite([FakeCheckResult(passed=False, summary="still broken")])
+        workspace = FakeWorkspace(tmp_path)
+        pipeline, feature, github, workspace, engineer = self._ready(
+            tmp_path, clock, github=github, workspace=workspace
+        )
+        workspace.merge_outcome = MergeOutcome(merged=True, new_sha=self.MERGED_SHA)
+        pipeline.check_suite_factory = lambda profile: suite
+
+        pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=self.HEAD_SHA, reason="base moved"
+        )
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.HUMAN_REQUIRED
+        assert not github.merge_calls
+
+    def test_repeatable_a_second_base_move_can_be_refreshed_again(self, tmp_path, clock):
+        github = self.FakeGitHub(base_sha=self.NEW_BASE)
+        pipeline, feature, github, workspace, engineer = self._ready(
+            tmp_path, clock, github=github
+        )
+        workspace.merge_outcome = MergeOutcome(merged=True, new_sha=self.MERGED_SHA)
+        pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=self.HEAD_SHA, reason="first move"
+        )
+        # Same fake-vs-real-git subtlety as
+        # test_moved_base_merges_cleanly_and_re_enters_testing: the merge was
+        # already pushed, so the worktree is clean going into this run.
+        workspace.changes_present = False
+        workspace.commit_sha = self.MERGED_SHA
+        pipeline.preview.vercel.commit_sha = self.MERGED_SHA
+        # A real push moves the PR's own head too -- GitHub reports whatever
+        # is actually on the branch, so the fake has to track it as well.
+        github.head_sha = self.MERGED_SHA
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+
+        second_base = "yetanother" + "0" * 22
+        second_sha = "second02" + "0" * 32
+        github.base_sha = second_base
+        workspace.merge_outcome = MergeOutcome(merged=True, new_sha=second_sha)
+
+        refreshed_again = pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=self.MERGED_SHA, reason="second move"
+        )
+        assert refreshed_again.state is FeatureState.TESTING
+        assert refreshed_again.attempts[-1].commit_sha == second_sha
+        assert refreshed_again.base_sha == second_base
+        assert len(engineer.build_calls) == 1  # still just the one real build
+
+    def test_direct_main_push_is_still_impossible(self, tmp_path, clock):
+        # merge_base() only ever pushes the feature's own branch (via
+        # workspace.push, whose real implementation refuses anything not
+        # carrying the feature prefix) -- the fake records what it was
+        # asked to push, proving this primitive never targets main itself.
+        github = self.FakeGitHub(base_sha=self.NEW_BASE)
+        pipeline, feature, github, workspace, engineer = self._ready(
+            tmp_path, clock, github=github
+        )
+        workspace.merge_outcome = MergeOutcome(merged=True, new_sha=self.MERGED_SHA)
+        pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=self.HEAD_SHA, reason="base moved"
+        )
+        # One push from _ready()'s own initial build-to-READY run, one more
+        # from reverify_against_current_base's merge push -- both always to
+        # "origin" for the feature branch, never main.
+        assert workspace.pushes == ["origin", "origin"]
+
+    def test_reentry_from_human_required_after_exhausted_attempts_reverifies_cleanly(
+        self, tmp_path, clock
+    ):
+        """Found live on FEAT-00031: a base-refresh's own re-verification can
+        exhaust attempts against an *intermediate* base and stop at
+        HUMAN_REQUIRED while the base moves again in the meantime -- here,
+        because a later commit on main happened to also fix whatever the
+        check suite was failing on. Re-entry must work with no Engineer
+        session and no new attempt spent, exactly like the READY path.
+        """
+        github = self.FakeGitHub(base_sha=self.NEW_BASE)
+        failing_suite = FakeSuite([FakeCheckResult(passed=False, summary="still broken")])
+        workspace = FakeWorkspace(tmp_path)
+        # Attempts already exhausted by the time reverify runs, exactly as
+        # they were for real on FEAT-00031 -- so the post-reverify TESTING
+        # failure stops immediately (_retry_or_stop's exhausted-attempts
+        # check fires on the very first failure) rather than spending fresh
+        # BUILDING retries whose own attempt objects would never reach the
+        # commit-assignment code and so would carry no commit_sha at all.
+        pipeline, feature, github, workspace, engineer = self._ready(
+            tmp_path, clock, github=github, workspace=workspace, max_attempts=1
+        )
+        workspace.merge_outcome = MergeOutcome(merged=True, new_sha=self.MERGED_SHA)
+        pipeline.check_suite_factory = lambda profile: failing_suite
+
+        pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=self.HEAD_SHA, reason="base moved"
+        )
+        exhausted = pipeline.run(feature.id)
+        assert exhausted.state is FeatureState.HUMAN_REQUIRED
+        exhausted_head = exhausted.attempts[-1].commit_sha
+        assert exhausted_head == self.MERGED_SHA
+        build_calls_before = len(engineer.build_calls)
+
+        # The base moves again, and this time reconciling it also happens to
+        # carry in whatever fixed the check suite (matching FEAT-00031: a
+        # later main commit independently fixed the lucide-react break).
+        # The first reverify's merge was actually pushed, so the PR's real
+        # head moved too.
+        github.head_sha = exhausted_head
+        github.base_sha = self.NEW_BASE_2
+        fixed_suite = FakeSuite([FakeCheckResult(passed=True)])
+        pipeline.check_suite_factory = lambda profile: fixed_suite
+        workspace.merge_outcome = MergeOutcome(merged=True, new_sha=self.MERGED_SHA_2)
+
+        refreshed = pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=exhausted_head, reason="second move, fix landed"
+        )
+        assert refreshed.state is FeatureState.TESTING
+        assert refreshed.attempts[-1].commit_sha == self.MERGED_SHA_2
+        assert refreshed.base_sha == self.NEW_BASE_2
+        assert len(engineer.build_calls) == build_calls_before  # no new session
+
+        # Same fake-vs-real-git subtlety as the READY-entry tests: the merge
+        # already landed and was pushed, so the worktree is clean going into
+        # this run, and every double consulted elsewhere in the pipeline
+        # needs to agree the merged commit is now the one that exists.
+        workspace.changes_present = False
+        workspace.commit_sha = self.MERGED_SHA_2
+        pipeline.preview.vercel.commit_sha = self.MERGED_SHA_2
+        github.head_sha = self.MERGED_SHA_2
+
+        result = pipeline.run(feature.id)
+        assert result.state is FeatureState.READY
+        assert result.attempts[-1].commit_sha == self.MERGED_SHA_2
+        assert len(engineer.build_calls) == build_calls_before  # still none
+
+    def test_reentry_from_human_required_conflict_stays_human_required(
+        self, tmp_path, clock
+    ):
+        """A second base movement that genuinely conflicts, discovered while
+        already HUMAN_REQUIRED, must not crash on an illegal
+        HUMAN_REQUIRED -> HUMAN_REQUIRED self-transition -- it has to record
+        the new conflict and stay put, the same as _retry_or_stop does for
+        BUILDING -> BUILDING.
+        """
+        github = self.FakeGitHub(base_sha=self.NEW_BASE)
+        failing_suite = FakeSuite([FakeCheckResult(passed=False, summary="still broken")])
+        workspace = FakeWorkspace(tmp_path)
+        pipeline, feature, github, workspace, engineer = self._ready(
+            tmp_path, clock, github=github, workspace=workspace, max_attempts=1
+        )
+        workspace.merge_outcome = MergeOutcome(merged=True, new_sha=self.MERGED_SHA)
+        pipeline.check_suite_factory = lambda profile: failing_suite
+        pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=self.HEAD_SHA, reason="base moved"
+        )
+        exhausted = pipeline.run(feature.id)
+        assert exhausted.state is FeatureState.HUMAN_REQUIRED
+        exhausted_head = exhausted.attempts[-1].commit_sha
+        assert exhausted_head == self.MERGED_SHA
+
+        # The first reverify's merge was actually pushed, so the PR's real
+        # head moved too -- the fake has to track that, same as every other
+        # test here that pushes a second time.
+        github.head_sha = exhausted_head
+        github.base_sha = self.NEW_BASE_2
+        workspace.merge_outcome = MergeOutcome(
+            merged=False,
+            conflicting_files=["src/lib/language.ts"],
+            error="<<<<<<< HEAD",
+        )
+        result = pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=exhausted_head, reason="second move, real conflict"
+        )
+        assert result.state is FeatureState.HUMAN_REQUIRED
+        assert "src/lib/language.ts" in result.history[-1]["reason"]
+        assert result.attempts[-1].commit_sha == exhausted_head  # unchanged
+
+    def test_reentry_from_human_required_works_even_when_original_stop_was_unrelated(
+        self, tmp_path, clock
+    ):
+        """Safe by construction, not by checking why the feature stopped:
+        this primitive never calls Engineer and never spends an attempt, so
+        re-entry from a HUMAN_REQUIRED reached for a completely unrelated
+        reason is harmless -- the worst case is a real, unrelated defect
+        surfacing again with fresh evidence, never a bypassed gate.
+        """
+        github = self.FakeGitHub(base_sha=self.OLD_BASE)
+        pipeline, feature, github, workspace, engineer = self._ready(
+            tmp_path, clock, github=github
+        )
+        # Reached HUMAN_REQUIRED for a reason with nothing to do with the
+        # base -- an ordinary owner cancellation, say.
+        feature.transition(
+            FeatureState.HUMAN_REQUIRED, at=clock(), reason="operator paused this for review"
+        )
+        pipeline.store.save(feature)
+
+        github.base_sha = self.NEW_BASE
+        workspace.merge_outcome = MergeOutcome(merged=True, new_sha=self.MERGED_SHA)
+        refreshed = pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=self.HEAD_SHA, reason="base moved"
+        )
+        assert refreshed.state is FeatureState.TESTING
+        assert refreshed.attempts[-1].commit_sha == self.MERGED_SHA
+
+    def test_current_base_evidence_can_actually_ship_end_to_end(self, tmp_path, clock):
+        """The full real sequence, proven live shipping FEAT-00031: a
+        feature reaches READY with an outstanding VIEWPORT item, its base
+        moves, reverify_against_current_base() reconciles it and re-enters
+        TESTING, the manual acceptance (invalidated by the SHA change) is
+        reissued for the new SHA, and a fresh MEDIUM ship approval takes it
+        all the way to COMPLETE. Exercises both fixes together: base-refresh
+        re-entry and ship() accepting the durable manual-acceptance record
+        instead of re-redeeming an already-spent token.
+        """
+        github = self.FakeGitHub(base_sha=self.OLD_BASE)
+        browser = RealisticFakeBrowser()
+        approvals = ApprovalStore(clock=lambda: 0.0, ttl_seconds=900)
+        workspace = FakeWorkspace(tmp_path)
+        engineer = ScriptedEngineer()
+        pipeline = build_pipeline(
+            tmp_path,
+            clock,
+            workspace=workspace,
+            engineer=engineer,
+            browser=browser,
+            approvals=approvals,
+        )
+        # merge_medium_risk=False, matching real production config (wiz.json)
+        # -- the point of this test is that the one-off approval is what
+        # actually authorizes the merge, not a policy that would anyway.
+        pipeline.shipper = FeatureShipper(
+            policy=FeatureShippingPolicy(merge_medium_risk=False),
+            github=github,
+            authority=AuthorityPolicy(
+                grants={
+                    Channel.CONTROL_CENTER: frozenset(
+                        {Authority.PR_WRITE, Authority.PRODUCTION_CHANGE}
+                    )
+                }
+            ),
+        )
+        pipeline.postship = TestShip.FakePostShip(verified=True)
+
+        submitted = pipeline.submit(REQUEST, actor=operator_actor())
+        feature = pipeline.run(submitted.id)
+        assert feature.state is FeatureState.HUMAN_REQUIRED  # awaiting a person
+
+        pipeline.approve_manual_acceptance(feature.id, reason="checked the preview")
+        pipeline.reopen_for_deploy(feature.id, reason="manual acceptance approved")
+        feature = pipeline.run(feature.id)
+        assert feature.state is FeatureState.READY
+        assert feature.pr_number
+
+        # The base moves.
+        github.base_sha = self.NEW_BASE
+        workspace.merge_outcome = MergeOutcome(merged=True, new_sha=self.MERGED_SHA)
+        refreshed = pipeline.reverify_against_current_base(
+            feature.id, expected_head_sha=self.HEAD_SHA, reason="base moved"
+        )
+        assert refreshed.state is FeatureState.TESTING
+        assert "manual_acceptance" not in refreshed.metadata  # invalidated
+
+        workspace.changes_present = False
+        workspace.commit_sha = self.MERGED_SHA
+        pipeline.preview.vercel.commit_sha = self.MERGED_SHA
+        github.head_sha = self.MERGED_SHA
+        after_refresh = pipeline.run(feature.id)
+        assert after_refresh.state is FeatureState.HUMAN_REQUIRED  # needs reissue
+
+        # Reissue for the new SHA.
+        pipeline.approve_manual_acceptance(
+            feature.id, reason="checked the new preview for the reconciled commit"
+        )
+        pipeline.reopen_for_deploy(feature.id, reason="reissued after base refresh")
+        ready_again = pipeline.run(feature.id)
+        assert ready_again.state is FeatureState.READY
+        assert ready_again.attempts[-1].commit_sha == self.MERGED_SHA
+        assert ready_again.metadata["manual_acceptance"]["head_sha"] == self.MERGED_SHA
+
+        # One-off MEDIUM ship approval, bound to the reconciled SHA.
+        approval = approvals.issue(
+            capability="feature.ship",
+            subject=feature.id,
+            parameters={"risk": ready_again.risk, "head_sha": self.MERGED_SHA},
+        )
+        ready_again.metadata["ship_approval_token"] = approval.token
+        pipeline.store.save(ready_again)
+
+        shipped = pipeline.ship(feature.id)
+        assert shipped.state is FeatureState.COMPLETE
+        assert github.merge_calls
 
 
 class TestAutoShipIfEligible:
