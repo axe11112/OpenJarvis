@@ -81,7 +81,8 @@ class TestNoFalsePositivesOnOrdinaryOperationalText:
         [
             "The deployment is READY at https://wize.vercel.app/coach/summary",
             "attempt 3 failed: node_modules was never installed",
-            "FEAT-00031 reached READY; base_sha 4f857b0a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f",
+            "FEAT-00031 is READY; base_sha "
+            "4f857b0a1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f",
             "merge commit e1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4 verified",
             "git push origin wiz/feature/FEAT-00031 --force-with-lease",
             # The one that catches a careless `Bearer\\s+\\S+` pattern.
