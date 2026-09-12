@@ -146,7 +146,8 @@ class TestCrossProcessSafety:
         barrier = multiprocessing.Barrier(3)
         workers = [
             multiprocessing.Process(
-                target=_hammer_journal, args=(str(path), f"worker-{i}", n_per_worker, barrier)
+                target=_hammer_journal,
+                args=(str(path), f"worker-{i}", n_per_worker, barrier),
             )
             for i in range(3)
         ]
@@ -203,3 +204,156 @@ class TestContents:
         journal = _journal(tmp_path)
         _record(journal, 10)
         assert [e.sequence for e in journal.tail(3)] == [8, 9, 10]
+
+
+class TestCorruptionIsReportedNotHidden:
+    """A journal that says it is intact when it is not is worse than none.
+
+    _read() stopped iterating at the first unparseable line, and carried a
+    comment saying "the chain check below will fail on it, which is the point".
+    Stopping the iteration is precisely what stopped the chain check from ever
+    reaching it: verify() walked the clean prefix, found it valid, and returned
+    (True, None) for a file with a torn line in the middle. Tamper-evidence
+    that a tamper switches off is not tamper-evidence.
+    """
+
+    def _corrupt_line(self, path, index: int) -> None:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        lines[index] = '{"this is not valid json'
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_a_corrupt_middle_line_is_a_broken_chain(self, tmp_path):
+        journal = _journal(tmp_path)
+        _record(journal, n=5)
+        assert journal.verify() == (True, None)
+
+        self._corrupt_line(journal.path, 2)
+
+        intact, broken_at = journal.verify()
+        assert not intact, "a journal with an unparseable line reported itself intact"
+        assert broken_at == 3, f"pointed at the wrong place: {broken_at}"
+
+    def test_a_corrupt_first_line_is_a_broken_chain(self, tmp_path):
+        journal = _journal(tmp_path)
+        _record(journal, n=3)
+        self._corrupt_line(journal.path, 0)
+        intact, broken_at = journal.verify()
+        assert not intact
+        assert broken_at == 1
+
+    def test_the_next_append_does_not_reuse_a_sequence(self, tmp_path):
+        """The forked chain: _tail_locked read the last *readable* entry.
+
+        With a corrupt line at position 3 of 5, the last readable entry is
+        sequence 2, so the next record was issued sequence 3 -- a number
+        entries further down the file already used. Disk order became
+        1, 2, <corrupt>, 4, 5, 3, and verify() still said intact.
+        """
+        import json
+
+        journal = _journal(tmp_path)
+        _record(journal, n=5)
+        self._corrupt_line(journal.path, 2)
+
+        journal.record(at="later", kind="event.after", reason="after the damage")
+
+        sequences = []
+        for line in journal.path.read_text(encoding="utf-8").splitlines():
+            try:
+                sequences.append(int(json.loads(line)["sequence"]))
+            except Exception:  # noqa: BLE001 - the corrupt line
+                continue
+        assert len(sequences) == len(set(sequences)), (
+            f"a sequence number was issued twice: {sequences}"
+        )
+        assert max(sequences) == 6, f"expected to continue past 5, got {sequences}"
+        # And the damage is still reported, not papered over by the new entry.
+        assert journal.verify()[0] is False
+
+    def test_a_torn_final_line_does_not_destroy_the_next_record(self, tmp_path):
+        """A process killed mid-write leaves a line with no newline.
+
+        The next append landed on the end of it and welded the two together,
+        so one lost entry cost a second, perfectly good one as collateral.
+        """
+        import json
+
+        journal = _journal(tmp_path)
+        journal.record(at="t1", kind="event.first", reason="before the crash")
+        with open(journal.path, "a", encoding="utf-8") as handle:
+            handle.write('{"sequence": 2, "at": "t2", "kind": "torn')
+
+        journal.record(at="t3", kind="event.after", reason="after the crash")
+
+        lines = journal.path.read_text(encoding="utf-8").splitlines()
+        parseable = []
+        for line in lines:
+            try:
+                parseable.append(json.loads(line))
+            except Exception:  # noqa: BLE001
+                continue
+        kinds = [entry["kind"] for entry in parseable]
+        assert "event.first" in kinds, "the record before the crash was lost"
+        assert "event.after" in kinds, (
+            "the record after the crash was welded onto the torn line and lost"
+        )
+        assert journal.verify()[0] is False, "the torn line should be visible"
+
+    def test_display_still_shows_what_can_be_read(self, tmp_path):
+        """tail() stays lenient: showing two entries beats showing none.
+
+        Integrity questions go to verify(), which does not forgive. These are
+        different jobs and must not be collapsed into one answer.
+        """
+        journal = _journal(tmp_path)
+        _record(journal, n=5)
+        self._corrupt_line(journal.path, 2)
+        assert len(journal.tail(50)) == 2
+        assert journal.verify()[0] is False
+
+
+class TestManyProcessesAtOnce:
+    """Eight processes, a hundred entries each, one intact chain."""
+
+    def test_eight_processes_produce_one_gapless_chain(self, tmp_path):
+        import multiprocessing
+
+        path = tmp_path / "journal.jsonl"
+        workers_count = 8
+        per_worker = 100
+        barrier = multiprocessing.Barrier(workers_count)
+        workers = [
+            multiprocessing.Process(
+                target=_hammer_journal,
+                args=(str(path), f"worker-{i}", per_worker, barrier),
+            )
+            for i in range(workers_count)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=180)
+            assert not worker.is_alive(), "a writer wedged on the journal lease"
+            assert worker.exitcode == 0
+
+        journal = WizJournal(path)
+        entries = journal.entries()
+        expected = workers_count * per_worker
+
+        # Every event exactly once -- not merely the right count.
+        assert len(entries) == expected, f"{len(entries)} of {expected} survived"
+        reasons = [entry.reason for entry in entries]
+        assert len(set(reasons)) == expected, "an entry was lost or duplicated"
+        for i in range(workers_count):
+            mine = [r for r in reasons if r.startswith(f"worker-{i} ")]
+            assert len(mine) == per_worker, (
+                f"worker-{i} recorded {len(mine)} of {per_worker} entries"
+            )
+
+        sequences = [entry.sequence for entry in entries]
+        assert sequences == list(range(1, expected + 1)), (
+            "sequences are not gapless and in order"
+        )
+
+        intact, broken_at = journal.verify()
+        assert intact, f"chain broken at sequence {broken_at}"
