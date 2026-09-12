@@ -183,7 +183,13 @@ class TestNormalization:
             returncode = 1
             stderr = "decode error"
 
-        normalizer = AudioNormalizer(runner=lambda _argv: _Failed())
+        # A decoder that exists and fails is a different path from no
+        # decoder at all; pretend ffmpeg is installed so the runner above is
+        # actually reached on a host that has none.
+        normalizer = AudioNormalizer(
+            runner=lambda _argv: _Failed(),
+            which=lambda name: f"/usr/bin/{name}",
+        )
         result = normalizer.normalize(b"\x00\x00\x00\x20ftypM4A " + b"\x00" * 400)
         assert not result.ok
         assert "could not decode" in result.reason

@@ -510,6 +510,7 @@ class LaunchdSupervisor:
         jarvis_dir: Optional[Path] = None,
         uid: Optional[int] = None,
         platform_name: str = "",
+        launchctl_lookup: Optional[Callable[[str], Optional[str]]] = None,
     ) -> None:
         if label != SERVICE_LABEL:
             raise ValueError(
@@ -524,6 +525,17 @@ class LaunchdSupervisor:
         self._jarvis_dir_override = jarvis_dir
         self._uid = os.getuid() if uid is None else uid
         self._platform = platform_name or platform.system()
+        # The launchctl binary lookup is a seam for the same reason every
+        # other collaborator above is one. ``supported()`` gates every
+        # launchctl call, so a test that injects a fake ``runner`` and
+        # ``platform_name="Darwin"`` still exercised nothing on a host
+        # without the real binary: ``supported()`` reached past the fake to
+        # ``shutil.which`` and short-circuited, and the assertions that
+        # mattered ("this never uses a shell", "this only ever targets our
+        # own label") silently passed over an empty call list. Injecting the
+        # lookup lets the launchd logic actually be tested off macOS rather
+        # than only asserted about.
+        self._launchctl_lookup = launchctl_lookup or shutil.which
 
     # -- locations --------------------------------------------------------
 
@@ -585,7 +597,10 @@ class LaunchdSupervisor:
 
     def supported(self) -> bool:
         """Whether this machine can be supervised by launchd at all."""
-        return self._platform == "Darwin" and shutil.which("launchctl") is not None
+        return (
+            self._platform == "Darwin"
+            and self._launchctl_lookup("launchctl") is not None
+        )
 
     def installed(self) -> bool:
         """Whether the LaunchAgent file is present."""

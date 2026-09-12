@@ -114,20 +114,33 @@ class AudioNormalizer:
     runner:
         Injected for tests, so the conversion path can be exercised without
         spawning a decoder.
+    which:
+        How a decoder binary is located. Injected for the same reason as
+        ``runner``, and needed for ``runner`` to be useful at all: the
+        decoder lookup runs *before* the runner is ever called, so on a host
+        with neither ``afconvert`` nor ``ffmpeg`` :meth:`normalize` reported
+        "no decoder on this machine" and returned without consulting the
+        injected runner. A test for how a *failing decoder* is handled then
+        exercised the no-decoder path instead, and said so only as a
+        confusing assertion failure.
     """
 
     timeout_seconds: float = 30.0
     runner: Optional[Callable[..., Any]] = None
+    which: Optional[Callable[[str], Optional[str]]] = None
 
     # -- availability -----------------------------------------------------
 
+    def _which(self, name: str) -> str:
+        return (self.which or shutil.which)(name) or ""
+
     @property
     def afconvert(self) -> str:
-        return shutil.which("afconvert") or ""
+        return self._which("afconvert")
 
     @property
     def ffmpeg(self) -> str:
-        return shutil.which("ffmpeg") or ""
+        return self._which("ffmpeg")
 
     def capabilities(self) -> Dict[str, Any]:
         """What this Mac can decode, for the health panel."""

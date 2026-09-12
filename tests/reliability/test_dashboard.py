@@ -175,6 +175,11 @@ def supervisor(config: JarvisConfig, tmp_path: Path, launchctl: FakeLaunchctl):
         jarvis_dir=tmp_path / "jarvis",
         uid=501,
         platform_name="Darwin",
+        # Without this the supervisor asks the real host for a real
+        # launchctl, finds none off macOS, and every call below short-
+        # circuits in supported() -- leaving these assertions passing over
+        # an empty list of calls instead of over the launchd logic.
+        launchctl_lookup=lambda name: f"/bin/{name}",
     )
     sup.plist_path().parent.mkdir(parents=True, exist_ok=True)
     sup.plist_path().write_text("<plist/>", encoding="utf-8")
@@ -365,6 +370,11 @@ def test_env_var_names_are_shown_but_values_never_are(config, monkeypatch, tmp_p
         jarvis_dir=tmp_path / "jarvis",
         uid=501,
         platform_name="Darwin",
+        # Without this the supervisor asks the real host for a real
+        # launchctl, finds none off macOS, and every call below short-
+        # circuits in supported() -- leaving these assertions passing over
+        # an empty list of calls instead of over the launchd logic.
+        launchctl_lookup=lambda name: f"/bin/{name}",
     )
     assert "TEST_GITHUB_TOKEN" in sup.required_env_names()
     assert FAKE_SECRET not in json.dumps(sup.status().to_dict())
