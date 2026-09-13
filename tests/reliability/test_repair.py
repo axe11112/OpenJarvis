@@ -1349,27 +1349,75 @@ class TestProductionLeaseIsActuallyWired:
 
     def test_the_repair_factory_passes_a_production_lease(self):
         """The real construction site, not a hand-made RepairLoop."""
-        import inspect
-
         from openjarvis.cli import reliability_cmd
 
-        source = inspect.getsource(reliability_cmd._build_repair_loop)
-        assert "production_lease=" in source, (
+        assert _keyword_is_wired(
+            reliability_cmd._build_repair_loop, "RepairLoop", "production_lease"
+        ), (
             "the repair loop is constructed without a production-change lease, "
             "so repair merges are again unserialised against feature ships"
         )
 
     def test_wiz_ships_under_the_shared_lease_not_a_private_one(self):
-        import inspect
-
         from openjarvis.wiz import assemble as assemble_mod
 
-        source = inspect.getsource(assemble_mod.assemble)
-        assert "production_change_lease" in source, (
-            "Wiz is shipping under a lease of its own again; it must take the "
-            "shared production-change lease so a repair merge contends with it"
+        assert _keyword_is_wired(
+            assemble_mod.assemble, "FeaturePipeline", "ship_lease"
+        ), "the Wiz pipeline is built with no ship lease at all"
+
+        # And that the lease it is built with is the *shared* one. What has to
+        # be true is that both subsystems open the same file, so this checks
+        # which function builds the value, not how the line is spelled.
+        import ast
+        import inspect
+        import textwrap
+
+        from openjarvis.core.proclock import production_change_lease
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(assemble_mod.assemble)))
+        builders = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for kw in node.keywords:
+                if kw.arg != "ship_lease" or not isinstance(kw.value, ast.Call):
+                    continue
+                inner = kw.value.func
+                builders.add(getattr(inner, "id", None) or getattr(inner, "attr", "?"))
+        assert "production_change_lease" in builders, (
+            f"ship_lease is built by {builders or 'something unrecognised'}, not "
+            "production_change_lease -- a Wiz-private lock serialises Wiz "
+            "against itself and leaves ship-versus-repair-merge unguarded"
         )
-        assert 'ProcessLease(root / "ship.lock"' not in source, (
-            "the Wiz-private ship.lock is back, which serialises Wiz against "
-            "itself and leaves feature-ship-versus-repair-merge unguarded"
-        )
+        assert production_change_lease(owner="x").path.name == "production-change.lock"
+
+
+def _keyword_is_wired(func, callee: str, keyword: str) -> bool:
+    """Whether *func* calls *callee* passing *keyword* a non-None value.
+
+    Parsed, not grepped. A substring search over the source is satisfied by the
+    keyword appearing in a comment -- including the comment explaining why the
+    wiring matters -- and by `keyword=None`, which is the one value that turns
+    the mechanism off. Both were true of the guards this replaces, so they
+    would have passed with the wiring deleted: exactly the "test that cannot
+    fail" this file exists to prevent.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = node.func
+        target = getattr(name, "id", None) or getattr(name, "attr", None)
+        if target != callee:
+            continue
+        for kw in node.keywords:
+            if kw.arg != keyword:
+                continue
+            if isinstance(kw.value, ast.Constant) and kw.value.value is None:
+                return False
+            return True
+    return False

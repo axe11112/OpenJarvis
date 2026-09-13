@@ -696,13 +696,38 @@ class TestTheDurableEmergencyStopActuallyStops:
         assert RepairGate().may_start("INC-00001")[0] is True
 
     def test_the_watcher_factory_wires_the_flag(self):
-        """Asserted at the wiring, because the wiring is what was missing."""
+        """Asserted at the wiring, because the wiring is what was missing.
+
+        Parsed, not grepped, and scoped to the one function that builds the
+        gate. The guard this replaces searched the whole ~2400-line module for a
+        literal, so any comment mentioning it anywhere satisfied it -- including
+        a comment explaining why the wiring matters.
+        """
+        import ast
         import inspect
+        import textwrap
 
         from openjarvis.cli import reliability_cmd
 
-        source = inspect.getsource(reliability_cmd)
-        assert "stop_engaged=lambda: _stop_flag_path(config).is_file()" in source, (
+        tree = ast.parse(
+            textwrap.dedent(
+                inspect.getsource(reliability_cmd._build_supervised_monitor)
+            )
+        )
+        wired = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if name != "RepairGate":
+                continue
+            for kw in node.keywords:
+                if kw.arg != "stop_engaged":
+                    continue
+                if isinstance(kw.value, ast.Constant) and kw.value.value is None:
+                    continue
+                wired = True
+        assert wired, (
             "the watcher's RepairGate no longer reads the durable emergency "
             "stop, so pulling it leaves repairs running"
         )

@@ -69,6 +69,12 @@ class _FakePipeline:
     def reverify_against_current_base(self, feature_id, **kw):
         return self._record("reverify_against_current_base", feature_id, kw)
 
+    def reconcile_after_ship(self, feature_id, **kw):
+        return self._record("reconcile_after_ship", feature_id, kw)
+
+    def reverify_production(self, feature_id, **kw):
+        return self._record("reverify_production", feature_id, kw)
+
 
 @pytest.fixture
 def pipeline(monkeypatch):
@@ -211,3 +217,50 @@ class TestRefusalsReachTheOwner:
         )
         assert result.exit_code != 0
         assert "is COMPLETE, not HUMAN_REQUIRED" in result.output
+
+
+class TestReconcile:
+    """`jarvis wiz reconcile`, which the map claimed was covered and was not.
+
+    The reachability guard above only asserts a command with that name exists.
+    That is the one thing it is for, and it is not the same as knowing the
+    command reaches the canonical method -- a command that exists and calls the
+    wrong thing satisfies it perfectly.
+    """
+
+    def test_it_reaches_reconcile_after_ship(self, pipeline):
+        result = CliRunner().invoke(
+            wiz, ["reconcile", "FEAT-00031", "--reason", "the watcher restarted"]
+        )
+        assert result.exit_code == 0, result.output
+        name, feature_id, kwargs = pipeline.calls[0]
+        assert name == "reconcile_after_ship", (
+            f"reconcile reached {name}, not the canonical method"
+        )
+        assert feature_id == "FEAT-00031"
+        assert kwargs["reason"] == "the watcher restarted"
+
+    def test_it_does_not_reach_reverify_production_directly(self, pipeline):
+        """reconcile_after_ship establishes the merge was this pipeline's before
+        it re-verifies. A command calling reverify_production directly would
+        skip that and become the unauthorised-merge path."""
+        CliRunner().invoke(wiz, ["reconcile", "FEAT-00031", "--reason", "x"])
+        assert [c[0] for c in pipeline.calls] == ["reconcile_after_ship"]
+
+    def test_a_reason_is_optional(self, pipeline):
+        """Unlike accept and rebuild: this asks what happened, it grants nothing."""
+        result = CliRunner().invoke(wiz, ["reconcile", "FEAT-00031"])
+        assert result.exit_code == 0, result.output
+        assert pipeline.calls[0][0] == "reconcile_after_ship"
+
+    def test_a_refusal_is_printed_and_exits_non_zero(self, monkeypatch):
+        """The refusal is the whole point of this verb: it must not read green."""
+        fake = _FakePipeline(
+            raises=ValueError("FEAT-00031 has no record of this pipeline merging it")
+        )
+        monkeypatch.setattr(
+            "openjarvis.cli.wiz_cmd._pipeline_or_exit", lambda: fake, raising=True
+        )
+        result = CliRunner().invoke(wiz, ["reconcile", "FEAT-00031"])
+        assert result.exit_code != 0
+        assert "no record of this pipeline merging" in result.output

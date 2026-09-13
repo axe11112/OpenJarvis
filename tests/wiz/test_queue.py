@@ -205,20 +205,48 @@ class TestProductionBusyIsConnectedToSomething:
                 holder.join(timeout=5.0)
 
     def test_assemble_supplies_a_default_production_busy(self):
-        """Asserted at the wiring, because the wiring is what was missing."""
+        """Asserted at the wiring, because the wiring is what was missing.
+
+        Parsed rather than grepped: a substring search is satisfied by the
+        comment explaining the wiring, which is the failure mode this whole
+        class is named after.
+        """
+        import ast
         import inspect
+        import textwrap
 
         from openjarvis.wiz import assemble as assemble_mod
 
-        source = inspect.getsource(assemble_mod.assemble)
-        assert "production_busy = _production_lease.is_held" in source, (
-            "assemble() no longer supplies a production_busy source, so the "
-            "queue's production deferral is inert again"
+        tree = ast.parse(textwrap.dedent(inspect.getsource(assemble_mod.assemble)))
+
+        wired = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if name != "DevelopmentQueue":
+                continue
+            for kw in node.keywords:
+                if kw.arg != "production_busy":
+                    continue
+                if isinstance(kw.value, ast.Constant) and kw.value.value is None:
+                    continue
+                wired = True
+        assert wired, (
+            "assemble() builds the queue with no production_busy, so the "
+            "production deferral is inert again"
         )
-        code = [
-            line for line in source.splitlines() if not line.lstrip().startswith("#")
-        ]
-        assert not any("current_holder" in line for line in code), (
+
+        # The default must come from is_held, never current_holder: a SIGKILLed
+        # holder's record outlives its lock and would stall feature work for the
+        # rest of the machine's uptime.
+        attributes = {
+            node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        }
+        assert "is_held" in attributes, (
+            "production_busy is no longer sourced from ProcessLease.is_held"
+        )
+        assert "current_holder" not in attributes, (
             "production_busy must not be built on current_holder(): a "
             "SIGKILLed holder's record outlives its lock and would stall "
             "feature work forever"
