@@ -1092,3 +1092,31 @@ def authority(as_json: bool) -> None:
             f"[dim]Grant it deliberately in {path} — this command will not "
             f"edit it for you.[/dim]"
         )
+
+
+@wiz.command("approve-ship")
+@click.argument("feature_id")
+@click.option(
+    "--reason", required=True, help="What you checked, and why this may merge."
+)
+def approve_ship(feature_id: str, reason: str) -> None:
+    """Consent to merging one HIGH-risk feature, once.
+
+    Grants nothing on its own and changes no policy. The approval is bound to
+    this feature, its current verified commit, its current risk tier and the
+    merge action, and it is consumed on use -- so a new commit, a re-rated risk
+    or a different feature all leave it matching nothing.
+
+    HIGH-risk features are never shipped automatically; that is unchanged. This
+    exists so that when a person does decide, the decision is recorded as
+    specifically as the MEDIUM-risk one already was, rather than being a bare
+    yes that nothing could later tie to anything.
+    """
+    console = _console()
+    pipeline = _pipeline_or_exit()
+    try:
+        feature = pipeline.approve_high_risk_ship(feature_id, reason=reason)
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]{exc}[/red]")
+        raise SystemExit(1) from exc
+    _report_feature(feature, did="approved for a HIGH-risk merge, once")

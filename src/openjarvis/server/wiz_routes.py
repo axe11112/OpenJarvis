@@ -340,6 +340,30 @@ def ship_feature(
     pipeline = runtime.product.pipeline
     operator_approved = bool((payload or {}).get("operator_approved", False))
 
+    # For a HIGH-risk feature the boolean above is not what authorises the
+    # merge, and has not been since ship() started requiring a redeemed,
+    # fingerprint-bound approval for that tier. Turn the operator's click into
+    # exactly that consent -- bound to this feature, its verified head SHA, its
+    # risk tier and the merge action, single-use and journalled -- rather than
+    # passing a bare flag down and hoping it means something. This is the same
+    # shape the HIGH-risk *build* approval on /approve already uses.
+    feature = pipeline.store.get(feature_id)
+    is_high = bool(feature and (feature.risk or "").strip().upper() == "HIGH")
+    if operator_approved and is_high:
+        try:
+            pipeline.approve_high_risk_ship(
+                feature_id,
+                reason=str(
+                    (payload or {}).get("summary", "approved from Control Center")
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - reported, never assumed past
+            logger.warning("could not record the HIGH-risk approval: %s", exc)
+            return {
+                "started": False,
+                "message": f"I could not record that approval: {exc}",
+            }
+
     def drive() -> None:
         try:
             pipeline.ship(feature_id, operator_approved=operator_approved)

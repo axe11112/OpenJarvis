@@ -1097,6 +1097,14 @@ class FeaturePipeline:
                 status = {"state": "unreadable", "contexts": {}}
 
         head_sha = str(pr.get("head_sha", ""))
+        if (feature.risk or "").strip().upper() == Risk.HIGH.value:
+            # For HIGH, the caller's boolean is not evidence of anything. Only a
+            # redeemed approval naming this feature, this head SHA, this risk
+            # tier and this action counts -- the same standard MEDIUM has always
+            # been held to, applied to the tier that matters more.
+            operator_approved = self._high_risk_ship_approved(
+                feature, head_sha=head_sha
+            )
         medium_risk_approved = self._medium_ship_approved(feature, head_sha=head_sha)
         # Either a durable record of the consent _finish already redeemed
         # once reaching READY (the common case — see
@@ -2242,6 +2250,100 @@ class FeaturePipeline:
         feature.approved_plan_hash = _digest(feature.plan)
         feature.metadata.pop("approval_token", None)
         return True
+
+    def _high_risk_ship_approved(
+        self, feature: FeatureRequest, *, head_sha: str
+    ) -> bool:
+        """Whether a redeemed approval authorises merging this HIGH-risk feature.
+
+        The same fingerprint-and-redeem shape as
+        :meth:`_medium_ship_approved`, and that is the whole point: HIGH was
+        the weakest-bound gate in the system while MEDIUM was the
+        strongest-bound. ``operator_approved`` arrived as a bare boolean in an
+        HTTP body -- no fingerprint, no TTL, no single use, no record of what
+        was consented to -- so the most consequential tier had the least
+        evidence behind it. The most dangerous decision should not be the
+        easiest one to make by accident.
+
+        Bound to this feature, this exact head SHA, the risk tier it was
+        approved at, and the action, so it cannot transfer to another feature,
+        survive a new commit, or be reused if the classifier later re-rates the
+        work. Consumed on use, and the issue and the redemption are both
+        journalled by the approval store.
+        """
+        if (feature.risk or "").strip().upper() != Risk.HIGH.value:
+            return False
+        token = str(feature.metadata.get("high_risk_ship_approval_token", ""))
+        if not token or self.approvals is None:
+            return False
+        try:
+            self.approvals.redeem(
+                token,
+                capability="feature.ship_high_risk",
+                subject=feature.id,
+                parameters={
+                    "risk": feature.risk,
+                    "head_sha": head_sha,
+                    "action": "merge",
+                },
+            )
+        except ApprovalError as exc:
+            feature.metadata["high_risk_ship_approval_error"] = str(exc)
+            return False
+        feature.metadata["high_risk_ship_approved_head_sha"] = head_sha
+        feature.metadata.pop("high_risk_ship_approval_token", None)
+        return True
+
+    def approve_high_risk_ship(
+        self, feature_id: str, *, reason: str
+    ) -> FeatureRequest:
+        """Record the owner's consent to merge one HIGH-risk feature, once.
+
+        Grants nothing on its own and changes no policy. It mints a single-use,
+        TTL'd approval bound to this feature, its current verified head SHA, its
+        current risk tier and the merge action, and stores the token where
+        :meth:`ship` looks. If any of those change before the ship, the
+        fingerprint no longer matches and the approval silently fails to
+        redeem -- it is consent to merge *this*, not a standing permission.
+
+        Deliberately does not make HIGH auto-shippable:
+        :meth:`auto_ship_if_eligible` still requires LOW, so nothing autonomous
+        reaches this path. A person has to decide, and now there is a record of
+        exactly what they decided.
+        """
+        feature = self._load(feature_id)
+        if self.approvals is None:
+            raise ApprovalError("no approval store is configured")
+        if (feature.risk or "").strip().upper() != Risk.HIGH.value:
+            raise ApprovalError(
+                f"{feature_id} is {feature.risk or 'unclassified'} risk, not "
+                f"HIGH; this approval exists only for the tier that needs it"
+            )
+        if not feature.attempts or not feature.attempts[-1].commit_sha:
+            raise ApprovalError(
+                f"{feature_id} has no verified commit to bind this approval to"
+            )
+        head_sha = feature.attempts[-1].commit_sha
+        approval = self.approvals.issue(
+            capability="feature.ship_high_risk",
+            subject=feature.id,
+            parameters={
+                "risk": feature.risk,
+                "head_sha": head_sha,
+                "action": "merge",
+            },
+            actor_id=feature.actor_id,
+            channel=feature.source,
+            summary=reason[:1000],
+        )
+        feature.metadata["high_risk_ship_approval_token"] = approval.token
+        self.store.save(feature)
+        self._record(
+            feature,
+            "feature.high_risk_ship_approved",
+            f"approved merging {feature_id} at {head_sha[:12]}. {reason}"[:1000],
+        )
+        return feature
 
     def _medium_ship_approved(self, feature: FeatureRequest, *, head_sha: str) -> bool:
         """Whether a live, redeemed approval authorises shipping this exact

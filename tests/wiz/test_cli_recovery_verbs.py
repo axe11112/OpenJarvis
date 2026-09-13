@@ -32,6 +32,7 @@ OPERATOR_VERBS: Dict[str, str] = {
     "reverify_against_current_base": "refresh-base",
     "reconcile_after_ship": "reconcile",
     "reverify_production": "reconcile",
+    "approve_high_risk_ship": "approve-ship",
 }
 
 
@@ -65,6 +66,9 @@ class _FakePipeline:
 
     def approve_manual_acceptance(self, feature_id, **kw):
         return self._record("approve_manual_acceptance", feature_id, kw)
+
+    def approve_high_risk_ship(self, feature_id, **kw):
+        return self._record("approve_high_risk_ship", feature_id, kw)
 
     def reverify_against_current_base(self, feature_id, **kw):
         return self._record("reverify_against_current_base", feature_id, kw)

@@ -4511,3 +4511,152 @@ class TestAMergeIsNeverStrandedByASaveConflict:
 
         with pytest.raises(ApprovalError, match="no record of this pipeline merging"):
             pipeline.reconcile_after_ship(feature.id, reason="finish it off")
+
+
+class TestHighRiskIsNotWeakerThanMedium:
+    """HIGH was the weakest-bound gate while MEDIUM was the strongest.
+
+    A MEDIUM-risk merge needed a redeemed approval naming the feature and the
+    exact head SHA, single-use, with a TTL, journalled at issue and at
+    redemption. A HIGH-risk merge -- the tier that exists because the change
+    could hurt -- needed `operator_approved: true` in an HTTP body. No
+    fingerprint, no TTL, no single use, and nothing afterwards that could say
+    what had been consented to.
+
+    The most dangerous decision should not be the easiest one to make by
+    accident.
+    """
+
+    def _approvals(self):
+        from openjarvis.wiz.approvals import ApprovalStore
+
+        return ApprovalStore(clock=lambda: 0.0, ttl_seconds=900)
+
+    def _high_risk_ready(self, tmp_path, clock, approvals):
+        github = TestShip.FakeGitHub()
+        pipeline = build_pipeline(tmp_path, clock, approvals=approvals)
+        pipeline.shipper = TestShip()._shipper(github)
+        pipeline.postship = TestShip.FakePostShip(verified=True)
+        submitted = pipeline.submit(REQUEST, actor=operator_actor())
+        feature = pipeline.run(submitted.id)
+        assert feature.state is FeatureState.READY
+        feature.risk = "HIGH"
+        pipeline.store.save(feature)
+        return pipeline, feature, github
+
+    def test_a_bare_boolean_no_longer_merges_a_high_risk_feature(
+        self, tmp_path, clock
+    ):
+        """The defect, stated directly."""
+        pipeline, feature, github = self._high_risk_ready(
+            tmp_path, clock, self._approvals()
+        )
+
+        shipped = pipeline.ship(feature.id, operator_approved=True)
+
+        assert shipped.state is FeatureState.READY
+        assert not github.merge_calls, (
+            "a HIGH-risk feature merged on an unbound boolean"
+        )
+
+    def test_a_bound_approval_does_merge_it(self, tmp_path, clock):
+        """Stronger binding must not mean unusable."""
+        pipeline, feature, github = self._high_risk_ready(
+            tmp_path, clock, self._approvals()
+        )
+        pipeline.approve_high_risk_ship(feature.id, reason="I read the diff")
+
+        shipped = pipeline.ship(feature.id)
+
+        assert shipped.state is FeatureState.COMPLETE
+        assert github.merge_calls
+
+    def test_it_is_single_use(self, tmp_path, clock):
+        pipeline, feature, github = self._high_risk_ready(
+            tmp_path, clock, self._approvals()
+        )
+        pipeline.approve_high_risk_ship(feature.id, reason="once")
+        pipeline.ship(feature.id)
+
+        # A second feature must not ride the first one's consent.
+        second = pipeline.submit(REQUEST, actor=operator_actor())
+        other = pipeline.run(second.id)
+        other.risk = "HIGH"
+        pipeline.store.save(other)
+        merges_before = len(github.merge_calls)
+
+        pipeline.ship(other.id)
+
+        assert len(github.merge_calls) == merges_before, (
+            "one approval merged a second HIGH-risk feature"
+        )
+
+    def test_it_does_not_survive_a_new_commit(self, tmp_path, clock):
+        pipeline, feature, github = self._high_risk_ready(
+            tmp_path, clock, self._approvals()
+        )
+        pipeline.approve_high_risk_ship(feature.id, reason="at this commit")
+
+        moved = pipeline.store.get(feature.id)
+        moved.attempts[-1].commit_sha = "9" * 40
+        pipeline.store.save(moved)
+
+        shipped = pipeline.ship(feature.id)
+        assert not github.merge_calls, (
+            "an approval for one commit merged a different one"
+        )
+        assert shipped.state is FeatureState.READY
+
+    def test_it_does_not_transfer_across_a_re_rated_risk(self, tmp_path, clock):
+        """The fingerprint names the tier it was approved at."""
+        approvals = self._approvals()
+        pipeline, feature, _ = self._high_risk_ready(tmp_path, clock, approvals)
+        pipeline.approve_high_risk_ship(feature.id, reason="approved as HIGH")
+
+        # Re-rated after the approval: the fingerprint no longer matches.
+        rerated = pipeline.store.get(feature.id)
+        rerated.risk = "MEDIUM"
+        pipeline.store.save(rerated)
+
+        assert (
+            pipeline._high_risk_ship_approved(
+                pipeline.store.get(feature.id), head_sha=TestShip.HEAD_SHA
+            )
+            is False
+        )
+
+    def test_approving_a_feature_that_is_not_high_risk_is_refused(
+        self, tmp_path, clock
+    ):
+        """This exists for one tier; it must not become a general override."""
+        pipeline = build_pipeline(tmp_path, clock, approvals=self._approvals())
+        pipeline.shipper = TestShip()._shipper(TestShip.FakeGitHub())
+        submitted = pipeline.submit(REQUEST, actor=operator_actor())
+        feature = pipeline.run(submitted.id)
+        feature.risk = "LOW"
+        pipeline.store.save(feature)
+
+        with pytest.raises(ApprovalError, match="not\\s+HIGH|is LOW"):
+            pipeline.approve_high_risk_ship(feature.id, reason="nope")
+
+    def test_the_approval_is_journalled(self, tmp_path, clock):
+        pipeline, feature, _ = self._high_risk_ready(
+            tmp_path, clock, self._approvals()
+        )
+        pipeline.approve_high_risk_ship(feature.id, reason="I read the diff")
+        kinds = [e.kind for e in pipeline.journal.tail(50)]
+        assert "feature.high_risk_ship_approved" in kinds
+
+    def test_high_risk_is_still_never_shipped_automatically(self, tmp_path, clock):
+        """Binding it better must not make it autonomous."""
+        pipeline, feature, github = self._high_risk_ready(
+            tmp_path, clock, self._approvals()
+        )
+        pipeline.approve_high_risk_ship(feature.id, reason="approved")
+
+        result = pipeline.auto_ship_if_eligible(feature.id)
+
+        assert not github.merge_calls, (
+            "auto_ship shipped a HIGH-risk feature"
+        )
+        assert result.state is FeatureState.READY
