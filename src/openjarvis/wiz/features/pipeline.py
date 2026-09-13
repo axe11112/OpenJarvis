@@ -788,7 +788,20 @@ class FeaturePipeline:
                 f"path and your explicit acknowledgement -- it is not an "
                 f"ordinary retry."
             )
-        if feature.state in self.IN_FLIGHT_SHIP_STATES:
+        # A feature left anywhere other than a terminal state while its merge is
+        # on record needs the same strand: a compare-and-swap conflict on the
+        # first post-merge save leaves it at READY, which is not an in-flight
+        # state and yet is exactly as wrong -- GitHub says MERGED and the store
+        # says the feature is waiting to be shipped. Left alone, ship() would
+        # cheerfully try to merge it a second time.
+        stranded = (
+            feature.state in self.IN_FLIGHT_SHIP_STATES
+            or (feature.state is FeatureState.READY and not feature.terminal)
+        )
+        if stranded:
+            # Before driving anything: prove the merge on record is this
+            # feature's and this attempt's.
+            self._assert_merge_is_this_attempt(feature)
             interrupted = feature.state.value
             feature.transition(
                 FeatureState.HUMAN_REQUIRED,
@@ -839,9 +852,89 @@ class FeaturePipeline:
         if feature.state in self.IN_FLIGHT_SHIP_STATES:
             return True
         in_flight = {state.value for state in self.IN_FLIGHT_SHIP_STATES}
-        return any(
-            str(entry.get("to", "")) in in_flight for entry in feature.history
-        )
+        if any(str(entry.get("to", "")) in in_flight for entry in feature.history):
+            return True
+        # And the case the history cannot cover: a compare-and-swap conflict on
+        # the very first post-merge save leaves the row at READY with no MERGING
+        # in its history, because that transition never reached the database.
+        # The journal did, because it is written first and is not the row.
+        return self._merge_evidence(feature.id) is not None
+
+    def _assert_merge_is_this_attempt(self, feature: FeatureRequest) -> None:
+        """Prove the merged pull request is this feature's and this attempt's.
+
+        "This pipeline merged something" is not enough to finish a feature on.
+        The pull request on record has to be the one that was merged, the commit
+        it merged has to be the head this feature's gates were evaluated
+        against, and there has to be a real merge commit. Anything else --
+        a renumbered pull request, a head that moved between the gates and the
+        merge, a merge nobody can name a commit for -- is a question for a
+        person, not a lifecycle this method should drive.
+
+        Raises :class:`ApprovalError` with the specific mismatch. Silent on the
+        cases it cannot check, which is deliberate: a shipper that cannot read
+        GitHub is a reason to stop, not a reason to assume.
+        """
+        evidence = self._merge_evidence(feature.id)
+        if evidence is None:
+            return  # in-flight state was the evidence; nothing further to bind
+        if self.shipper is None:
+            raise ApprovalError(
+                f"{feature.id} has a recorded merge but no shipper is "
+                f"configured, so GitHub cannot be asked what really happened"
+            )
+        try:
+            pull_request = self.shipper.github.get_pull_request(feature.pr_number)
+        except Exception as exc:  # noqa: BLE001 - surfaced, never assumed past
+            raise ApprovalError(
+                f"{feature.id}: could not read pull request "
+                f"#{feature.pr_number} to confirm the merge: {exc}"
+            ) from exc
+
+        if not pull_request.get("merged"):
+            raise ApprovalError(
+                f"{feature.id}: I have a record of merging "
+                f"#{feature.pr_number}, but GitHub says it is not merged "
+                f"(state={pull_request.get('state', 'unknown')!r}). That "
+                f"disagreement needs a person."
+            )
+
+        observed_head = str(pull_request.get("head_sha") or "")
+        expected_head = str(evidence.get("head_sha") or "")
+        if expected_head and observed_head and observed_head != expected_head:
+            raise ApprovalError(
+                f"{feature.id}: the merged pull request's head is "
+                f"{observed_head[:12]}, not the {expected_head[:12]} this "
+                f"feature was verified and gated at. This is not the same "
+                f"attempt."
+            )
+
+        if not str(pull_request.get("merge_commit_sha") or ""):
+            raise ApprovalError(
+                f"{feature.id}: #{feature.pr_number} is merged but GitHub "
+                f"reports no merge commit, so there is nothing to verify "
+                f"production against"
+            )
+
+    def _merge_evidence(self, feature_id: str) -> Optional[Dict[str, Any]]:
+        """The journalled record that this pipeline merged *feature_id*, if any.
+
+        Scans the journal rather than the feature, on purpose: the question is
+        asked precisely when the feature row may not have been writable.
+        """
+        if self.journal is None:
+            return None
+        try:
+            entries = list(self.journal.entries())
+        except Exception:  # noqa: BLE001 - a broken journal must not crash recovery
+            logger.exception("could not read the journal for merge evidence")
+            return None
+        for entry in reversed(entries):
+            if entry.kind != "feature.merge_performed":
+                continue
+            if str((entry.detail or {}).get("feature_id", "")) == feature_id:
+                return dict(entry.detail or {})
+        return None
 
     def reverify_production(
         self, feature_id: str, *, reason: str = ""
@@ -1066,6 +1159,71 @@ class FeaturePipeline:
             return feature
 
         merge_sha = merge_result.get("sha", "")
+        # The merge has happened. From here on the pull request is on the
+        # default branch whatever this process does next, so the first thing
+        # recorded is the fact itself -- into the journal, which is append-only
+        # and, crucially, is not the feature row.
+        #
+        # That distinction is the whole fix. Every state save below is a
+        # compare-and-swap, and a CAS conflict in this window used to leave
+        # GitHub saying MERGED while the feature store still said READY, with
+        # no record anywhere that a merge had been performed at all. The
+        # journal entry is the durable evidence that survives exactly that, and
+        # it carries the bindings a later reconciliation needs to prove the
+        # merge is this feature's and this attempt's rather than somebody
+        # else's: the pull request, the commit that was merged, and the head
+        # the gates were evaluated against.
+        self._record_merge_performed(feature, merge_sha=merge_sha, head_sha=head_sha)
+
+        try:
+            return self._finish_after_merge(feature, merge_sha=merge_sha)
+        except ConcurrentModificationError:
+            # Another process advanced this feature while we were merging. The
+            # merge is real and must not be repeated, and this object is stale
+            # so nothing it says can be written back. Hand it to the one
+            # reconciliation this codebase has, which reloads, asks GitHub what
+            # actually happened, and drives the canonical post-merge lifecycle
+            # from external truth.
+            logger.warning(
+                "%s merged at %s but its row moved under us; reconciling",
+                feature.id,
+                merge_sha[:12],
+            )
+            return self.reconcile_after_ship(
+                feature.id,
+                reason=(
+                    f"the merge of #{feature.pr_number} at {merge_sha[:12]} "
+                    "succeeded, but this feature was written by another process "
+                    "before the result could be recorded"
+                ),
+            )
+
+    def _record_merge_performed(
+        self, feature: FeatureRequest, *, merge_sha: str, head_sha: str
+    ) -> None:
+        """Journal that this pipeline merged this feature, before anything else.
+
+        Deliberately not on the feature row: the row is what may be unwritable.
+        """
+        self._record(
+            feature,
+            "feature.merge_performed",
+            (
+                f"merged pull request #{feature.pr_number} at {merge_sha} "
+                f"(head {head_sha})"
+            ),
+            detail={
+                "pr_number": feature.pr_number,
+                "merge_sha": merge_sha,
+                "head_sha": head_sha,
+                "base_sha": feature.base_sha,
+            },
+        )
+
+    def _finish_after_merge(
+        self, feature: FeatureRequest, *, merge_sha: str
+    ) -> FeatureRequest:
+        """The post-merge lifecycle, for a caller whose merge just succeeded."""
         self._transition(
             feature, FeatureState.MERGING, f"merged pull request #{feature.pr_number}"
         )
@@ -2343,7 +2501,14 @@ class FeaturePipeline:
             raise KeyError(f"no feature request {feature_id!r}")
         return feature
 
-    def _record(self, feature: FeatureRequest, kind: str, reason: str) -> None:
+    def _record(
+        self,
+        feature: FeatureRequest,
+        kind: str,
+        reason: str,
+        *,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> None:
         if self.journal is not None:
             try:
                 self.journal.record(
@@ -2358,6 +2523,10 @@ class FeaturePipeline:
                         "state": feature.state.value,
                         "risk": feature.risk,
                         "attempts": feature.attempts_used,
+                        # Extra bindings, for the few events a later reader has
+                        # to be able to act on rather than merely read -- see
+                        # _record_merge_performed.
+                        **(detail or {}),
                     },
                 )
             except Exception:

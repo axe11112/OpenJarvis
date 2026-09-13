@@ -30,7 +30,7 @@ from openjarvis.wiz.features.preview import PreviewObserver
 from openjarvis.wiz.features.profile import EngineeringProfile
 from openjarvis.wiz.features.queue import DevelopmentQueue
 from openjarvis.wiz.features.shipping import FeatureShipper, FeatureShippingPolicy
-from openjarvis.wiz.features.store import FeatureStore
+from openjarvis.wiz.features.store import ConcurrentModificationError, FeatureStore
 from openjarvis.wiz.features.verification import FeatureVerifier
 from openjarvis.wiz.journal import WizJournal
 
@@ -4165,9 +4165,7 @@ class TestTheSafeStopIsActuallySafe:
                     ConcurrentModificationError,
                 )
 
-                raise ConcurrentModificationError(
-                    feature.id, expected_version=1, actual_version=2
-                )
+                raise ConcurrentModificationError(feature.id, expected_version=1, actual_version=2)
             return self._inner.save(feature)
 
     def _pipeline_mid_build(self, tmp_path, clock):
@@ -4255,3 +4253,261 @@ class TestTheSafeStopIsActuallySafe:
 
         assert result.progressed is False
         assert not pipeline.queue.snapshot()["running"]
+
+
+class TestAMergeIsNeverStrandedByASaveConflict:
+    """GitHub MERGED and the feature store saying READY is not a terminal state.
+
+    Every save in ship()'s post-merge window is a compare-and-swap. A conflict
+    there -- another process advancing the same feature while this one was
+    merging -- used to leave the pull request on the default branch while the
+    store still said READY. Nothing recorded that a merge had happened, so the
+    next ship() would have tried to merge it again.
+
+    The fix is not a retry of the stale save. The merge is journalled the
+    instant GitHub confirms it, into the journal rather than the row -- the row
+    is the thing that may be unwritable -- and the conflict routes into the one
+    reconciliation this codebase has, which reloads, asks GitHub what actually
+    happened, and drives the canonical post-merge lifecycle from that.
+    """
+
+    class ConflictingStore:
+        """A real store that CAS-conflicts the Nth save onwards."""
+
+        def __init__(self, inner, *, fail_from: int = 1, fail_times: int = 1):
+            self._inner = inner
+            self._save_count = 0
+            self._fail_from = fail_from
+            self._remaining = fail_times
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def save(self, feature):
+            self._save_count += 1
+            if self._save_count >= self._fail_from and self._remaining > 0:
+                self._remaining -= 1
+                raise ConcurrentModificationError(feature.id, expected_version=1, actual_version=2)
+            return self._inner.save(feature)
+
+    class MergedGitHub(TestShip.FakeGitHub):
+        """A real-shaped GitHub: open until merged, merged afterwards.
+
+        ``merged_after_merge=False`` models the disagreement where our record
+        says we merged and GitHub says otherwise.
+        """
+
+        def __init__(
+            self,
+            *,
+            merged_after_merge=True,
+            merge_commit_sha="d" * 40,
+            head_sha=None,
+            number=7,
+            merged_now=False,
+        ):
+            super().__init__()
+            self._merged_after_merge = merged_after_merge
+            self._merge_commit_sha = merge_commit_sha
+            self._head_sha = head_sha or TestShip.HEAD_SHA
+            self._number = number
+            self._merged = merged_now
+
+        def merge_pull_request(self, **kwargs):
+            result = super().merge_pull_request(**kwargs)
+            self._merged = self._merged_after_merge
+            return result
+
+        def get_pull_request(self, number):
+            pr = dict(super().get_pull_request(number))
+            pr["number"] = self._number
+            pr["head_sha"] = self._head_sha
+            pr["merged"] = self._merged
+            pr["state"] = "closed" if self._merged else "open"
+            if self._merged:
+                pr["merge_commit_sha"] = self._merge_commit_sha
+            return pr
+
+    def _ready(self, tmp_path, clock, *, github=None, postship=None):
+        github = github or self.MergedGitHub()
+        pipeline, feature = TestShip()._ready(
+            tmp_path,
+            clock,
+            shipper=TestShip()._shipper(github),
+            postship=postship or TestShip.FakePostShip(verified=True),
+        )
+        return pipeline, feature, github
+
+    # -- the defect itself -------------------------------------------------
+
+    def test_a_conflict_on_the_first_post_merge_save_still_completes(
+        self, tmp_path, clock
+    ):
+        """The exact scenario: merge succeeds, the very next save conflicts."""
+        pipeline, feature, github = self._ready(tmp_path, clock)
+        # Saves before the merge succeed; the first one after it conflicts.
+        pipeline.store = self.ConflictingStore(pipeline.store, fail_from=1)
+        pipeline.store._save_count = 0
+
+        shipped = pipeline.ship(feature.id)
+
+        assert shipped.state is FeatureState.COMPLETE, (
+            f"left at {shipped.state.value} with the pull request already merged"
+        )
+        assert len(github.merge_calls) == 1, "the merge was attempted twice"
+
+    def test_the_merge_is_journalled_before_any_state_save(self, tmp_path, clock):
+        """The evidence has to survive the row being unwritable.
+
+        A store that never accepts a write is a broken database, not a race, and
+        ship() is right to raise rather than return a feature that looks fine.
+        What must not happen is the merge going unrecorded: the journal entry is
+        written before any save is attempted, so it is there for the operator
+        and for a later reconciliation even when nothing else could be.
+        """
+        pipeline, feature, github = self._ready(tmp_path, clock)
+        pipeline.store = self.ConflictingStore(pipeline.store, fail_times=99)
+        pipeline.store._save_count = 0
+
+        with pytest.raises(ConcurrentModificationError):
+            pipeline.ship(feature.id)
+
+        merges = [
+            e
+            for e in pipeline.journal.entries()
+            if e.kind == "feature.merge_performed"
+            and e.detail.get("feature_id") == feature.id
+        ]
+        assert merges, "nothing recorded that a merge had been performed"
+        detail = merges[-1].detail
+        assert detail["merge_sha"]
+        assert detail["head_sha"] == TestShip.HEAD_SHA
+        assert detail["pr_number"] == feature.pr_number
+
+    def test_it_never_merges_a_second_time(self, tmp_path, clock):
+        pipeline, feature, github = self._ready(tmp_path, clock)
+        pipeline.store = self.ConflictingStore(pipeline.store)
+        pipeline.store._save_count = 0
+        pipeline.ship(feature.id)
+
+        # A second ship() must not merge again, whatever state it finds.
+        pipeline.store = pipeline.store._inner
+        pipeline.ship(feature.id)
+        assert len(github.merge_calls) == 1, "the pull request was merged twice"
+
+    def test_reconciling_twice_is_idempotent(self, tmp_path, clock):
+        pipeline, feature, github = self._ready(tmp_path, clock)
+        pipeline.store = self.ConflictingStore(pipeline.store)
+        pipeline.store._save_count = 0
+        first = pipeline.ship(feature.id)
+        pipeline.store = pipeline.store._inner
+
+        again = pipeline.reconcile_after_ship(feature.id, reason="again")
+
+        assert first.state is FeatureState.COMPLETE
+        assert again.state is FeatureState.COMPLETE
+        assert len(github.merge_calls) == 1
+
+    # -- external truth has to agree ---------------------------------------
+
+    def test_a_merge_github_denies_stops_for_a_person(self, tmp_path, clock):
+        """Our record says merged, GitHub says open. Nobody guesses."""
+        github = self.MergedGitHub(merged_now=False)
+        pipeline, feature, _ = self._ready(tmp_path, clock, github=github)
+        pipeline._record_merge_performed(
+            feature, merge_sha="d" * 40, head_sha=TestShip.HEAD_SHA
+        )
+
+        with pytest.raises(ApprovalError, match="not merged"):
+            pipeline.reconcile_after_ship(feature.id, reason="finish it")
+
+        assert pipeline.store.get(feature.id).state is not FeatureState.COMPLETE
+
+    def test_a_different_head_sha_is_not_this_attempt(self, tmp_path, clock):
+        """The head moved between the gates and the merge: a different attempt."""
+        github = self.MergedGitHub(head_sha="9" * 40, merged_now=True)
+        pipeline, feature, _ = self._ready(tmp_path, clock, github=github)
+        pipeline._record_merge_performed(
+            feature, merge_sha="d" * 40, head_sha=TestShip.HEAD_SHA
+        )
+
+        with pytest.raises(ApprovalError, match="not the same attempt|not the"):
+            pipeline.reconcile_after_ship(feature.id, reason="finish it")
+
+        assert pipeline.store.get(feature.id).state is not FeatureState.COMPLETE
+
+    def test_a_merge_with_no_merge_commit_is_refused(self, tmp_path, clock):
+        github = self.MergedGitHub(merge_commit_sha="", merged_now=True)
+        pipeline, feature, _ = self._ready(tmp_path, clock, github=github)
+        pipeline._record_merge_performed(
+            feature, merge_sha="d" * 40, head_sha=TestShip.HEAD_SHA
+        )
+
+        with pytest.raises(ApprovalError, match="no merge commit"):
+            pipeline.reconcile_after_ship(feature.id, reason="finish it")
+
+    def test_an_unreadable_pull_request_stops_rather_than_assumes(
+        self, tmp_path, clock
+    ):
+        github = self.MergedGitHub()
+
+        def _boom(_number):
+            raise RuntimeError("GitHub is unreachable")
+
+        pipeline, feature, _ = self._ready(tmp_path, clock, github=github)
+        pipeline._record_merge_performed(
+            feature, merge_sha="d" * 40, head_sha=TestShip.HEAD_SHA
+        )
+        github.get_pull_request = _boom
+
+        with pytest.raises(ApprovalError, match="could not read pull request"):
+            pipeline.reconcile_after_ship(feature.id, reason="finish it")
+
+    # -- production still has the last word --------------------------------
+
+    def test_production_failing_does_not_reach_complete(self, tmp_path, clock):
+        pipeline, feature, github = self._ready(
+            tmp_path, clock, postship=TestShip.FakePostShip(verified=False)
+        )
+        pipeline.store = self.ConflictingStore(pipeline.store)
+        pipeline.store._save_count = 0
+
+        shipped = pipeline.ship(feature.id)
+
+        assert shipped.state is not FeatureState.COMPLETE, (
+            "production said no and the feature was completed anyway"
+        )
+
+    def test_an_unrelated_concurrent_update_does_not_lose_the_merge(
+        self, tmp_path, clock
+    ):
+        """Another process touched metadata; the merge must still land."""
+        pipeline, feature, github = self._ready(tmp_path, clock)
+        inner = pipeline.store
+
+        class _MetadataRace(self.ConflictingStore):
+            def save(self, feature_arg):
+                if self._save_count == 0 and self._remaining > 0:
+                    # Simulate the other process's write landing first.
+                    other = inner.get(feature_arg.id)
+                    other.metadata["touched_by_someone_else"] = True
+                    inner.save(other)
+                return super().save(feature_arg)
+
+        pipeline.store = _MetadataRace(inner)
+        pipeline.store._save_count = 0
+
+        shipped = pipeline.ship(feature.id)
+
+        assert shipped.state is FeatureState.COMPLETE
+        assert len(github.merge_calls) == 1
+        assert pipeline.store.get(feature.id).metadata.get("touched_by_someone_else")
+
+    def test_a_feature_with_no_merge_on_record_is_still_refused(self, tmp_path, clock):
+        """The unauthorised-merge guard must survive all of this."""
+        github = self.MergedGitHub()
+        pipeline, feature, _ = self._ready(tmp_path, clock, github=github)
+        # No merge_performed journal entry, no MERGING in history.
+
+        with pytest.raises(ApprovalError, match="no record of this pipeline merging"):
+            pipeline.reconcile_after_ship(feature.id, reason="finish it off")
