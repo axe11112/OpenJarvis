@@ -849,6 +849,16 @@ class Incident:
     resolution: Resolution = field(default_factory=Resolution)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    #: The row version this incident was loaded at, for optimistic concurrency.
+    #:
+    #: Storage bookkeeping, not incident data: set by
+    #: :class:`~openjarvis.reliability.store.IncidentStore` on load and after a
+    #: successful write, and deliberately absent from :meth:`to_dict` and
+    #: :meth:`from_dict` so it never travels in a payload, a briefing or an
+    #: audit record. ``0`` means "not loaded from a store", which matches no row
+    #: a real ``create()`` produces.
+    store_version: int = 0
+
     # -- state machine ----------------------------------------------------
 
     def can_transition_to(self, state: IncidentState) -> bool:

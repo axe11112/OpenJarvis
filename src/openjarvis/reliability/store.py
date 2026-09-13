@@ -27,18 +27,20 @@ from openjarvis.reliability.events import (
     RELIABILITY_INCIDENT_TRANSITION,
 )
 from openjarvis.reliability.types import (
+    Correlation,
     Evidence,
     Incident,
     IncidentState,
     IncidentTransition,
     RepairAttempt,
+    Resolution,
     Severity,
     now_iso,
 )
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["IncidentStore"]
+__all__ = ["ConcurrentIncidentModification", "IncidentStore"]
 
 _CREATE_INCIDENTS = """\
 CREATE TABLE IF NOT EXISTS incidents (
@@ -59,7 +61,11 @@ CREATE TABLE IF NOT EXISTS incidents (
     repro_steps   TEXT    NOT NULL DEFAULT '[]',
     correlation   TEXT    NOT NULL DEFAULT '{}',
     resolution    TEXT    NOT NULL DEFAULT '{}',
-    metadata      TEXT    NOT NULL DEFAULT '{}'
+    metadata      TEXT    NOT NULL DEFAULT '{}',
+    -- Optimistic concurrency. Every scalar write checks this and bumps it in
+    -- the same statement, so two processes cannot both believe they are
+    -- writing on top of what they last read. See _write_incident_locked.
+    version       INTEGER NOT NULL DEFAULT 1
 );
 """
 
@@ -125,6 +131,15 @@ INSERT OR REPLACE INTO incidents
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
+_UPDATE_INCIDENT = """\
+UPDATE incidents SET
+    fingerprint=?, severity=?, component=?, title=?, summary=?, environment=?,
+    source=?, probe_id=?, state=?, created_at=?, updated_at=?, occurrences=?,
+    last_seen_at=?, repro_steps=?, correlation=?, resolution=?, metadata=?,
+    version=version+1
+WHERE id=? AND version=?
+"""
+
 _INSERT_EVIDENCE = """\
 INSERT OR REPLACE INTO incident_evidence
     (id, incident_id, kind, summary, content, artifact_path, source,
@@ -134,6 +149,31 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 
 #: Incident IDs are zero-padded to this width: ``INC-00042``.
 _ID_WIDTH = 5
+
+
+class ConcurrentIncidentModification(RuntimeError):
+    """Raised when an incident row moved under a writer.
+
+    Means exactly one thing: some other writer -- another thread, another
+    process, another watcher entirely against the same database -- persisted
+    this incident after this caller last read it. The most expensive case is a
+    state change: a second process holding a stale read would otherwise
+    overwrite a HUMAN_REQUIRED escalation with whatever state it still believed
+    the incident had, silently un-escalating an incident a person was asked to
+    look at.
+
+    The caller should re-read the incident, decide whether its change still
+    makes sense against the newer state, and retry.
+    """
+
+    def __init__(self, incident_id: str, *, expected_version: int, actual_version: int):
+        self.incident_id = incident_id
+        self.expected_version = expected_version
+        self.actual_version = actual_version
+        super().__init__(
+            f"{incident_id} was written by someone else first (expected version "
+            f"{expected_version}, found {actual_version}) -- reload and retry"
+        )
 
 
 class IncidentStore:
@@ -165,7 +205,27 @@ class IncidentStore:
             *_CREATE_INDEXES,
         ):
             self._conn.execute(statement)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Bring an existing database up to the current schema.
+
+        CREATE TABLE IF NOT EXISTS does nothing to a table that already exists,
+        so a column added later never reaches a database that predates it --
+        and the operator's incident database does predate this one. Adding it
+        with a DEFAULT gives every existing row a usable version rather than
+        NULL, so the first write after an upgrade behaves like any other.
+        """
+        columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(incidents)").fetchall()
+        }
+        if "version" not in columns:
+            self._conn.execute(
+                "ALTER TABLE incidents ADD COLUMN version INTEGER NOT NULL DEFAULT 1"
+            )
+            logger.info("incident store: added the version column for CAS writes")
 
     # -- ID allocation ----------------------------------------------------
 
@@ -195,7 +255,7 @@ class IncidentStore:
         with self._lock:
             if not incident.id:
                 incident.id = self.next_id()
-            self._write_incident(incident)
+            self._write_incident(incident, check_version=False)
             for evidence in incident.evidence:
                 self._write_evidence(incident.id, evidence)
             for attempt in incident.attempts:
@@ -385,7 +445,7 @@ class IncidentStore:
         incident.add_evidence(evidence)
         with self._lock:
             self._write_evidence(incident.id, evidence)
-            self._write_incident(incident)
+            self._write_incident_or_adopt(incident)
             self._conn.commit()
         return evidence
 
@@ -394,7 +454,7 @@ class IncidentStore:
         incident.add_attempt(attempt)
         with self._lock:
             self._write_attempt(incident.id, attempt)
-            self._write_incident(incident)
+            self._write_incident_or_adopt(incident)
             self._conn.commit()
         return attempt
 
@@ -404,7 +464,7 @@ class IncidentStore:
         """Persist changes to an already-recorded attempt (same ``number``)."""
         with self._lock:
             self._write_attempt(incident.id, attempt)
-            self._write_incident(incident)
+            self._write_incident_or_adopt(incident)
             self._conn.commit()
         return attempt
 
@@ -412,7 +472,7 @@ class IncidentStore:
         """Note a repeat observation of the same failure."""
         count = incident.record_occurrence(at)
         with self._lock:
-            self._write_incident(incident)
+            self._write_incident_or_adopt(incident)
             self._conn.commit()
         return count
 
@@ -503,29 +563,119 @@ class IncidentStore:
 
     # -- Internals --------------------------------------------------------
 
-    def _write_incident(self, incident: Incident) -> None:
-        self._conn.execute(
-            _INSERT_INCIDENT,
-            (
+    def _write_incident(
+        self, incident: Incident, *, check_version: bool = True
+    ) -> None:
+        """Persist an incident's scalar fields.
+
+        ``check_version=True`` (everything but :meth:`create`) writes only if
+        the row is still at the version this incident was loaded with, and
+        bumps it in the same statement so nothing can race between the check and
+        the write. The previous INSERT OR REPLACE was an unconditional clobber:
+        a second process holding a stale read overwrote whatever the first had
+        written, state included.
+        """
+        if not check_version:
+            self._conn.execute(_INSERT_INCIDENT, self._incident_row(incident))
+            incident.store_version = 1
+            return
+
+        expected = incident.store_version
+        cursor = self._conn.execute(
+            _UPDATE_INCIDENT, self._incident_row(incident)[1:] + (incident.id, expected)
+        )
+        if cursor.rowcount == 0:
+            current = self._conn.execute(
+                "SELECT version FROM incidents WHERE id = ?", (incident.id,)
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"no incident {incident.id!r} to write")
+            raise ConcurrentIncidentModification(
                 incident.id,
-                incident.fingerprint,
-                incident.severity.value,
-                incident.component,
-                incident.title,
-                incident.summary,
-                incident.environment,
-                incident.source,
-                incident.probe_id,
-                incident.state.value,
-                incident.created_at,
-                incident.updated_at,
-                incident.occurrences,
-                incident.last_seen_at,
-                json.dumps(incident.repro_steps),
-                json.dumps(incident.correlation.to_dict()),
-                json.dumps(incident.resolution.to_dict()),
-                json.dumps(incident.metadata),
-            ),
+                expected_version=expected,
+                actual_version=int(current["version"]),
+            )
+        incident.store_version = expected + 1
+
+    def _write_incident_or_adopt(self, incident: Incident) -> None:
+        """Write an incident's scalars, or adopt the newer row if one exists.
+
+        For the append-only operations -- attaching evidence, recording an
+        attempt, noting a repeat occurrence. The payload of those calls is a
+        row in a child table, and it has already been written by the time this
+        runs. Raising here would abort a repair *after* its evidence was made
+        durable, which is a worse outcome than the one being prevented; and
+        retrying the write would be the clobber itself.
+
+        So a conflict is resolved the other way: the other writer's scalars win,
+        this incident adopts them, and its child collections -- which are this
+        caller's own appends, already persisted -- are left alone. The caller
+        goes on holding a correct object instead of a stale one.
+
+        :meth:`save` and :meth:`transition` deliberately do not use this. A state
+        change built on a stale read is the thing that must not be resolved
+        quietly.
+        """
+        try:
+            self._write_incident(incident)
+        except ConcurrentIncidentModification as exc:
+            logger.info(
+                "incident %s changed under an append (version %d -> %d); "
+                "adopting the newer row rather than overwriting it",
+                incident.id,
+                exc.expected_version,
+                exc.actual_version,
+            )
+            self._adopt_scalars(incident)
+
+    def _adopt_scalars(self, incident: Incident) -> None:
+        """Refresh *incident*'s scalar fields from the durable row.
+
+        Scalars only: evidence, attempts and transitions are child tables whose
+        in-memory lists this caller has just appended to, and re-reading them
+        here would discard work that is already saved.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM incidents WHERE id = ?", (incident.id,)
+        ).fetchone()
+        if row is None:  # pragma: no cover - deleted under us
+            return
+        data = dict(row)
+        incident.state = IncidentState.parse(data["state"])
+        incident.severity = Severity.parse(data["severity"])
+        incident.updated_at = data["updated_at"]
+        incident.occurrences = int(data["occurrences"] or 1)
+        incident.last_seen_at = data["last_seen_at"]
+        incident.resolution = Resolution.from_dict(
+            _loads(data["resolution"], default={})
+        )
+        incident.correlation = Correlation.from_dict(
+            _loads(data["correlation"], default={})
+        )
+        incident.metadata = dict(_loads(data["metadata"], default={}))
+        incident.store_version = int(data.get("version") or 0)
+
+    @staticmethod
+    def _incident_row(incident: Incident) -> tuple:
+        return (
+            incident.id,
+            incident.fingerprint,
+            incident.severity.value,
+            incident.component,
+            incident.title,
+            incident.summary,
+            incident.environment,
+            incident.source,
+            incident.probe_id,
+            incident.state.value,
+            incident.created_at,
+            incident.updated_at,
+            incident.occurrences,
+            incident.last_seen_at,
+            json.dumps(incident.repro_steps),
+            json.dumps(incident.correlation.to_dict()),
+            json.dumps(incident.resolution.to_dict()),
+            json.dumps(incident.metadata),
         )
 
     def _write_evidence(self, incident_id: str, evidence: Evidence) -> None:
@@ -612,7 +762,11 @@ class IncidentStore:
         data["attempts"] = [_loads(ar["payload"], default={}) for ar in attempt_rows]
 
         data["transitions"] = [t.to_dict() for t in self.transitions_for(incident_id)]
-        return Incident.from_dict(data)
+        incident = Incident.from_dict(data)
+        # Storage bookkeeping, set after construction: from_dict deliberately
+        # does not carry it, so the version never travels in a payload.
+        incident.store_version = int(data.get("version") or 0)
+        return incident
 
     def _publish(self, event_name: str, incident: Incident, **extra: Any) -> None:
         if self._bus is None:

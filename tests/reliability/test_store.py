@@ -371,3 +371,251 @@ class TestPersistenceAcrossConnections:
             "incident_transitions",
             "incident_sequence",
         } <= names
+
+
+def _escalate_in_another_process(db_path: str, incident_id: str, ready, go) -> None:
+    """Escalate an incident from a genuinely separate process."""
+    from openjarvis.reliability.store import IncidentStore
+    from openjarvis.reliability.types import IncidentState
+
+    other = IncidentStore(db_path)
+    try:
+        incident = other.get(incident_id)
+        ready.set()
+        go.wait(timeout=30.0)
+        other.transition(
+            incident, IncidentState.INVESTIGATING, reason="the other watcher"
+        )
+    finally:
+        other.close()
+
+
+class TestStaleWritesAreRefused:
+    """A second writer must not overwrite a state it never saw.
+
+    Every scalar write went through `INSERT OR REPLACE`, which is an
+    unconditional clobber. Two watchers, a watcher and a CLI, a watcher and the
+    Control Center -- any second process holding a read from a moment ago wrote
+    its whole row back on top, state included. The expensive case is an
+    escalation: a HUMAN_REQUIRED incident silently un-escalated by a process
+    that still believed it was INVESTIGATING, and nobody told the person who was
+    supposed to be asked.
+    """
+
+    def test_a_stale_transition_is_refused(self, store):
+        from openjarvis.reliability.store import ConcurrentIncidentModification
+
+        created = store.create(_incident())
+        first = store.get(created.id)
+        stale = store.get(created.id)
+
+        store.transition(first, IncidentState.INVESTIGATING, reason="first")
+
+        with pytest.raises(ConcurrentIncidentModification):
+            store.transition(stale, IncidentState.INVESTIGATING, reason="stale")
+
+        assert store.get(created.id).state is IncidentState.INVESTIGATING
+
+    def test_a_stale_save_is_refused(self, store):
+        from openjarvis.reliability.store import ConcurrentIncidentModification
+
+        created = store.create(_incident())
+        first = store.get(created.id)
+        stale = store.get(created.id)
+
+        first.title = "written by the first"
+        store.save(first)
+
+        stale.title = "written by the stale one"
+        with pytest.raises(ConcurrentIncidentModification):
+            store.save(stale)
+
+        assert store.get(created.id).title == "written by the first"
+
+    def test_an_escalation_survives_a_stale_writer(self, store):
+        """The case this exists for, stated in its own terms."""
+        from openjarvis.reliability.store import ConcurrentIncidentModification
+
+        created = store.create(_incident())
+        escalating = store.get(created.id)
+        stale = store.get(created.id)
+
+        store.transition(escalating, IncidentState.INVESTIGATING, reason="looking")
+        store.transition(
+            escalating, IncidentState.HUMAN_REQUIRED, reason="I need a person"
+        )
+
+        with pytest.raises(ConcurrentIncidentModification):
+            store.transition(stale, IncidentState.INVESTIGATING, reason="stale view")
+
+        assert store.get(created.id).state is IncidentState.HUMAN_REQUIRED, (
+            "a stale writer un-escalated an incident a person was asked to look at"
+        )
+
+    def test_a_version_is_assigned_and_bumped(self, store):
+        created = store.create(_incident())
+        assert created.store_version == 1
+        loaded = store.get(created.id)
+        assert loaded.store_version == 1
+        store.transition(loaded, IncidentState.INVESTIGATING, reason="move")
+        assert loaded.store_version == 2
+        assert store.get(created.id).store_version == 2
+
+    def test_a_fresh_read_can_always_write(self, store):
+        """Refusing a stale write must not refuse a correct one."""
+        created = store.create(_incident())
+        for target in (IncidentState.INVESTIGATING, IncidentState.REPRODUCING):
+            current = store.get(created.id)
+            store.transition(current, target, reason="in order")
+        assert store.get(created.id).state is IncidentState.REPRODUCING
+
+    def test_two_real_processes_cannot_both_win(self, store, tmp_path):
+        """A threading lock proves nothing here; the writers are processes."""
+        import multiprocessing
+
+        from openjarvis.reliability.store import ConcurrentIncidentModification
+
+        created = store.create(_incident())
+        db_path = str(tmp_path / "reliability" / "incidents.db")
+        ready = multiprocessing.Event()
+        go = multiprocessing.Event()
+        other = multiprocessing.Process(
+            target=_escalate_in_another_process,
+            args=(db_path, created.id, ready, go),
+        )
+        other.start()
+        try:
+            assert ready.wait(timeout=20.0), "the other process never read"
+            mine = store.get(created.id)  # read at the same version it has
+            go.set()
+            other.join(timeout=20.0)
+            assert not other.is_alive()
+            assert other.exitcode == 0
+
+            with pytest.raises(ConcurrentIncidentModification):
+                store.transition(mine, IncidentState.INVESTIGATING, reason="mine")
+        finally:
+            if other.is_alive():  # pragma: no cover - defensive
+                other.terminate()
+                other.join(timeout=5.0)
+
+
+class TestAppendsAdoptRatherThanClobberOrCrash:
+    """Attaching evidence must neither overwrite a state nor break a repair.
+
+    The payload of these calls is a row in a child table, already written by the
+    time the scalars are touched. Raising would abort a repair *after* its
+    evidence was made durable -- worse than the problem. Retrying the write
+    would be the clobber itself. So the other writer's scalars win and this
+    caller adopts them, keeping the child rows it just appended.
+    """
+
+    def test_evidence_from_a_stale_caller_does_not_clobber_the_state(self, store):
+        created = store.create(_incident())
+        escalating = store.get(created.id)
+        stale = store.get(created.id)
+        store.transition(escalating, IncidentState.INVESTIGATING, reason="looking")
+
+        store.add_evidence(
+            stale,
+            Evidence(kind=EvidenceKind.NOTE, summary="a late note", content="body"),
+        )
+
+        reloaded = store.get(created.id)
+        assert reloaded.state is IncidentState.INVESTIGATING, (
+            "an evidence append overwrote a state change it never saw"
+        )
+        assert "a late note" in [e.summary for e in reloaded.evidence], (
+            "the evidence was lost while avoiding the clobber"
+        )
+
+    def test_the_stale_caller_stops_being_stale(self, store):
+        created = store.create(_incident())
+        escalating = store.get(created.id)
+        stale = store.get(created.id)
+        store.transition(escalating, IncidentState.INVESTIGATING, reason="looking")
+
+        store.add_evidence(
+            stale, Evidence(kind=EvidenceKind.NOTE, summary="note", content="b")
+        )
+
+        assert stale.state is IncidentState.INVESTIGATING, (
+            "the caller went on holding a state the database had already moved past"
+        )
+        assert stale.store_version == store.get(created.id).store_version
+
+    def test_an_attempt_from_a_stale_caller_is_kept(self, store):
+        created = store.create(_incident())
+        escalating = store.get(created.id)
+        stale = store.get(created.id)
+        store.transition(escalating, IncidentState.INVESTIGATING, reason="looking")
+
+        store.add_attempt(stale, RepairAttempt(number=1, claim="tried something"))
+
+        reloaded = store.get(created.id)
+        assert reloaded.state is IncidentState.INVESTIGATING
+        assert [a.claim for a in reloaded.attempts] == ["tried something"]
+
+    def test_recording_an_occurrence_does_not_undo_an_escalation(self, store):
+        created = store.create(_incident())
+        escalating = store.get(created.id)
+        stale = store.get(created.id)
+        store.transition(escalating, IncidentState.INVESTIGATING, reason="looking")
+        store.transition(escalating, IncidentState.HUMAN_REQUIRED, reason="help")
+
+        store.record_occurrence(stale)
+
+        assert store.get(created.id).state is IncidentState.HUMAN_REQUIRED
+
+
+class TestTheSchemaUpgradesInPlace:
+    """The operator's incident database predates the version column.
+
+    CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so
+    without an explicit migration every write against the live database would
+    fail on an unknown column.
+    """
+
+    def test_a_database_without_the_column_gains_it(self, tmp_path):
+        db = tmp_path / "old" / "incidents.db"
+        db.parent.mkdir(parents=True)
+        legacy = sqlite3.connect(str(db))
+        legacy.execute(
+            "CREATE TABLE incidents ("
+            " id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, severity TEXT NOT NULL,"
+            " component TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '',"
+            " summary TEXT NOT NULL DEFAULT '', environment TEXT NOT NULL DEFAULT"
+            " 'production', source TEXT NOT NULL DEFAULT 'probe', probe_id TEXT NOT"
+            " NULL DEFAULT '', state TEXT NOT NULL DEFAULT 'DETECTED', created_at TEXT"
+            " NOT NULL, updated_at TEXT NOT NULL, occurrences INTEGER NOT NULL DEFAULT"
+            " 1, last_seen_at TEXT NOT NULL, repro_steps TEXT NOT NULL DEFAULT '[]',"
+            " correlation TEXT NOT NULL DEFAULT '{}', resolution TEXT NOT NULL DEFAULT"
+            " '{}', metadata TEXT NOT NULL DEFAULT '{}')"
+        )
+        legacy.execute(
+            "INSERT INTO incidents (id, fingerprint, severity, created_at,"
+            " updated_at, last_seen_at)"
+            " VALUES ('INC-00001', 'fp', 'HIGH', 't', 't', 't')"
+        )
+        legacy.commit()
+        legacy.close()
+
+        upgraded = IncidentStore(db)
+        try:
+            columns = {
+                row["name"]
+                for row in upgraded._conn.execute(
+                    "PRAGMA table_info(incidents)"
+                ).fetchall()
+            }
+            assert "version" in columns
+
+            # And a pre-existing row is writable rather than stuck at version 0.
+            existing = upgraded.get("INC-00001")
+            assert existing is not None
+            assert existing.store_version >= 1
+            existing.title = "still writable after the upgrade"
+            upgraded.save(existing)
+            assert upgraded.get("INC-00001").title == "still writable after the upgrade"
+        finally:
+            upgraded.close()
