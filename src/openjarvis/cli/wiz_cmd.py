@@ -1094,6 +1094,102 @@ def authority(as_json: bool) -> None:
         )
 
 
+@wiz.command("check-env")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Raw report.")
+def check_env(as_json: bool) -> None:
+    """What the local gates would see, and what they would not.
+
+    Read-only, and it runs nothing: it resolves the configured target's check
+    suite and reports the environment each gate *would* be given. No check is
+    executed, no worktree is created, no network is touched.
+
+    Run this on a machine before restarting the watcher there. A check no
+    longer inherits this process's environment -- it would hand code the
+    coding agent just wrote the Supabase service_role key, a GitHub token that
+    can merge, and the Telegram bot token -- so a build that silently depended
+    on an inherited variable will start failing, and this is how to find out
+    before it does rather than from a red gate at 3am.
+
+    Names only, never values. A variable a build genuinely needs is added to
+    ``check_env_pass_through`` by hand; this command will not edit anything.
+    """
+    import json as _json
+    import os
+
+    console = _console()
+    from pathlib import Path
+
+    from openjarvis.reliability.checks import check_environment
+    from openjarvis.wiz.assemble import _check_suite_factory
+    from openjarvis.wiz.runtime import wiz_home
+    from openjarvis.wiz.settings import SETTINGS_FILENAME, load_settings
+
+    try:
+        settings = load_settings(Path(wiz_home()) / SETTINGS_FILENAME)
+        profile = settings.profile()
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]could not read the Wiz settings: {exc}[/red]")
+        raise SystemExit(1) from exc
+    if profile is None:
+        console.print(
+            "[yellow]No engineering target is configured here, so there are "
+            "no gates to report on.[/yellow]"
+        )
+        return
+    suite = _check_suite_factory(profile)
+
+    parent = set(os.environ)
+    gates = []
+    for check in suite.checks:
+        env = check_environment(check)
+        gates.append(
+            {
+                "name": check.name,
+                "configured": bool(check.command.strip()),
+                "inherited": sorted(set(env) & parent),
+                "set_by_configuration": sorted(set(env) - parent),
+                "withheld": sorted(parent - set(env)),
+                "named_pass_through": sorted(check.pass_through),
+            }
+        )
+
+    report = {"target": profile.name, "gates": gates}
+    if as_json:
+        click.echo(_json.dumps(report, indent=2, sort_keys=True))
+        return
+
+    console.print(f"[bold]Check environment for[/bold] {profile.name}")
+    console.print("[dim]Nothing is run. Names only — no values are printed.[/dim]")
+    console.print()
+    for gate in gates:
+        state = "" if gate["configured"] else " [dim](not configured)[/dim]"
+        console.print(f"[bold]{gate['name']}[/bold]{state}")
+        console.print(
+            f"  inherited from this process   {len(gate['inherited'])}: "
+            + (", ".join(gate["inherited"]) or "nothing")
+        )
+        if gate["set_by_configuration"]:
+            console.print(
+                "  set by configuration          "
+                + ", ".join(gate["set_by_configuration"])
+            )
+        if gate["named_pass_through"]:
+            console.print(
+                "  named in check_env_pass_through "
+                + ", ".join(gate["named_pass_through"])
+            )
+        console.print(
+            f"  [yellow]withheld[/yellow]                      "
+            f"{len(gate['withheld'])}: "
+            + (", ".join(gate["withheld"]) or "nothing")
+        )
+        console.print()
+    console.print(
+        "[dim]If a gate needs one of the withheld names, add it to "
+        "check_env_pass_through for this target and run this again.[/dim]"
+    )
+
+
 @wiz.command("approve-ship")
 @click.argument("feature_id")
 @click.option(

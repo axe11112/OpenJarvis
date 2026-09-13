@@ -1072,6 +1072,64 @@ def reliability_stop() -> None:
     )
 
 
+@reliability.command("resume")
+def reliability_resume() -> None:
+    """Lift the emergency stop, so JARVIS may monitor and repair again.
+
+    The other half of ``jarvis reliability stop``, which until now could only
+    be undone by deleting a file whose path the operator had to work out. A
+    panicking operator should not have to compose an ``rm`` against a guessed
+    path to get monitoring back, and an operator following a written procedure
+    should not have one step that is a raw filesystem command.
+
+    It changes nothing except the stop: no incident is reopened, no cooldown
+    is cleared, no repair is started, and the watcher is not launched. It only
+    removes the reason everything was refusing.
+
+    Deliberately interactive. Engaging a stop is something an operator does in
+    a hurry and should be easy; lifting one is something they should do on
+    purpose, having decided that whatever caused it is dealt with — so this
+    asks, every time, and there is no flag to skip the question. Nothing
+    automatic can call it, which is the property that matters.
+    """
+    console = Console()
+    config = _load_config()
+    path = _stop_flag_path(config)
+
+    if not path.exists():
+        console.print("No emergency stop is engaged; nothing to lift.")
+        console.print(f"[dim]Looked for {escape(str(path))}[/dim]")
+        return
+
+    try:
+        engaged = path.read_text().strip()
+    except OSError:
+        engaged = ""
+    console.print("[yellow]An emergency stop is engaged.[/yellow]")
+    console.print(f"  {escape(str(path))}")
+    if engaged:
+        console.print(f"  {escape(engaged)}")
+    console.print()
+    click.confirm(
+        "Lift it, allowing JARVIS to monitor and repair again?", abort=True
+    )
+
+    try:
+        path.unlink()
+    except OSError as exc:
+        console.print(f"[red]could not remove the stop flag: {exc}[/red]")
+        raise SystemExit(1) from exc
+
+    console.print(
+        "JARVIS RESUMED\n\n"
+        "Monitoring:   allowed again at the next cycle\n"
+        "New repairs:  allowed again\n"
+        "Production:   UNCHANGED\n\n"
+        "Nothing was started. A supervised watcher that is not running still "
+        "needs `jarvis reliability service start`."
+    )
+
+
 @reliability.command("report")
 @click.argument("incident_id")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output.")
