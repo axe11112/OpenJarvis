@@ -2250,31 +2250,37 @@ class TestShip:
 
         lease_path = tmp_path / "ship.lock"
 
-        def _hold_lease(path_str, ready_event):
+        def _hold_lease(path_str, ready_event, release_event):
             lease = ProcessLease(path_str, owner="other-wiz-process")
             with lease.acquire(timeout=5.0):
                 ready_event.set()
-                import time
+                # Held until this process is told to let go, not for a fixed
+                # interval. A fixed hold is a race against however long the
+                # rest of this test takes to reach ship(), which on a loaded
+                # machine is longer than any interval worth waiting for -- and
+                # losing that race makes the lease look like it did not work.
+                release_event.wait(timeout=60.0)
 
-                time.sleep(1.0)
+        # Everything expensive happens before the holder starts, so the only
+        # thing between "the lease is held" and "ship() asks for it" is ship().
+        github = self.FakeGitHub()
+        pipeline, feature = self._ready(
+            tmp_path,
+            clock,
+            shipper=self._shipper(github),
+            postship=self.FakePostShip(verified=True),
+        )
+        pipeline.ship_lease = ProcessLease(lease_path, owner="this-process")
+        pipeline.ship_lease_timeout = 0.3
 
         ready = multiprocessing.Event()
+        release = multiprocessing.Event()
         holder = multiprocessing.Process(
-            target=_hold_lease, args=(str(lease_path), ready)
+            target=_hold_lease, args=(str(lease_path), ready, release)
         )
         holder.start()
         try:
-            assert ready.wait(timeout=5.0), "other process never acquired the lease"
-
-            github = self.FakeGitHub()
-            pipeline, feature = self._ready(
-                tmp_path,
-                clock,
-                shipper=self._shipper(github),
-                postship=self.FakePostShip(verified=True),
-            )
-            pipeline.ship_lease = ProcessLease(lease_path, owner="this-process")
-            pipeline.ship_lease_timeout = 0.3
+            assert ready.wait(timeout=10.0), "other process never acquired the lease"
 
             shipped = pipeline.ship(feature.id)
 
@@ -2291,7 +2297,8 @@ class TestShip:
             assert refusals, "the lease timeout was not journalled as a refusal"
             assert "other-wiz-process" in refusals[-1].reason
         finally:
-            holder.join(timeout=5.0)
+            release.set()
+            holder.join(timeout=10.0)
             if holder.is_alive():  # pragma: no cover - safety net
                 holder.terminate()
                 holder.join(timeout=5.0)

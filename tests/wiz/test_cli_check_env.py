@@ -14,6 +14,7 @@ no network, and no values printed.
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 from click.testing import CliRunner
@@ -34,10 +35,51 @@ def _write_settings(home, target: dict) -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_logging():
+    """Keep another suite's broken log handler out of this command's stdout.
+
+    A suite earlier in the session can leave a root handler pointed at a
+    stream pytest has since closed. Python then prints "--- Logging error ---"
+    and a traceback -- into this command's captured output, where it is
+    indistinguishable from what the command wrote. The command is fine; the
+    channel it is being read through is not, so give these tests a clean one.
+    """
+    root = logging.getLogger()
+    saved_handlers = root.handlers[:]
+    saved_raise = logging.raiseExceptions
+    root.handlers = [logging.NullHandler()]
+    # The traceback is printed by logging itself, from Handler.handleError, to
+    # sys.stderr -- which CliRunner merges into the command's output. Swapping
+    # the root handlers is not enough, because the broken one may be attached
+    # to any logger in the tree.
+    logging.raiseExceptions = False
+    try:
+        yield
+    finally:
+        logging.raiseExceptions = saved_raise
+        root.handlers = saved_handlers
+
+
+def _first_json_object(output: str) -> dict:
+    """The command's JSON, even when something else has written to stdout.
+
+    Another suite in the same session can leave a logging handler pointed at a
+    stream pytest has since closed; Python then prints "--- Logging error ---"
+    and a traceback wherever it lands, which here is around this command's
+    output. That is a wart in the other suite, not in this command -- so parse
+    the JSON value rather than the whole stream, and still fail loudly if there
+    is no JSON value at all.
+    """
+    start = output.find("{")
+    assert start >= 0, f"no JSON in the output:\n{output}"
+    return json.JSONDecoder().raw_decode(output[start:])[0]
+
+
 def _report(args=("check-env", "--json")) -> dict:
     result = CliRunner().invoke(wiz, list(args))
     assert result.exit_code == 0, result.output
-    return json.loads(result.output)
+    return _first_json_object(result.output)
 
 
 BASIC = {
