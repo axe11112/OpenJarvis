@@ -267,6 +267,10 @@ def _check_suite_factory(profile: EngineeringProfile) -> Any:
         # per-feature retry feedback. Vercel's own build environment is
         # unaffected — this only reaches the local pre-push check.
         build_env={"NODE_OPTIONS": "--max-old-space-size=4096"},
+        # Named per repository, or not inherited at all. These gates run code
+        # Claude wrote minutes ago; they do not get this process's production
+        # keyring merely because this process has one.
+        pass_through=list(profile.check_env_pass_through),
     )
 
 

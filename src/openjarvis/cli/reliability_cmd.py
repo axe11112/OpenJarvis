@@ -491,6 +491,10 @@ def _build_repair_loop(config: Any, store: Any, sources: list) -> Any:
             typecheck_command=rc.repair.typecheck_command,
             build_command=rc.repair.build_command,
             timeout=rc.repair.test_timeout_seconds,
+            # Named in configuration, or not inherited at all. A check runs
+            # code the agent just wrote; it does not get this process's
+            # production keyring merely because this process has one.
+            pass_through=list(rc.repair.check_env_pass_through),
         ),
         scope_limits=ScopeLimits(
             max_files=rc.repair.max_changed_files,

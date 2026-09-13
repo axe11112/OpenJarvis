@@ -1540,6 +1540,17 @@ class ReliabilityRepairConfig:
     typecheck_command: str = ""
     build_command: str = ""
     test_timeout_seconds: int = 1800
+    #: Environment variables the local gates may inherit from the watcher, by
+    #: name, on top of the base set in
+    #: :data:`openjarvis.reliability.checks.BASE_ENV`.
+    #:
+    #: A check runs code the coding agent just wrote, so it is given a named
+    #: environment rather than the watcher's own — which holds the Supabase
+    #: service_role key, a GitHub token that can merge, and the Telegram bot
+    #: token. A build that genuinely needs a credential (a private package
+    #: registry, say) is given it here, deliberately and in writing. Being
+    #: present in the watcher's environment is not a reason on its own.
+    check_env_pass_through: List[str] = field(default_factory=list)
     #: A repair may not reach a pull request without a preview deployment to
     #: verify against. Turning this off means trusting local checks alone.
     require_preview_verification: bool = True

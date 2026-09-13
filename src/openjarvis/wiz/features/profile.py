@@ -122,6 +122,17 @@ class EngineeringProfile:
     #: Where a preview deployment can be found, when the project has one.
     preview_provider: str = ""
 
+    #: Environment variables the gates may inherit from this process, by name.
+    #:
+    #: A check runs code the coding agent just wrote, so it is given a named
+    #: environment rather than this process's own -- which holds the keys that
+    #: can write to production. A build that genuinely needs a credential (a
+    #: private package registry, say) is named here, per repository, because
+    #: what a build legitimately needs differs by repository the same way
+    #: protected paths do. Never discovered: a variable is inherited because
+    #: someone wrote it down, not because it happened to be set.
+    check_env_pass_through: List[str] = field(default_factory=list)
+
     def check_commands(self) -> Dict[str, str]:
         """The gate commands, in the shape ``CheckSuite.from_config`` wants."""
         return {
@@ -210,6 +221,7 @@ class EngineeringProfile:
             node_version=str(raw.get("node_version", "")),
             protected_paths=list(raw.get("protected_paths") or []),
             preview_provider=str(raw.get("preview_provider", "")),
+            check_env_pass_through=list(raw.get("check_env_pass_through") or []),
         )
 
     def merged_with_discovery(
@@ -234,6 +246,9 @@ class EngineeringProfile:
             node_version=self.node_version or discovered.node_version,
             protected_paths=list(self.protected_paths),
             preview_provider=self.preview_provider or discovered.preview_provider,
+            # Never taken from discovery: reading a repository tells you how it
+            # builds, never which of this machine's secrets it may see.
+            check_env_pass_through=list(self.check_env_pass_through),
         )
 
 
