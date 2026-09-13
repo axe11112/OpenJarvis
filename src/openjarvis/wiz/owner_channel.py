@@ -51,13 +51,39 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
+from openjarvis.core.proclock import LeaseTimeout, ProcessLease
+from openjarvis.reliability.statefile import write_json_atomic
+
 logger = logging.getLogger(__name__)
 
-__all__ = ["OwnerDoor", "OwnerReply", "SeenMessages", "TelegramOwnerDoor"]
+__all__ = [
+    "OwnerDoor",
+    "OwnerReply",
+    "SeenLedgerUnavailable",
+    "SeenMessages",
+    "TelegramOwnerDoor",
+]
+
+#: How many (chat, message) pairs to keep. Telegram stops redelivering an
+#: update after 24 hours, so a bounded window is enough, and an unbounded one
+#: is a file that grows for as long as the machine runs.
+MAX_SEEN = 2000
+
+
+class SeenLedgerUnavailable(RuntimeError):
+    """Raised when it cannot be established whether a message is new.
+
+    Deliberately not a boolean. Both answers are wrong when the ledger cannot
+    be read: "new" acts on the owner's instruction a second time — a second
+    feature request, a second branch, a second pull request — and "already
+    handled" drops what they said in silence, which looks to them exactly like
+    Wiz ignoring them. The caller is told it does not know, and says so.
+    """
 
 
 @dataclass
@@ -72,59 +98,200 @@ class SeenMessages:
     lands after a watcher restart is still recognised — in-memory-only
     otherwise, which still protects against redelivery within one process's
     lifetime.
+
+    **The operation that matters is :meth:`claim`, and it is one operation.**
+    Asking "have you seen this?" and then saying "you have now" is two, with a
+    gap between them, and everything this class is for lives in that gap. Two
+    pollers — a restarting watcher overlapping its replacement, a webhook
+    server beside a long-poller, the CLI beside either — both read "not seen",
+    both return ``False``, and the owner's one sentence becomes two feature
+    requests, two branches, two pull requests. A ``threading.Lock`` does not
+    close that: the two processes each have their own.
+
+    So the check and the record happen together, under a lease the whole
+    machine shares, against the file re-read at that moment rather than a copy
+    this process loaded at startup. Exactly one caller is told the message is
+    new.
     """
 
     path: Optional[Path] = None
+    #: How long to wait for the machine-wide lease. Every holder does a read,
+    #: a compare and one atomic write, so a wait beyond this means a stuck
+    #: process, not contention.
+    lease_timeout: float = 10.0
     _seen: Set[Tuple[str, str]] = field(default_factory=set, repr=False)
+    _order: List[Tuple[str, str]] = field(default_factory=list, repr=False)
     _loaded: bool = field(default=False, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    # -- the one operation --------------------------------------------------
+
+    def claim(self, chat_id: Any, message_id: Any) -> bool:
+        """Take responsibility for this message, or report it already taken.
+
+        ``True`` means this caller — this thread, in this process, on this
+        machine — is the one that should act on it, and it is recorded before
+        this returns. ``False`` means somebody already has it.
+
+        Raises :class:`SeenLedgerUnavailable` when it cannot tell, which is
+        neither of those and must not be flattened into either.
+
+        A message with no id cannot be judged a duplicate and is always
+        claimed: treating "unknown" as "already handled" would silently drop
+        real messages from any transport that does not number them.
+        """
+        mid = str(message_id or "")
+        if not mid:
+            return True
+        key = (str(chat_id), mid)
+        with self._lock:
+            if self.path is None:
+                # In-memory only. One process, one set, still atomic here
+                # because both halves happen under this lock.
+                self._ensure_loaded()
+                if key in self._seen:
+                    return False
+                self._remember(key)
+                return True
+            try:
+                with self._lease.acquire(
+                    timeout=self.lease_timeout, reason=f"claim {mid}"
+                ):
+                    # Re-read under the lease. A copy loaded at startup cannot
+                    # know what another process recorded since, and this
+                    # process may have been running for weeks.
+                    self._reload()
+                    if key in self._seen:
+                        return False
+                    self._remember(key)
+                    if not self._save():
+                        raise SeenLedgerUnavailable(
+                            f"could not persist the seen-messages ledger at {self.path}"
+                        )
+                    return True
+            except LeaseTimeout as exc:
+                raise SeenLedgerUnavailable(str(exc)) from exc
+            except OSError as exc:
+                raise SeenLedgerUnavailable(str(exc)) from exc
+
+    # -- the older two-call form, kept for callers that only ask ------------
 
     def already_handled(self, chat_id: Any, message_id: Any) -> bool:
         """Whether this exact message was already handled.
 
-        A missing message id (an older channel, a message the transport
-        does not give one to) can never be judged a duplicate — treating
-        "unknown" as "duplicate" would silently drop real messages.
+        A read, with no claim attached, so two callers can both get ``False``.
+        Use :meth:`claim` anywhere that acts on the answer; this is for
+        display and for tests.
         """
         mid = str(message_id or "")
         if not mid:
             return False
         with self._lock:
-            self._ensure_loaded()
+            if self.path is not None:
+                try:
+                    self._reload()
+                except OSError:
+                    logger.exception("could not read the seen-messages ledger")
+            else:
+                self._ensure_loaded()
             return (str(chat_id), mid) in self._seen
 
     def record(self, chat_id: Any, message_id: Any) -> None:
         mid = str(message_id or "")
         if not mid:
             return
+        key = (str(chat_id), mid)
         with self._lock:
-            self._ensure_loaded()
-            self._seen.add((str(chat_id), mid))
-            self._save()
+            if self.path is None:
+                self._ensure_loaded()
+                self._remember(key)
+                return
+            try:
+                with self._lease.acquire(
+                    timeout=self.lease_timeout, reason=f"record {mid}"
+                ):
+                    self._reload()
+                    self._remember(key)
+                    self._save()
+            except (LeaseTimeout, OSError):
+                logger.exception("could not record a handled message")
+
+    # -- internals ---------------------------------------------------------
+
+    @property
+    def _lease(self) -> ProcessLease:
+        return ProcessLease(Path(str(self.path) + ".lock"), owner="owner-door")
+
+    def _remember(self, key: Tuple[str, str]) -> None:
+        if key in self._seen:
+            return
+        self._seen.add(key)
+        self._order.append(key)
+        # Bounded, oldest first. Telegram stops redelivering after 24 hours,
+        # so forgetting the oldest entries costs nothing real, while keeping
+        # them forever is a file that grows for as long as the machine runs.
+        while len(self._order) > MAX_SEEN:
+            self._seen.discard(self._order.pop(0))
 
     def _ensure_loaded(self) -> None:
         if self._loaded:
             return
+        self._reload()
+
+    def _reload(self) -> None:
+        """Read the ledger from disk, replacing what is held in memory."""
         self._loaded = True
         if self.path is None:
             return
         try:
             data = json.loads(self.path.read_text())
         except FileNotFoundError:
+            self._seen, self._order = set(), []
             return
-        except (json.JSONDecodeError, OSError):
-            logger.exception("could not read the seen-messages ledger")
+        except json.JSONDecodeError:
+            # Not reachable through this class's own writes now that they are
+            # atomic. Keeping the file rather than overwriting it leaves the
+            # evidence; the cost is that redeliveries from before it broke are
+            # no longer recognised.
+            logger.error(
+                "the seen-messages ledger at %s is unreadable; redelivered "
+                "messages from before now may be handled again",
+                self.path,
+            )
+            self._seen, self._order = set(), []
             return
-        self._seen = {(str(pair[0]), str(pair[1])) for pair in data}
+        order: List[Tuple[str, str]] = []
+        seen: Set[Tuple[str, str]] = set()
+        if isinstance(data, list):
+            for entry in data:
+                # Every shape this file has ever had: a two-element pair, and
+                # a three-element pair carrying when it was recorded. A single
+                # malformed entry used to raise out of this method, through
+                # the door's blanket handler, and answer every message from
+                # then on with "something went wrong".
+                if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+                    continue
+                key = (str(entry[0]), str(entry[1]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                order.append(key)
+        self._seen, self._order = seen, order[-MAX_SEEN:]
+        self._seen = set(self._order)
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
+        """Atomically replace the ledger. ``False`` when it did not land.
+
+        Atomic because ``write_text`` truncates before it writes: interrupted
+        between the two — a sleeping laptop, a launchd reload — it leaves a
+        file that reads back as an empty ledger, and an empty ledger means
+        every redelivered message is acted on a second time.
+        """
         if self.path is None:
-            return
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(sorted(self._seen)))
-        except OSError:
-            logger.exception("could not persist the seen-messages ledger")
+            return True
+        now = time.time()
+        payload = [[chat, mid, now] for chat, mid in self._order]
+        return write_json_atomic(self.path, payload)
 
 
 @dataclass(frozen=True)
@@ -244,7 +411,30 @@ class OwnerDoor:
         if not message:
             return OwnerReply(route="", authorized=True)
 
-        if self.seen.already_handled(chat_id, message_id):
+        try:
+            mine = self.seen.claim(chat_id, message_id)
+        except SeenLedgerUnavailable:
+            # Neither "new" nor "already handled" is safe to assume. Acting
+            # would risk a second feature request, a second branch and a
+            # second pull request from one sentence; assuming it was handled
+            # would drop what the owner said in silence, which to them is
+            # indistinguishable from being ignored. So: say so, and let them
+            # send it again once the ledger is readable.
+            logger.exception(
+                "could not establish whether a message was already handled "
+                "(chat=%s, message_id=%s)",
+                (str(chat_id)[:8] + "…") if chat_id else "<empty>",
+                message_id,
+            )
+            return OwnerReply(
+                text=self._say(
+                    "I could not record that message, so I have not acted on it "
+                    "— send it again in a moment."
+                ),
+                route="refused",
+                authorized=True,
+            )
+        if not mine:
             # A redelivery of something already acted on. Silent — the owner
             # already got their answer the first time, and answering twice
             # is indistinguishable from Wiz not remembering what it did.
@@ -254,7 +444,6 @@ class OwnerDoor:
                 message_id,
             )
             return OwnerReply(route="duplicate", authorized=True)
-        self.seen.record(chat_id, message_id)
 
         if self._is_live_reliability_instruction(message):
             return self._reliability(chat_id=chat_id, text=message)

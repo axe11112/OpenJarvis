@@ -25,6 +25,13 @@ messages that happen to say the same words must not be collapsed into one.
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
+import textwrap
+import time
+from pathlib import Path
+
 import pytest
 
 from openjarvis.wiz.authority import (
@@ -39,7 +46,13 @@ from openjarvis.wiz.features.shipping import FeatureShippingPolicy
 from openjarvis.wiz.intake import TelegramIntake
 from openjarvis.wiz.journal import WizJournal
 from openjarvis.wiz.memory import ProductMemory
-from openjarvis.wiz.owner_channel import OwnerDoor, SeenMessages, TelegramOwnerDoor
+from openjarvis.wiz.owner_channel import (
+    MAX_SEEN,
+    OwnerDoor,
+    SeenLedgerUnavailable,
+    SeenMessages,
+    TelegramOwnerDoor,
+)
 from openjarvis.wiz.product import ProductVerbs, product_capabilities
 from openjarvis.wiz.runtime import build_wiz
 from tests.wiz.test_product import FakePipeline
@@ -526,3 +539,262 @@ class TestRiskTierGating:
             agent_opinion=Risk.LOW,
         )
         assert assessment.risk is Risk.HIGH
+
+
+class TestTheClaimIsAtomicAcrossProcesses:
+    """One sentence from the owner may become work exactly once.
+
+    Checking "have you seen this?" and then saying "you have now" is two
+    operations with a gap between them, and this is what lives in that gap: a
+    restarting watcher overlapping its replacement, or the CLI beside the
+    poller, both read "not seen" and the owner's one message becomes two
+    feature requests, two branches, two pull requests. The processes here are
+    real, because a ``threading.Lock`` is exactly what does not help.
+    """
+
+    def _child(self, ledger: Path, body: str):
+        script = textwrap.dedent(
+            f"""
+            from pathlib import Path
+            from openjarvis.wiz.owner_channel import SeenMessages
+
+            seen = SeenMessages(path=Path({str(ledger)!r}))
+            {body}
+            """
+        )
+        return subprocess.Popen(
+            [sys.executable, "-c", script], stdout=subprocess.PIPE, text=True
+        )
+
+    def test_only_one_process_is_told_the_message_is_new(self, tmp_path):
+        ledger = tmp_path / "telegram_seen.json"
+        # Every child fires at the same wall-clock instant, spinning rather
+        # than sleeping. Anything looser -- a marker file polled every few
+        # milliseconds, or no barrier at all -- staggers them by more than a
+        # claim takes, so they never overlap and the test passes against the
+        # very race it exists to catch.
+        at = time.time() + 3.0
+        body = f"""
+            import time
+            print("ready", flush=True)
+            while time.time() < {at!r}:
+                pass
+            print("yes" if seen.claim("12345", "upd-1") else "no", flush=True)
+            """
+        children = [self._child(ledger, body) for _ in range(6)]
+        try:
+            for child in children:
+                assert child.stdout.readline().strip() == "ready"
+            answers = [child.stdout.readline().strip() for child in children]
+            for child in children:
+                child.wait(timeout=20)
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+        assert answers.count("yes") == 1, (
+            f"the owner's one message was claimed {answers.count('yes')} times: "
+            f"{answers}"
+        )
+
+    def test_a_claim_in_another_process_is_visible_to_a_long_running_one(
+        self, tmp_path
+    ):
+        """A copy loaded at startup cannot know what happened since.
+
+        The watcher runs for weeks. Reading the ledger once and trusting that
+        copy means every message another process handled in the meantime looks
+        new.
+        """
+        ledger = tmp_path / "telegram_seen.json"
+        long_running = SeenMessages(path=ledger)
+        assert long_running.claim("12345", "upd-0") is True  # loads the file
+
+        child = self._child(
+            ledger,
+            """
+            print("yes" if seen.claim("12345", "upd-1") else "no", flush=True)
+            """,
+        )
+        try:
+            assert child.stdout.readline().strip() == "yes"
+            child.wait(timeout=20)
+        finally:
+            if child.poll() is None:
+                child.kill()
+
+        assert long_running.claim("12345", "upd-1") is False
+
+    def test_a_claim_that_cannot_be_recorded_is_neither_yes_nor_no(self, tmp_path):
+        """The third answer, which must not be flattened into the other two.
+
+        "New" acts on the owner's instruction a second time; "already handled"
+        drops it in silence. Saying "I don't know" is what lets the door
+        answer honestly.
+        """
+        ledger = tmp_path / "telegram_seen.json"
+        script = textwrap.dedent(
+            f"""
+            import time
+            from pathlib import Path
+            from openjarvis.core.proclock import ProcessLease
+
+            with ProcessLease(Path({str(ledger) + ".lock"!r})).acquire(timeout=5):
+                print("holding", flush=True)
+                time.sleep(120)
+            """
+        )
+        holder = subprocess.Popen(
+            [sys.executable, "-c", script], stdout=subprocess.PIPE, text=True
+        )
+        try:
+            assert holder.stdout.readline().strip() == "holding"
+            seen = SeenMessages(path=ledger, lease_timeout=0.3)
+            with pytest.raises(SeenLedgerUnavailable):
+                seen.claim("12345", "upd-1")
+        finally:
+            holder.kill()
+            holder.wait(timeout=10)
+
+    def test_the_door_says_so_rather_than_acting_or_going_silent(self, tmp_path):
+        intake, product = make_intake(tmp_path)
+
+        class Unavailable(SeenMessages):
+            def claim(self, chat_id, message_id):
+                raise SeenLedgerUnavailable("the disk is full")
+
+        door = OwnerDoor(intake=intake, allowed_chat_ids=OWNER, seen=Unavailable())
+        reply = door.receive(
+            chat_id=OWNER, text="Add export to reports", message_id="upd-1"
+        )
+
+        assert reply.route == "refused"
+        assert "send it again" in reply.text
+        assert product.pipeline.submitted == []
+
+    def test_a_write_that_does_not_land_is_not_reported_as_a_claim(self, tmp_path):
+        """Claiming is the record, not the intention to record it.
+
+        Returning True on an unpersisted claim means the next process to ask
+        also gets True.
+        """
+        import openjarvis.wiz.owner_channel as mod
+
+        seen = SeenMessages(path=tmp_path / "telegram_seen.json")
+        original = mod.write_json_atomic
+        mod.write_json_atomic = lambda *a, **kw: False
+        try:
+            with pytest.raises(SeenLedgerUnavailable):
+                seen.claim("12345", "upd-1")
+        finally:
+            mod.write_json_atomic = original
+
+
+class TestTheSeenLedgerSurvivesTheMachineStopping:
+    def test_the_ledger_is_written_atomically(self, tmp_path, monkeypatch):
+        import openjarvis.wiz.owner_channel as mod
+
+        calls = []
+        real = mod.write_json_atomic
+        monkeypatch.setattr(
+            mod,
+            "write_json_atomic",
+            lambda path, payload, **kw: (calls.append(path), real(path, payload, **kw))[
+                1
+            ],
+        )
+        ledger = tmp_path / "telegram_seen.json"
+        SeenMessages(path=ledger).claim("12345", "upd-1")
+        assert calls == [ledger]
+
+    def test_a_malformed_entry_does_not_break_every_later_message(self, tmp_path):
+        """A single bad entry used to raise out of the ledger.
+
+        It went through the door's blanket handler, so every message from then
+        on -- not just the redelivered one -- was answered with "something
+        went wrong handling that".
+        """
+        ledger = tmp_path / "telegram_seen.json"
+        ledger.write_text('[["12345", "upd-1"], "not-a-pair", ["12345"], null]')
+
+        intake, product = make_intake(tmp_path)
+        door = OwnerDoor(
+            intake=intake, allowed_chat_ids=OWNER, seen=SeenMessages(path=ledger)
+        )
+        reply = door.receive(
+            chat_id=OWNER, text="Add export to reports", message_id="upd-2"
+        )
+        assert reply.route == "wiz"
+        assert len(product.pipeline.submitted) == 1
+
+        replay = door.receive(
+            chat_id=OWNER, text="Add export to reports", message_id="upd-1"
+        )
+        assert replay.route == "duplicate", "the readable entries are still honoured"
+
+    def test_an_unreadable_ledger_does_not_break_the_door(self, tmp_path):
+        ledger = tmp_path / "telegram_seen.json"
+        ledger.write_text('[["12345", "upd')
+
+        intake, product = make_intake(tmp_path)
+        door = OwnerDoor(
+            intake=intake, allowed_chat_ids=OWNER, seen=SeenMessages(path=ledger)
+        )
+        reply = door.receive(
+            chat_id=OWNER, text="Add export to reports", message_id="upd-2"
+        )
+        assert reply.route == "wiz"
+
+    def test_the_ledger_does_not_grow_without_bound(self, tmp_path):
+        """Telegram stops redelivering after a day; this file does not stop.
+
+        Unbounded, it is read and rewritten in full on every message the owner
+        sends, for as long as the machine runs.
+        """
+        ledger = tmp_path / "telegram_seen.json"
+        seen = SeenMessages(path=ledger)
+        for index in range(MAX_SEEN + 25):
+            seen.claim("12345", f"upd-{index}")
+
+        entries = json.loads(ledger.read_text())
+        assert len(entries) == MAX_SEEN
+        # The oldest are the ones dropped, and the newest are all still there.
+        assert seen.claim("12345", f"upd-{MAX_SEEN + 24}") is False
+        assert seen.claim("12345", "upd-0") is True
+
+    def test_the_ledger_still_holds_no_message_text(self, tmp_path):
+        ledger = tmp_path / "telegram_seen.json"
+        seen = SeenMessages(path=ledger)
+        seen.claim(OWNER, "upd-1")
+        contents = ledger.read_text()
+        assert "upd-1" in contents
+        assert "export" not in contents.lower()
+
+    def test_the_real_door_gets_a_ledger_on_disk(self):
+        """An in-memory ledger protects nothing across the restart.
+
+        Checked against the parsed call rather than the source text: a string
+        search for "SeenMessages(path=" is satisfied by a comment, and one for
+        "path" is satisfied by ``path=None``.
+        """
+        import ast
+
+        import openjarvis.wiz.owner_channel as mod
+
+        tree = ast.parse(open(mod.__file__).read())
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", "") == "OwnerDoor"
+        ]
+        assert calls, "owner_channel no longer builds an OwnerDoor"
+        for call in calls:
+            given = {kw.arg: kw.value for kw in call.keywords}
+            assert "seen" in given
+            seen = given["seen"]
+            assert isinstance(seen, ast.Call)
+            path = {kw.arg: kw.value for kw in seen.keywords}.get("path")
+            assert path is not None and not (
+                isinstance(path, ast.Constant) and path.value is None
+            ), "the real owner door was given an in-memory-only seen ledger"
