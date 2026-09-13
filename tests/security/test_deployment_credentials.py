@@ -29,16 +29,12 @@ FAKE_SUPABASE_SERVICE_ROLE = (
 FAKE_TELEGRAM_BOT_TOKEN = "7123456789:AAFAKEfakeFAKEfakeFAKEfakeFAKEfakeFAK"
 FAKE_VERCEL_TOKEN = "vercel_FAKEfakeFAKEfakeFAKEfake1234"
 FAKE_BEARER_HEADER = "Authorization: Bearer FAKEfakeFAKEfakeFAKEfake1234"
-FAKE_UNQUOTED_ASSIGNMENT = "SUPABASE_SERVICE_ROLE_KEY=FAKEfakeFAKEfakeFAKEfake5678"
 
 DEPLOYMENT_CREDENTIALS = [
     pytest.param(FAKE_SUPABASE_SERVICE_ROLE, "FAKEsignature", id="supabase-jwt"),
     pytest.param(FAKE_TELEGRAM_BOT_TOKEN, "AAFAKEfake", id="telegram-bot-token"),
     pytest.param(FAKE_VERCEL_TOKEN, "FAKEfakeFAKEfake", id="vercel-token"),
     pytest.param(FAKE_BEARER_HEADER, "FAKEfakeFAKEfake", id="bare-bearer-header"),
-    pytest.param(
-        FAKE_UNQUOTED_ASSIGNMENT, "FAKEfakeFAKEfake", id="unquoted-assignment"
-    ),
 ]
 
 
@@ -57,6 +53,17 @@ class TestTheCredentialsThisSystemHolds:
         assert secret_part not in redacted, (
             f"the secret survived redaction: {redacted[:80]}"
         )
+
+    def test_a_credential_in_an_env_assignment_is_caught_by_its_shape(self):
+        """No pattern matches `NAME=<anything long>`, and none should.
+
+        One was tried and removed: an opaque credential and an ordinary
+        identifier are indistinguishable in that position. What catches this is
+        the JWT's own shape, which is what makes it safe.
+        """
+        line = f"SUPABASE_SERVICE_ROLE_KEY={FAKE_SUPABASE_SERVICE_ROLE}"
+        assert SecretScanner().scan(line).findings
+        assert "FAKEsignature" not in SecretScanner().redact(line)
 
     def test_a_credential_embedded_in_a_sentence_is_still_caught(self):
         """How it actually leaks: inside subprocess output or a traceback."""
@@ -89,6 +96,17 @@ class TestNoFalsePositivesOnOrdinaryOperationalText:
             "error: Bearer with me, this will take a moment",
             "vercel_project_id is not a secret",
             "Playwright timed out after 30000ms waiting for .download-btn",
+            # Source code, which is what a repair briefing is made of. A
+            # pattern matching `api_key = <anything long>` flagged all of
+            # these, and has_critical_secret() refuses a briefing outright --
+            # so it dead-ended every repair touching a file that assigns a
+            # credential from a variable. Removed; these keep it out.
+            "api_key = self._resolve_api_key_from_config()",
+            "const apiKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY",
+            "auth_token = build_auth_token(user_identifier)",
+            "ACCESS_TOKEN = resolve_access_token_for_session()",
+            "self.secret_key = configuration.secret_key_material",
+            'ACCESS_TOKEN_HEADER = "X-Access-Token-Value-Here"',
         ],
     )
     def test_it_is_not_flagged(self, text):

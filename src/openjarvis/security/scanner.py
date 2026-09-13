@@ -78,7 +78,18 @@ class SecretScanner(BaseScanner):
         # catches somebody else's provider; the three services JARVIS is wired
         # to -- Supabase, Telegram and Vercel -- matched no pattern here, so a
         # redaction layer ran over a leaked service-role key, reported clean,
-        # and passed it through. Kept identical to the Rust table in
+        # and passed it through.
+        #
+        # All shape-based. A sixth pattern matching `api_key = <anything long>`
+        # was tried and removed: an opaque credential and an ordinary identifier
+        # are indistinguishable in that position, so it flagged
+        # `api_key = self._resolve_api_key_from_config()` and
+        # `const apiKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY`. That is not
+        # a cosmetic false positive -- has_critical_secret() refuses a briefing
+        # outright, so it would have dead-ended every repair touching a file that
+        # assigns an api_key from a variable.
+        #
+        # Kept identical to the Rust table in
         # rust/crates/openjarvis-security/src/scanner.rs; a parity test asserts
         # that, because this table is the fallback used when the compiled
         # extension is missing and a fallback that protects less than the
@@ -102,12 +113,6 @@ class SecretScanner(BaseScanner):
             r"(?i)bearer\s+[A-Za-z0-9._~+/=-]{16,}",
             ThreatLevel.HIGH,
             "Bearer token in an Authorization header",
-        ),
-        "unquoted_api_key_assignment": (
-            r"(?i)(?:api[_-]?key|secret[_-]?key|auth[_-]?token|access[_-]?token"
-            r"|service[_-]?role[_-]?key)\s*[=:]\s*[A-Za-z0-9._~+/=-]{16,}",
-            ThreatLevel.HIGH,
-            "Credential assignment",
         ),
     }
 

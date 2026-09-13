@@ -116,15 +116,6 @@ static SECRET_PATTERNS: Lazy<Vec<PatternDef>> = Lazy::new(|| {
             ThreatLevel::High,
             "Bearer token in an Authorization header"
         ),
-        // Unquoted assignments, which is how a credential appears in an env
-        // file, a shell export, a CI log or a subprocess environment dump --
-        // every surface this scanner exists to guard.
-        pattern!(
-            "unquoted_api_key_assignment",
-            r"(?i)(?:api[_-]?key|secret[_-]?key|auth[_-]?token|access[_-]?token|service[_-]?role[_-]?key)\s*[=:]\s*[A-Za-z0-9._~+/=-]{16,}",
-            ThreatLevel::High,
-            "Credential assignment"
-        ),
     ]
 });
 
