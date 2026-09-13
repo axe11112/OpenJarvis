@@ -260,15 +260,52 @@ class FeaturePipeline:
     # -- driving -----------------------------------------------------------
 
     def run(self, feature_id: str, *, max_steps: int = 30) -> FeatureRequest:
-        """Advance *feature_id* until it stops making progress on its own."""
+        """Advance *feature_id* until it stops making progress on its own.
+
+        Claims the machine first. On a two-core laptop with 8 GB, one Claude
+        Code session with a Node build under it is roughly what fits, so
+        starting a second while the first is running does not make two
+        features arrive sooner -- it makes both slower and can make the
+        machine unusable for the thing that keeps the site up. The queue
+        refuses on exactly two grounds: a production change is in flight, or
+        the concurrency limit is reached.
+
+        A refusal is not a failure. The feature is left in the state it was
+        already in, the reason is journalled, and the call can simply be made
+        again -- the same shape ``auto_ship_if_eligible`` uses when it defers.
+        What a refusal never does is advance anything, because the whole point
+        is that the machine is busy.
+
+        The claim is what makes production pre-emption real: it is the only
+        thing that records a feature as *running*, and
+        ``yield_to_production()`` can only stop what it can see running.
+        """
         feature = self._load(feature_id)
-        for _ in range(max_steps):
-            if feature.terminal or feature.state is FeatureState.READY:
-                break
-            result = self.advance(feature)
-            feature = result.feature
-            if not result.progressed:
-                break
+        admitted = True
+        if self.queue is not None:
+            decision = self.queue.admit(
+                feature.id, title=feature.title, priority=feature.priority
+            )
+            admitted = bool(decision.admitted)
+            if not admitted:
+                logger.info("not starting %s: %s", feature.id, decision.reason)
+                self._record(feature, "feature.queue_deferred", decision.reason)
+                return feature
+        try:
+            for _ in range(max_steps):
+                if feature.terminal or feature.state is FeatureState.READY:
+                    break
+                result = self.advance(feature)
+                feature = result.feature
+                if not result.progressed:
+                    break
+        finally:
+            # Unconditionally: a run that stopped at READY, stopped making
+            # progress, or raised is a run that is no longer using the
+            # machine. Holding the one slot past that would refuse every
+            # later feature for the rest of the process's life.
+            if admitted:
+                self._release(feature)
         return feature
 
     def cancel(self, feature_id: str, *, reason: str = "") -> FeatureRequest:

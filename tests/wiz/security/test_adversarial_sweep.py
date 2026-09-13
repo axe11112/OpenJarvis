@@ -542,7 +542,7 @@ class TestIncidentPreemption:
         queue = DevelopmentQueue(max_concurrent=1)
         pipeline = build_pipeline(tmp_path, clock, queue=queue)
         feature = pipeline.submit(REQUEST, actor=operator_actor())
-        queue.admit_next()
+        queue.admit(feature.id)
         queue.yield_to_production("the site is down")
         result = pipeline.advance(feature)
         assert not result.progressed

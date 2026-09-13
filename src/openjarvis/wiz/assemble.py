@@ -96,7 +96,7 @@ def assemble(
 
     # The production-deferral gate, finally connected to something.
     #
-    # DevelopmentQueue.admit_next() refuses to start feature work while
+    # DevelopmentQueue.admit() refuses to start feature work while
     # production_busy() is true, and _reliability_busy() below answers the same
     # question for auto_ship_if_eligible by reading it back out of the queue's
     # snapshot. Both were a closed loop: the snapshot value came from this

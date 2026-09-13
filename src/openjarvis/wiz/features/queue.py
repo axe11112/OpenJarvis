@@ -5,6 +5,12 @@ build under it is roughly what fits. So the queue's real job is not scheduling;
 it is refusing. Exactly one code task runs at a time by default, and the answer
 to "can this start?" is usually no.
 
+Admission is by name — :meth:`DevelopmentQueue.admit` claims the machine for
+one feature — because something has always already decided which feature to
+work on by the time this is asked: an owner message, an operator command, the
+dashboard. Priorities order the waiting list, which is what a person reads to
+decide what to look at next; they do not start anything on their own.
+
 The part that matters for safety is :meth:`DevelopmentQueue.yield_to_production`.
 If the site breaks while a feature is building, the feature stops. Not "is
 deprioritised for the next admission" — stops, now, releasing the machine to the
@@ -122,9 +128,44 @@ class DevelopmentQueue:
 
     # -- admission ---------------------------------------------------------
 
-    def admit_next(self) -> QueueDecision:
-        """Start the highest-priority waiting task, if anything may start."""
+    def admit(
+        self,
+        feature_id: str,
+        *,
+        title: str = "",
+        priority: Priority = Priority.P2,
+    ) -> QueueDecision:
+        """Claim the machine for *feature_id*, or say why it may not have it.
+
+        Named rather than "whichever is next", because admission here is
+        caller-driven: something already decided which feature to work on --
+        an owner message, an operator command, the dashboard -- and calls
+        :meth:`~openjarvis.wiz.features.pipeline.FeaturePipeline.run` with
+        that id. An ``admit_next()`` that started the highest-priority waiting
+        task instead was the shape of a scheduler this system does not have,
+        and having no caller it enforced nothing: nothing was ever recorded as
+        running, so :meth:`yield_to_production` had nothing to yield and
+        :meth:`must_yield` was permanently false. The production pre-emption
+        this module's docstring describes did not happen.
+
+        A feature that already holds the slot is admitted again rather than
+        refused. Re-running one is ordinary -- an operator retry, a resumed
+        feature -- and refusing a caller the slot it already has would be a
+        deadlock against itself.
+
+        A feature that was never submitted is admitted on its own terms. The
+        waiting list is in memory, so after a restart it is empty while the
+        features themselves are still on disk; refusing those would mean a
+        restart silently stopped every feature the machine was working on.
+        """
         with self._lock:
+            existing = self._running.get(feature_id)
+            if existing is not None:
+                return QueueDecision(
+                    admitted=True,
+                    reason=f"{feature_id} already holds a slot",
+                    task=existing,
+                )
             if self._production_busy():
                 return QueueDecision(
                     admitted=False,
@@ -134,21 +175,44 @@ class DevelopmentQueue:
                     ),
                 )
             if len(self._running) >= self._max_concurrent:
+                running = ", ".join(sorted(self._running))
                 return QueueDecision(
                     admitted=False,
                     reason=(
                         f"{len(self._running)} of {self._max_concurrent} code "
-                        "task slots are in use"
+                        f"task slots are in use (running: {running})"
                     ),
                 )
-            if not self._waiting:
-                return QueueDecision(admitted=False, reason="nothing is waiting")
 
-            task = self._waiting.pop(0)
+            task = self._take_waiting_locked(feature_id)
+            if task is None:
+                self._sequence += 1
+                task = QueuedTask(
+                    feature_id=feature_id,
+                    priority=priority,
+                    sequence=self._sequence,
+                    title=title,
+                )
             self._running[task.feature_id] = task
             return QueueDecision(
                 admitted=True, reason=f"started {task.feature_id}", task=task
             )
+
+    def _take_waiting_locked(self, feature_id: str) -> Optional[QueuedTask]:
+        for index, task in enumerate(self._waiting):
+            if task.feature_id == feature_id:
+                return self._waiting.pop(index)
+        return None
+
+    def next_waiting(self) -> Optional[QueuedTask]:
+        """The highest-priority task nothing has started yet, for display.
+
+        Ordering is what the priorities are for now that admission is by name:
+        it says what a person should look at next, and it does not by itself
+        start anything.
+        """
+        with self._lock:
+            return self._waiting[0] if self._waiting else None
 
     def finish(self, feature_id: str) -> None:
         """Release the slot *feature_id* was holding."""

@@ -18,8 +18,8 @@ class TestConcurrency:
         queue.submit(_feature("FEAT-1"))
         queue.submit(_feature("FEAT-2"))
 
-        assert queue.admit_next().admitted
-        second = queue.admit_next()
+        assert queue.admit("FEAT-1").admitted
+        second = queue.admit("FEAT-2")
         assert not second.admitted
         assert "slot" in second.reason
 
@@ -28,12 +28,30 @@ class TestConcurrency:
         queue.submit(_feature("FEAT-1"))
         queue.submit(_feature("FEAT-2"))
 
-        first = queue.admit_next()
+        first = queue.admit("FEAT-1")
         queue.finish(first.task.feature_id)
-        assert queue.admit_next().admitted
+        assert queue.admit("FEAT-2").admitted
 
-    def test_an_empty_queue_admits_nothing(self):
-        assert not DevelopmentQueue().admit_next().admitted
+    def test_a_feature_that_was_never_submitted_is_still_admitted(self):
+        """The waiting list is in memory; the features are on disk.
+
+        After a restart nothing is waiting, so refusing what was never
+        submitted would mean a restart silently stopped every feature the
+        machine was working on.
+        """
+        decision = DevelopmentQueue().admit("FEAT-restored")
+        assert decision.admitted
+        assert decision.task.feature_id == "FEAT-restored"
+
+    def test_a_feature_that_already_holds_the_slot_is_admitted_again(self):
+        """Re-running one is ordinary. Refusing the caller the slot it already
+        holds would be a deadlock against itself."""
+        queue = DevelopmentQueue()
+        queue.submit(_feature("FEAT-1"))
+        assert queue.admit("FEAT-1").admitted
+        again = queue.admit("FEAT-1")
+        assert again.admitted
+        assert "already holds" in again.reason
 
     def test_zero_concurrency_is_refused_at_construction(self):
         with pytest.raises(ValueError):
@@ -41,31 +59,50 @@ class TestConcurrency:
 
 
 class TestOrdering:
-    def test_higher_priority_runs_first(self):
+    """Priorities order what a person should look at next.
+
+    They do not start anything: admission is by name, because something has
+    always already decided which feature to work on by the time the queue is
+    asked.
+    """
+
+    def test_higher_priority_is_next(self):
         queue = DevelopmentQueue()
         queue.submit(_feature("FEAT-normal", Priority.P3))
         queue.submit(_feature("FEAT-urgent", Priority.P2))
-        assert queue.admit_next().task.feature_id == "FEAT-urgent"
+        assert queue.next_waiting().feature_id == "FEAT-urgent"
 
-    def test_equal_priority_runs_in_arrival_order(self):
+    def test_equal_priority_keeps_arrival_order(self):
         queue = DevelopmentQueue(max_concurrent=3)
         for n in range(3):
             queue.submit(_feature(f"FEAT-{n}", Priority.P3))
-        admitted = [queue.admit_next().task.feature_id for _ in range(3)]
-        assert admitted == ["FEAT-0", "FEAT-1", "FEAT-2"]
+        assert [t.feature_id for t in queue.waiting()] == [
+            "FEAT-0",
+            "FEAT-1",
+            "FEAT-2",
+        ]
 
-    def test_maintenance_runs_last(self):
+    def test_maintenance_is_last(self):
         queue = DevelopmentQueue()
         queue.submit(_feature("FEAT-maint", Priority.P4))
         queue.submit(_feature("FEAT-normal", Priority.P3))
-        assert queue.admit_next().task.feature_id == "FEAT-normal"
+        assert queue.next_waiting().feature_id == "FEAT-normal"
+
+    def test_nothing_waiting_has_no_next(self):
+        assert DevelopmentQueue().next_waiting() is None
+
+    def test_admitting_takes_the_task_off_the_waiting_list(self):
+        queue = DevelopmentQueue()
+        queue.submit(_feature("FEAT-1"))
+        queue.admit("FEAT-1")
+        assert queue.waiting() == []
 
 
 class TestProductionWins:
     def test_nothing_is_admitted_while_reliability_is_working(self):
         queue = DevelopmentQueue(production_busy=lambda: True)
         queue.submit(_feature("FEAT-1"))
-        decision = queue.admit_next()
+        decision = queue.admit("FEAT-1")
         assert not decision.admitted
         assert "reliability" in decision.reason
 
@@ -73,14 +110,14 @@ class TestProductionWins:
         busy = {"value": True}
         queue = DevelopmentQueue(production_busy=lambda: busy["value"])
         queue.submit(_feature("FEAT-1"))
-        assert not queue.admit_next().admitted
+        assert not queue.admit("FEAT-1").admitted
         busy["value"] = False
-        assert queue.admit_next().admitted
+        assert queue.admit("FEAT-1").admitted
 
     def test_a_running_feature_is_told_to_yield(self):
         queue = DevelopmentQueue()
         queue.submit(_feature("FEAT-1"))
-        queue.admit_next()
+        queue.admit("FEAT-1")
 
         yielding = queue.yield_to_production("the site is down")
         assert [t.feature_id for t in yielding] == ["FEAT-1"]
@@ -104,7 +141,7 @@ class TestReliabilityPrioritiesAreReserved:
     def test_a_demoted_feature_still_loses_to_reliability(self):
         queue = DevelopmentQueue(production_busy=lambda: True)
         queue.submit(_feature("FEAT-pushy", Priority.P0))
-        assert not queue.admit_next().admitted
+        assert not queue.admit("FEAT-pushy").admitted
 
 
 class TestInspection:
@@ -112,7 +149,7 @@ class TestInspection:
         queue = DevelopmentQueue()
         queue.submit(_feature("FEAT-1"))
         queue.submit(_feature("FEAT-2"))
-        queue.admit_next()
+        queue.admit("FEAT-1")
 
         snapshot = queue.snapshot()
         assert [r["feature_id"] for r in snapshot["running"]] == ["FEAT-1"]
@@ -131,7 +168,7 @@ class TestInspection:
 class TestProductionBusyIsConnectedToSomething:
     """The deferral was a closed loop answering "not busy" forever.
 
-    DevelopmentQueue.admit_next() refuses to start feature work while
+    DevelopmentQueue.admit() refuses to start feature work while
     production_busy() is true, and assemble._reliability_busy() answers the
     same question for auto_ship_if_eligible by reading it back out of the
     queue's snapshot -- where it had come from this same callback. No caller of
@@ -153,13 +190,13 @@ class TestProductionBusyIsConnectedToSomething:
         queue.submit(_feature("FEAT-1"))
 
         with lease.acquire(timeout=2.0):
-            decision = queue.admit_next()
+            decision = queue.admit("FEAT-1")
             assert not decision.admitted, (
                 "feature work started while a production change was in flight"
             )
             assert "reliability" in decision.reason
 
-        assert queue.admit_next().admitted, (
+        assert queue.admit("FEAT-1").admitted, (
             "feature work did not resume once production was free again"
         )
 
@@ -190,13 +227,13 @@ class TestProductionBusyIsConnectedToSomething:
             probe = production_change_lease(owner="wiz-queue-probe", root=tmp_path)
             queue = DevelopmentQueue(production_busy=probe.is_held)
             queue.submit(_feature("FEAT-1"))
-            assert not queue.admit_next().admitted
+            assert not queue.admit("FEAT-1").admitted
 
             os.kill(holder.pid, signal.SIGKILL)
             holder.join(timeout=10.0)
             time.sleep(0.2)
 
-            assert queue.admit_next().admitted, (
+            assert queue.admit("FEAT-1").admitted, (
                 "a crashed production change stalled every feature permanently"
             )
         finally:

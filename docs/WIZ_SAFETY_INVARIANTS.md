@@ -312,18 +312,29 @@ indicator reporting a guarantee nothing enforces is worse than no indicator.
 
 ## 17. Feature work defers to a production change in flight
 
-**enforced for automatic shipping.** The reachable gate is
-`auto_ship_if_eligible()`, which asks `_reliability_busy()` — the queue's
-snapshot — and declines with a journalled `feature.auto_ship_skipped`, leaving
-the feature safely at `READY`. It is asked through `ProcessLease.is_held()` —
-which asks the kernel.
+**enforced, on both paths.** `FeaturePipeline.run()` claims the machine through
+`DevelopmentQueue.admit()` before advancing anything, and the queue refuses on
+exactly two grounds: a production change is in flight, or the concurrency limit
+is reached. A refusal advances nothing, journals `feature.queue_deferred`, and
+leaves the feature in the state it was already in, so the call can simply be
+made again. `auto_ship_if_eligible()` carries the same refusal for the shipping
+half, declining with a journalled `feature.auto_ship_skipped` and leaving the
+feature at `READY`. Both ask through `ProcessLease.is_held()` — which asks the
+kernel.
 
-`DevelopmentQueue.admit_next()` carries the same refusal and is the more
-complete one, but it has **no caller in `src/`**, so it enforces nothing today;
-see §19. Nothing automatically retries a deferred auto-ship either: the feature
-waits at `READY` for the dashboard's Ship button or the next call. That is the
-safe direction — `READY` is a resting state and the lease is bounded — but it is
-a reduction in autonomy, not a no-op. Never through `current_holder()`, which reads a record a
+The claim is also what makes production pre-emption real: it is the only thing
+that records a feature as *running*, and `yield_to_production()` can only stop
+what it can see running. Before it, nothing was ever admitted, so `must_yield()`
+was permanently false and a mid-build incident could not stop the build.
+
+Nothing automatically retries a deferred run or a deferred auto-ship: the
+feature waits for the next call, the dashboard's Ship button, or the operator.
+That is the safe direction — both resting states are stable and the lease is
+bounded — but it is a reduction in autonomy, not a no-op.
+
+- `wiz/features/queue.py::DevelopmentQueue.admit`
+- `wiz/features/pipeline.py::FeaturePipeline.run`
+- `tests/wiz/test_pipeline.py::TestRunClaimsTheMachineBeforeUsingIt` Never through `current_holder()`, which reads a record a
 SIGKILLed holder leaves behind and would stall every feature for the rest of the
 machine's uptime after one crash.
 
@@ -367,14 +378,18 @@ Stated because a document that lists only what holds is a marketing document.
    dict. Two processes can each admit a repair for the same incident; §12 now
    stops them destroying each other's worktree, and §1 stops them merging at
    once, but the duplicate work itself is not prevented.
-3. **HIGH-risk approval is an unbound boolean** — see §4.
+3. ~~**HIGH-risk approval is an unbound boolean**~~ — fixed. HIGH now redeems a
+   single-use approval bound to the capability, the feature, the exact head SHA,
+   the risk and the production action, and the bare boolean no longer merges
+   anything; see §4.
 4. **`ProcessLease` is not reentrant.** A second `acquire()` of the same lease in
    one process blocks against itself until the timeout. No current path nests,
    and nothing should be written that does.
-5. **`DevelopmentQueue.admit_next()` has no caller.** The queue's own
-   production-deferral and concurrency refusal are therefore unreachable; only
-   the `auto_ship_if_eligible` path in §17 actually defers. Features are
-   submitted to the queue and finished on it, but nothing admits from it.
+5. **Priorities order the waiting list and nothing else.** Admission is by name
+   (`admit(feature_id)`), because something has always already decided which
+   feature to work on by the time the queue is asked. A higher-priority feature
+   waiting does not pre-empt or delay a lower-priority one that a caller
+   started; it is simply what `next_waiting()` reports a person should look at.
 6. **`reverify_production()` runs outside the production-change lease** — see
    §1. It performs no merge, but its production observation can interleave with
    another subsystem's deploy.

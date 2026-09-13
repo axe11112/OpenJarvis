@@ -1279,12 +1279,146 @@ class TestVerificationDecides:
         assert "no way to see a preview" in result.history[-1]["reason"]
 
 
+class TestRunClaimsTheMachineBeforeUsingIt:
+    """The queue was submitted to, finished on, and never admitted from.
+
+    Nothing was ever recorded as *running*, so ``yield_to_production()`` had
+    nothing to yield, ``must_yield()`` was permanently false, and the
+    production pre-emption the queue's own docstring describes did not
+    happen -- while the waiting list grew for every feature ever requested and
+    was never emptied. ``admit_next()`` was the shape of a scheduler this
+    system does not have; ``run()`` is the caller that actually exists.
+    """
+
+    def test_a_run_refuses_to_start_while_production_is_being_changed(
+        self, tmp_path, clock
+    ):
+        queue = DevelopmentQueue(max_concurrent=1, production_busy=lambda: True)
+        pipeline = build_pipeline(tmp_path, clock, queue=queue)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+
+        result = pipeline.run(feature.id)
+
+        assert result.state is FeatureState.RECEIVED, (
+            "feature work started while a production change was in flight"
+        )
+        assert pipeline.store.get(feature.id).state is FeatureState.RECEIVED
+
+    def test_a_deferred_run_says_why_in_the_journal(self, tmp_path, clock):
+        queue = DevelopmentQueue(max_concurrent=1, production_busy=lambda: True)
+        pipeline = build_pipeline(tmp_path, clock, queue=queue)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+
+        pipeline.run(feature.id)
+
+        entries = [
+            e for e in pipeline.journal.tail(50) if e.kind == "feature.queue_deferred"
+        ]
+        assert entries, "a deferral nothing records is indistinguishable from a hang"
+        assert "reliability" in entries[-1].reason
+
+    def test_a_deferred_run_can_simply_be_made_again(self, tmp_path, clock):
+        busy = {"value": True}
+        queue = DevelopmentQueue(
+            max_concurrent=1, production_busy=lambda: busy["value"]
+        )
+        pipeline = build_pipeline(tmp_path, clock, queue=queue)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+
+        assert pipeline.run(feature.id).state is FeatureState.RECEIVED
+        busy["value"] = False
+        assert pipeline.run(feature.id).state is not FeatureState.RECEIVED
+
+    def test_a_second_feature_does_not_start_while_the_first_is_running(
+        self, tmp_path, clock
+    ):
+        """One Claude session with a Node build under it is what this machine
+        fits. Two do not arrive sooner; they arrive slower, together."""
+        queue = DevelopmentQueue(max_concurrent=1)
+        pipeline = build_pipeline(tmp_path, clock, queue=queue)
+        first = pipeline.submit(REQUEST, actor=operator_actor())
+        second = pipeline.submit(REQUEST, actor=operator_actor())
+
+        queue.admit(first.id)  # stands in for the first run, still in flight
+        result = pipeline.run(second.id)
+
+        assert result.state is FeatureState.RECEIVED
+
+    def test_a_finished_run_gives_the_machine_back(self, tmp_path, clock):
+        """A run that stops at READY, or stops making progress, or raises, is
+        no longer using the machine. Holding the slot past that would refuse
+        every later feature for the rest of the process's life."""
+        queue = DevelopmentQueue(max_concurrent=1)
+        pipeline = build_pipeline(tmp_path, clock, queue=queue)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+
+        pipeline.run(feature.id)
+
+        assert queue.snapshot()["running"] == []
+        assert pipeline.run(pipeline.submit(REQUEST, actor=operator_actor()).id)
+
+    def test_a_run_that_raises_still_gives_the_machine_back(self, tmp_path, clock):
+        queue = DevelopmentQueue(max_concurrent=1)
+        pipeline = build_pipeline(tmp_path, clock, queue=queue)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+
+        def explode(_feature):
+            raise RuntimeError("the engineer fell over")
+
+        pipeline.advance = explode
+        with pytest.raises(RuntimeError):
+            pipeline.run(feature.id)
+
+        assert queue.snapshot()["running"] == []
+
+    def test_running_a_feature_takes_it_off_the_waiting_list(self, tmp_path, clock):
+        """The list was never emptied, so the dashboard's queue grew for every
+        feature ever requested and never shrank."""
+        queue = DevelopmentQueue(max_concurrent=1)
+        pipeline = build_pipeline(tmp_path, clock, queue=queue)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+        assert queue.waiting()
+
+        pipeline.run(feature.id)
+
+        assert queue.waiting() == []
+
+    def test_production_preemption_is_reachable_through_run(self, tmp_path, clock):
+        """End to end, with nothing hand-admitted.
+
+        This is the property that was inert: an incident opening mid-build had
+        to be able to stop the build, and could not, because the build was
+        never recorded as running.
+        """
+        queue = DevelopmentQueue(max_concurrent=1)
+        pipeline = build_pipeline(tmp_path, clock, queue=queue)
+        feature = pipeline.submit(REQUEST, actor=operator_actor())
+
+        seen = {}
+
+        real_advance = pipeline.advance
+
+        def advance_then_break_production(f):
+            if not seen:
+                seen["yielded"] = queue.yield_to_production("the site is down")
+            return real_advance(f)
+
+        pipeline.advance = advance_then_break_production
+        result = pipeline.run(feature.id)
+
+        assert seen["yielded"], "run() never recorded the feature as running"
+        assert [t.feature_id for t in seen["yielded"]] == [feature.id]
+        assert result.state is FeatureState.RECEIVED, (
+            "the feature kept building while production needed the machine"
+        )
+
+
 class TestProductionAlwaysWins:
     def test_a_feature_stops_when_reliability_needs_the_machine(self, tmp_path, clock):
         queue = DevelopmentQueue(max_concurrent=1)
         pipeline = build_pipeline(tmp_path, clock, queue=queue)
         feature = pipeline.submit(REQUEST, actor=operator_actor())
-        queue.admit_next()
+        queue.admit(feature.id)
         queue.yield_to_production("the site is down")
 
         result = pipeline.advance(feature)
@@ -1297,7 +1431,7 @@ class TestProductionAlwaysWins:
         pipeline = build_pipeline(tmp_path, clock, queue=queue)
         feature = pipeline.submit(REQUEST, actor=operator_actor())
         pipeline.advance(feature)  # UNDERSTANDING
-        queue.admit_next()
+        queue.admit(feature.id)
         queue.yield_to_production("incident")
         pipeline.advance(feature)
 
@@ -4182,7 +4316,7 @@ class TestTheSafeStopIsActuallySafe:
         pipeline, submitted = self._pipeline_mid_build(tmp_path, clock)
         feature = pipeline.store.get(submitted.id)
         pipeline.queue.submit(feature)
-        pipeline.queue.admit_next()
+        pipeline.queue.admit(feature.id)
         assert pipeline.queue.snapshot()["running"], "nothing was running to leak"
 
         pipeline.store = self._ConflictingStore(pipeline.store)
@@ -4223,7 +4357,7 @@ class TestTheSafeStopIsActuallySafe:
         pipeline, submitted = self._pipeline_mid_build(tmp_path, clock)
         feature = pipeline.store.get(submitted.id)
         pipeline.queue.submit(feature)
-        pipeline.queue.admit_next()
+        pipeline.queue.admit(feature.id)
 
         pipeline.store = self._ConflictingStore(pipeline.store, fail_times=99)
         pipeline._stop(feature, "stopped", kind="feature.failed")
