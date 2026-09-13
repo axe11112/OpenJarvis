@@ -58,6 +58,14 @@ def assemble(
     from openjarvis.wiz.runtime import wiz_home
 
     root = Path(home) if home is not None else wiz_home()
+    # Where the production-change lease lives. None means "the config root",
+    # which the reliability repair loop resolves too, so both subsystems open
+    # the same file. A caller that passed an explicit home= is sandboxing and
+    # gets a lease inside that sandbox: the ProcessLease(root / "ship.lock")
+    # this replaced honoured home=, and resolving the global config dir
+    # regardless would have a test or a scratch instance contend on the
+    # operator's real lock.
+    lease_root = Path(home) if home is not None else None
     resolved = (
         settings if settings is not None else load_settings(root / SETTINGS_FILENAME)
     )
@@ -115,7 +123,9 @@ def assemble(
     # as one -- serialisation is the lease being *held* across the merge, which
     # ship() and the repair loop do.
     if production_busy is None:
-        _production_lease = production_change_lease(owner="wiz-queue-probe")
+        _production_lease = production_change_lease(
+            owner="wiz-queue-probe", root=lease_root
+        )
         production_busy = _production_lease.is_held
     queue = DevelopmentQueue(max_concurrent=1, production_busy=production_busy)
 
@@ -155,7 +165,9 @@ def assemble(
         # feature ship and a repair merge, each then reading one shared
         # production to judge its own change — completely unguarded. Same file,
         # both callers. See openjarvis.core.proclock.production_change_lease.
-        ship_lease=production_change_lease(owner=f"wiz@{profile.name}"),
+        ship_lease=production_change_lease(
+            owner=f"wiz@{profile.name}", root=lease_root
+        ),
     )
 
     return ProductVerbs(

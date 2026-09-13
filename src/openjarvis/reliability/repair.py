@@ -25,7 +25,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
 
-from openjarvis.core.proclock import LeaseTimeout
 from openjarvis.reliability.briefing import (
     BriefingRefusedError,
     build_briefing,
@@ -847,6 +846,12 @@ class RepairLoop:
             return self._merge_and_verify_locked(
                 incident, attempt, verification, pull_request_url, spec
             )
+        # Imported here, not at module scope: core.proclock needs POSIX fcntl,
+        # and importing openjarvis.reliability.repair on a non-POSIX host used
+        # to work. Nothing in this module needs the lease until a repair is
+        # actually merging, by which point the platform question is settled.
+        from openjarvis.core.proclock import LeaseTimeout
+
         try:
             with self.production_lease.acquire(
                 timeout=self.production_lease_timeout,

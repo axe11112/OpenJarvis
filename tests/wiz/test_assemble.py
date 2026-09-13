@@ -166,3 +166,60 @@ class TestReliabilityBusy:
 
         pipeline = type("P", (), {"queue": _Queue()})()
         assert _reliability_busy(pipeline) is True
+
+
+class TestAssembleHonoursItsSandbox:
+    """`assemble(home=...)` must not reach for the operator's real state.
+
+    The Wiz-private lease it replaced was `ProcessLease(root / "ship.lock")`,
+    where root honours home=. production_change_lease() defaults to the config
+    root instead -- correctly, since the reliability repair loop resolves the
+    same place -- so a caller that passed a scratch home= would have contended
+    on the real /~.openjarvis/production-change.lock: a test, or a second
+    instance pointed at a sandbox, blocking or being blocked by a real ship.
+    """
+
+    def _lease_call_roots(self):
+        import ast
+        import inspect
+        import textwrap
+
+        from openjarvis.wiz import assemble as assemble_mod
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(assemble_mod.assemble)))
+        roots = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if name != "production_change_lease":
+                continue
+            roots.append({kw.arg for kw in node.keywords})
+        return roots
+
+    def test_every_lease_in_assemble_is_sandbox_aware(self):
+        roots = self._lease_call_roots()
+        assert roots, "assemble() no longer builds a production-change lease"
+        for keywords in roots:
+            assert "root" in keywords, (
+                "a production_change_lease call in assemble() ignores home=, so "
+                "a sandboxed instance would contend on the operator's real lock"
+            )
+
+    def test_a_sandboxed_home_keeps_the_lease_inside_it(self, tmp_path):
+        """Behaviour, not just the call shape."""
+        from openjarvis.core.proclock import production_change_lease
+
+        sandboxed = production_change_lease(owner="wiz@test", root=tmp_path)
+        real = production_change_lease(owner="wiz@test")
+        assert sandboxed.path != real.path
+        assert tmp_path in sandboxed.path.parents
+
+    def test_the_default_still_matches_what_the_repair_loop_resolves(self):
+        """Sandboxing must not split the two subsystems' default lock apart."""
+        from openjarvis.core.proclock import production_change_lease
+
+        assert (
+            production_change_lease(owner="wiz@target").path
+            == production_change_lease(owner="reliability-repair").path
+        )
