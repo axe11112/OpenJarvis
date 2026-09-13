@@ -86,17 +86,22 @@ more.
 
 ## 4. A HIGH-risk feature never merges without the owner
 
-**enforced.** The risk tier is classified before the build and re-checked at
-merge. HIGH requires `operator_approved`.
+**enforced, and no longer more weakly than MEDIUM.** The risk tier is classified
+before the build and re-checked at merge. HIGH redeems a single-use approval
+bound to the capability, the feature, the exact head SHA, the risk rating and
+the production action — so it cannot transfer across any of them — and it is
+spent on redemption and journalled.
 
-Caveat, stated plainly because it is the weakest approval binding in the system:
-`operator_approved` arrives as a bare boolean in an HTTP body. It carries no
-fingerprint, no TTL, and no binding to feature or SHA — unlike the MEDIUM-risk
-approval, which has all three. The route is behind the dashboard's own authority
-check and control token, so this is not an open door; it is an asymmetry in which
-the most dangerous tier has the least-bound consent. See §19.
+It used to be a bare boolean in an HTTP body: no fingerprint, no TTL, no binding
+to feature or commit, while the *less* dangerous MEDIUM tier had all three. An
+approval collected once was indistinguishable from one replayed later against a
+different commit. The boolean no longer merges a HIGH-risk feature at all, and
+HIGH is still never shipped automatically — `auto_ship_if_eligible` refuses it
+structurally, whatever approval exists.
 
-- `wiz/features/risk.py`, `wiz/features/shipping.py`, `server/wiz_routes.py`
+- `wiz/features/pipeline.py::_high_risk_ship_approved`, `approve_high_risk_ship`
+- `cli/wiz_cmd.py::approve-ship`, `server/wiz_routes.py`
+- `tests/wiz/test_pipeline.py::TestHighRiskIsNotWeakerThanMedium`
 
 ## 5. Manual acceptance cannot mask an automated failure
 
@@ -275,7 +280,7 @@ compounds.
 ## 14. Feature state is written with compare-and-swap
 
 **enforced.** `FeatureStore.save()` rejects a write whose durable revision has
-moved, rather than last-writer-wins. See §19 for the caller-side gap.
+moved, rather than last-writer-wins. See §22 for the caller-side gap.
 
 ## 15. An owner is told once, and never silently not at all
 
@@ -293,8 +298,31 @@ duplicate is an annoyance; a silence is the system quietly giving up.
 Dedup is keyed on a stable semantic fingerprint, so a reworded exception with the
 same root cause does not escalate twice.
 
+The Wiz ledger is also process-safe and crash-safe. The read, the send and the
+write happen under a cross-process lease, because a watcher and a `jarvis wiz
+ship` are two processes: each would read the ledger, find nothing, send, and
+write back the whole object — so the owner hears it twice *and* whichever
+feature's record lost the write is told everything about it again. The write
+itself is atomic, because `write_text` truncates before it writes and an
+interruption between the two leaves a file that reads back as no ledger at all.
+A ledger that cannot be parsed is kept aside as evidence rather than
+overwritten.
+
+This is the one lease in the system that deliberately **fails open**: a refusal
+here is silence about a feature that needs a person, and nothing ever retries a
+notification that was never attempted. Everywhere else a guard that cannot
+answer refuses; the direction is chosen by what the failure costs, not by
+habit.
+
+The contract is "at most one message per outcome **in a row**", not "ever". A
+feature that needed a person, was fixed, shipped, and later needs them again for
+the identical reason says so again — remembering the whole history would make
+that second message silence.
+
 - `wiz/features/notify.py`, `reliability/notify.py`
 - `tests/reliability/test_notify.py::TestAFailedSendIsNotRecordedAsTold`
+- `tests/wiz/test_feature_notify.py::TestTwoProcessesShareOneLedger`
+- `tests/wiz/test_feature_notify.py::TestTheLedgerSurvivesTheMachineStopping`
 
 ## 16. The emergency stop stops the thing that is running
 
@@ -361,23 +389,80 @@ Over-redaction is tested too: 40-character git SHAs, preview URLs and
 - `security/scanner.py`, `rust/crates/openjarvis-security/src/scanner.rs`
 - `tests/security/test_deployment_credentials.py`
 
+## 19. Repair admission survives a second process and a restart
+
+**enforced.** A running repair holds an `flock` per key the gate arbitrates on —
+the incident id, and the failure fingerprint when it differs — so the kernel
+drops it the instant the holder exits for any reason, including SIGKILL, and a
+live-but-slow repair is never mistaken for a dead one. A cooldown is a
+wall-clock deadline in a file, not a `time.monotonic` reading in a dict: a
+monotonic deadline means nothing to the next process, and surviving a restart is
+the entire point of the pending-pull-request cooldown, which exists because one
+outage once became six pull requests in six ticks.
+
+Both are read and written under one registry lease, so two watchers cannot both
+read "there is capacity" and act on it. An unreadable registry **refuses**
+admission: a repair that does not start is a delay; two repairs that start
+together is the failure this exists to prevent.
+
+- `reliability/admission.py`, `reliability/watch.py::RepairGate`
+- `tests/reliability/test_admission.py` (real subprocesses, real `flock`s)
+
+## 20. An owner's message becomes work exactly once
+
+**enforced.** Asking "have you seen this?" and then saying "you have now" was
+two operations with a gap between them; two pollers both read "not seen" in that
+gap and one sentence became two feature requests, two branches, two pull
+requests. `SeenMessages.claim()` is one operation, under a machine-wide lease,
+against the file re-read at that moment rather than a copy loaded at startup.
+
+When it cannot be established whether a message is new, that is a **third
+answer**, not a guess: acting would repeat the owner's instruction, assuming it
+was handled would drop what they said in silence. The door says it could not
+record the message and asks them to send it again.
+
+- `wiz/owner_channel.py::SeenMessages.claim`, `SeenLedgerUnavailable`
+- `tests/wiz/test_owner_intake_hardening.py::TestTheClaimIsAtomicAcrossProcesses`
+
+## 21. A local check is not given the production keyring
+
+**enforced.** `run_check` passed `env=None` unless a PATH or variable override
+happened to be configured — which is to say, almost always — and `env=None`
+gives the child everything the parent holds. The parent is the watcher, and
+`jarvis reliability service install` deliberately captures the credential
+environment variables into a file the wrapper sources: the Supabase
+`service_role` key, a GitHub token that can merge, the Telegram bot token,
+Vercel and Anthropic credentials. The child is a shell command running code a
+coding agent wrote minutes earlier.
+
+A check now gets a named set — what a build or a test suite needs in order to
+*be* one — and nothing else. An allowlist, not a denylist, because the next
+service this integrates with will name its key something nobody has written down
+yet; secret-shaped names are refused on top of that, so a well-meaning addition
+to the base set cannot quietly let a token through. A credential a build
+genuinely needs is named in `check_env_pass_through`, per repository or in the
+watcher's configuration, and a repository's own `package.json` cannot widen it
+by being read.
+
+`jarvis wiz check-env` reports what each gate would and would not inherit,
+running nothing and printing no values.
+
+- `reliability/checks.py::check_environment`, `BASE_ENV`
+- `tests/reliability/test_check_environment.py`
+
 ---
 
-## 19. Known gaps
+## 22. Known gaps
 
 Stated because a document that lists only what holds is a marketing document.
 
-1. **`ship()`'s own post-merge `save()` has no conflict handler.** A lost race
-   there can leave the pull request merged while the store still says `READY`.
-   §9's `jarvis wiz reconcile` is the way back, but it has to be run, and which
-   of "retry", "reload and re-verify" or "stop for a person" should be automatic
-   is a judgement about production that was deliberately left to the owner.
-   Every *other* `store.save()` routes its failure through `_stop()`, which is
-   safe — see §14.
-2. **Repair admission is process-local.** `RepairGate._active` is an in-memory
-   dict. Two processes can each admit a repair for the same incident; §12 now
-   stops them destroying each other's worktree, and §1 stops them merging at
-   once, but the duplicate work itself is not prevented.
+1. ~~**`ship()`'s own post-merge `save()` has no conflict handler**~~ — fixed.
+   The merge is journalled before any state save, and a conflict on the save
+   that follows reconciles against what production actually says rather than
+   stranding a merged pull request behind a lost race; see §9 and §14.
+2. ~~**Repair admission is process-local**~~ — fixed. A running repair holds an
+   `flock` per key it arbitrates on, and cooldowns are wall-clock deadlines in a
+   file, both under one registry lease; see §19.
 3. ~~**HIGH-risk approval is an unbound boolean**~~ — fixed. HIGH now redeems a
    single-use approval bound to the capability, the feature, the exact head SHA,
    the risk and the production action, and the bare boolean no longer merges
@@ -397,8 +482,28 @@ Stated because a document that lists only what holds is a marketing document.
    the actor causing the merge. Not currently reachable — only the Control
    Center route and the internal auto-ship path call `ship()` — but a future
    ship verb on a low-authority channel would inherit the wrong actor.
+8. **Nothing retries a deferred run.** §17's refusal leaves the feature where it
+   was, journalled, for the next call — the same shape as a deferred auto-ship.
+   Both resting states are stable and the lease is bounded, so this is the safe
+   direction, but it is a reduction in autonomy rather than a no-op: a feature
+   deferred while an incident was being repaired stays deferred until somebody
+   asks again.
+9. **The incident-side notification ledger is not process-guarded.**
+   `reliability/notify_ledger.py` writes atomically and re-reads when the file's
+   stat changes, but its read-modify-write is not under a lease — so two
+   processes recording at the same moment can still lose one entry, costing one
+   duplicate message. §15's fix covers the Wiz ledger only; this one has the
+   same shape and was left out of that change deliberately rather than
+   accidentally.
+10. **`BASE_ENV` is a judgement, not a measurement.** §21's allowlist was chosen
+   by reasoning about what a build needs, not by observing what this machine's
+   builds actually read. Being too narrow is visible (the gate fails and says
+   how many variables were withheld) and recoverable
+   (`check_env_pass_through`), which is why the error is in that direction —
+   but the first run on a real machine is where the list gets tested. See
+   `docs/MAC_INTEGRATION_PLAN.md` steps 9 and 10.
 
-## 20. What this environment cannot prove
+## 23. What this environment cannot prove
 
 `launchd` supervision, real Telegram delivery, real Vercel deployments and
 production lineage, real GitHub merge permissions, real Supabase, real Tailscale
