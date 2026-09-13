@@ -356,28 +356,29 @@ Over-redaction is tested too: 40-character git SHAs, preview URLs and
 
 Stated because a document that lists only what holds is a marketing document.
 
-1. **`FeatureStore` CAS has no handlers.** `save()` correctly rejects a stale
-   write, and no caller catches the error. A lost race in `ship()`'s post-merge
-   window can leave the pull request merged while the store still says `READY`.
-   §9's reconciliation is the way back, but it has to be run.
-2. **`IncidentStore.transition()` has no CAS at all**, so a second process can
-   overwrite a `HUMAN_REQUIRED` escalation from a stale read.
-3. **Repair admission is process-local.** `RepairGate._active` is an in-memory
+1. **`ship()`'s own post-merge `save()` has no conflict handler.** A lost race
+   there can leave the pull request merged while the store still says `READY`.
+   §9's `jarvis wiz reconcile` is the way back, but it has to be run, and which
+   of "retry", "reload and re-verify" or "stop for a person" should be automatic
+   is a judgement about production that was deliberately left to the owner.
+   Every *other* `store.save()` routes its failure through `_stop()`, which is
+   safe — see §14.
+2. **Repair admission is process-local.** `RepairGate._active` is an in-memory
    dict. Two processes can each admit a repair for the same incident; §12 now
    stops them destroying each other's worktree, and §1 stops them merging at
    once, but the duplicate work itself is not prevented.
-4. **HIGH-risk approval is an unbound boolean** — see §4.
-5. **`ProcessLease` is not reentrant.** A second `acquire()` of the same lease in
+3. **HIGH-risk approval is an unbound boolean** — see §4.
+4. **`ProcessLease` is not reentrant.** A second `acquire()` of the same lease in
    one process blocks against itself until the timeout. No current path nests,
    and nothing should be written that does.
-6. **`DevelopmentQueue.admit_next()` has no caller.** The queue's own
+5. **`DevelopmentQueue.admit_next()` has no caller.** The queue's own
    production-deferral and concurrency refusal are therefore unreachable; only
    the `auto_ship_if_eligible` path in §17 actually defers. Features are
    submitted to the queue and finished on it, but nothing admits from it.
-7. **`reverify_production()` runs outside the production-change lease** — see
+6. **`reverify_production()` runs outside the production-change lease** — see
    §1. It performs no merge, but its production observation can interleave with
    another subsystem's deploy.
-8. **The channel ceiling is checked against the feature's stored `source`**, not
+7. **The channel ceiling is checked against the feature's stored `source`**, not
    the actor causing the merge. Not currently reachable — only the Control
    Center route and the internal auto-ship path call `ship()` — but a future
    ship verb on a low-authority channel would inherit the wrong actor.
