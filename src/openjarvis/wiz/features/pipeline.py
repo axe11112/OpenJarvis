@@ -74,6 +74,7 @@ from openjarvis.wiz.features.preview import PreviewObserver
 from openjarvis.wiz.features.profile import EngineeringProfile
 from openjarvis.wiz.features.provision import PROVISION_CHECK_NAME, provision_check
 from openjarvis.wiz.features.risk import classify, classify_paths
+from openjarvis.wiz.features.store import ConcurrentModificationError
 from openjarvis.wiz.features.verification import (
     CriterionOutcome,
     FeatureVerifier,
@@ -2271,15 +2272,70 @@ class FeaturePipeline:
         kind: str,
         message_is_success: bool = False,
     ) -> StepResult:
-        """End the feature's autonomous progress and say why."""
-        if not feature.terminal:
-            feature.transition(
-                FeatureState.HUMAN_REQUIRED, at=self.clock(), reason=message[:300]
+        """End the feature's autonomous progress and say why.
+
+        The universal safe-stop handler: every failure in :meth:`advance`, and
+        every step that decides it cannot continue, arrives here. So this must
+        not be a place that can itself fail.
+
+        It could. The save was unguarded, and on a cross-process conflict it
+        raised -- skipping the journal entry *and* the queue release, then
+        escaping into ``advance``'s catch-all, which calls this method again with
+        the same stale object and so raises a second time and escapes entirely.
+        One benign conflict therefore leaked the development queue's only
+        concurrency slot permanently, with nothing recorded anywhere to say why
+        Wiz had stopped taking work.
+
+        The persist is now best-effort with one reload-and-reapply, and the
+        journal entry and the queue release happen either way. A feature whose
+        stop could not be written down is a bad outcome; a Wiz that silently
+        stops accepting features is a worse one.
+        """
+        stopped = self._persist_stop(feature, message)
+        self._record(stopped, kind, message)
+        self._release(stopped)
+        return StepResult(stopped, progressed=False, message=message)
+
+    def _persist_stop(self, feature: FeatureRequest, message: str) -> FeatureRequest:
+        """Record HUMAN_REQUIRED durably, adopting a newer row if there is one.
+
+        Returns whichever object is now authoritative -- the caller's, or the
+        reloaded one -- so nothing downstream keeps acting on a stale view.
+        """
+        try:
+            if not feature.terminal:
+                feature.transition(
+                    FeatureState.HUMAN_REQUIRED, at=self.clock(), reason=message[:300]
+                )
+            self.store.save(feature)
+            return feature
+        except ConcurrentModificationError:
+            # Someone else wrote first. Re-apply the stop to what is actually
+            # there: the point is that the feature ends up stopped, not that
+            # this particular in-memory copy is the one that says so.
+            try:
+                fresh = self._load(feature.id)
+                if not fresh.terminal:
+                    fresh.transition(
+                        FeatureState.HUMAN_REQUIRED,
+                        at=self.clock(),
+                        reason=message[:300],
+                    )
+                    self.store.save(fresh)
+                return fresh
+            except Exception:
+                logger.exception(
+                    "could not record the stop for %s after reloading it; "
+                    "releasing the queue slot anyway",
+                    feature.id,
+                )
+                return feature
+        except Exception:
+            logger.exception(
+                "could not record the stop for %s; releasing the queue slot anyway",
+                feature.id,
             )
-        self.store.save(feature)
-        self._record(feature, kind, message)
-        self._release(feature)
-        return StepResult(feature, progressed=False, message=message)
+            return feature
 
     def _load(self, feature_id: str) -> FeatureRequest:
         feature = self.store.get(feature_id)

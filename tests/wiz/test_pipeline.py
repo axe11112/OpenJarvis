@@ -4096,9 +4096,7 @@ class TestTheOwnersDecisionKeepsItsOwnTimestamp:
 
     def _accepted(self, tmp_path, clock):
         helper = TestManualAcceptanceSurvivesTheProcessThatRecordedIt()
-        return helper._feature_awaiting_a_person(
-            tmp_path, clock, helper._approvals()
-        )
+        return helper._feature_awaiting_a_person(tmp_path, clock, helper._approvals())
 
     def test_finish_does_not_restamp_a_matching_record(self, tmp_path, clock):
         pipeline, feature, _ = self._accepted(tmp_path, clock)
@@ -4109,13 +4107,9 @@ class TestTheOwnersDecisionKeepsItsOwnTimestamp:
 
         # Anything that reads the record again must not move its timestamp.
         again = pipeline.store.get(feature.id)
-        pipeline._manual_acceptance_still_valid(
-            again, head_sha=recorded["head_sha"]
-        )
+        pipeline._manual_acceptance_still_valid(again, head_sha=recorded["head_sha"])
         assert (
-            pipeline.store.get(feature.id).metadata["manual_acceptance"][
-                "confirmed_at"
-            ]
+            pipeline.store.get(feature.id).metadata["manual_acceptance"]["confirmed_at"]
             == original_at
         )
 
@@ -4139,3 +4133,125 @@ class TestTheOwnersDecisionKeepsItsOwnTimestamp:
             )
             is False
         )
+
+
+class TestTheSafeStopIsActuallySafe:
+    """`_stop` is where every failure in the pipeline arrives.
+
+    Its save was unguarded. On a cross-process conflict it raised, skipping the
+    journal entry *and* the queue release, then escaped into advance()'s
+    catch-all -- which calls _stop again with the same stale object, raising a
+    second time and escaping entirely. One benign conflict leaked the
+    development queue's only concurrency slot permanently, with nothing recorded
+    anywhere to say why Wiz had stopped taking work.
+    """
+
+    class _ConflictingStore:
+        """Wraps a real store and fails the next save with a real conflict."""
+
+        def __init__(self, inner, *, fail_times: int = 1):
+            self._inner = inner
+            self._remaining = fail_times
+            self.saves = 0
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def save(self, feature):
+            self.saves += 1
+            if self._remaining > 0:
+                self._remaining -= 1
+                from openjarvis.wiz.features.store import (
+                    ConcurrentModificationError,
+                )
+
+                raise ConcurrentModificationError(
+                    feature.id, expected_version=1, actual_version=2
+                )
+            return self._inner.save(feature)
+
+    def _pipeline_mid_build(self, tmp_path, clock):
+        from openjarvis.wiz.features.queue import DevelopmentQueue
+
+        pipeline = build_pipeline(tmp_path, clock)
+        # A real queue: the leak this class is about is a leaked queue slot, so
+        # a pipeline without one would prove nothing.
+        pipeline.queue = DevelopmentQueue(max_concurrent=1)
+        submitted = pipeline.submit(REQUEST, actor=operator_actor())
+        return pipeline, submitted
+
+    def test_a_conflict_does_not_leak_the_queue_slot(self, tmp_path, clock):
+        pipeline, submitted = self._pipeline_mid_build(tmp_path, clock)
+        feature = pipeline.store.get(submitted.id)
+        pipeline.queue.submit(feature)
+        pipeline.queue.admit_next()
+        assert pipeline.queue.snapshot()["running"], "nothing was running to leak"
+
+        pipeline.store = self._ConflictingStore(pipeline.store)
+        pipeline._stop(feature, "something went wrong", kind="feature.failed")
+
+        assert not pipeline.queue.snapshot()["running"], (
+            "the queue slot was never released, so Wiz has silently stopped "
+            "accepting features"
+        )
+
+    def test_a_conflict_is_still_journalled(self, tmp_path, clock):
+        pipeline, submitted = self._pipeline_mid_build(tmp_path, clock)
+        feature = pipeline.store.get(submitted.id)
+        pipeline.store = self._ConflictingStore(pipeline.store)
+
+        pipeline._stop(feature, "something went wrong", kind="feature.failed")
+
+        kinds = [e.kind for e in pipeline.journal.tail(50)]
+        assert "feature.failed" in kinds, (
+            "the stop was not recorded anywhere, so nothing says why Wiz stopped"
+        )
+
+    def test_the_stop_is_re_applied_to_the_reloaded_feature(self, tmp_path, clock):
+        """Best-effort must still make its best effort: one reload and retry."""
+        pipeline, submitted = self._pipeline_mid_build(tmp_path, clock)
+        feature = pipeline.store.get(submitted.id)
+        pipeline.store = self._ConflictingStore(pipeline.store, fail_times=1)
+
+        result = pipeline._stop(feature, "stopped", kind="feature.failed")
+
+        assert result.feature.state is FeatureState.HUMAN_REQUIRED
+        assert pipeline.store.get(submitted.id).state is FeatureState.HUMAN_REQUIRED, (
+            "the retry did not persist the stop"
+        )
+
+    def test_a_permanently_failing_store_still_releases_the_slot(self, tmp_path, clock):
+        """The worst case: the save never succeeds. The slot must still go."""
+        pipeline, submitted = self._pipeline_mid_build(tmp_path, clock)
+        feature = pipeline.store.get(submitted.id)
+        pipeline.queue.submit(feature)
+        pipeline.queue.admit_next()
+
+        pipeline.store = self._ConflictingStore(pipeline.store, fail_times=99)
+        pipeline._stop(feature, "stopped", kind="feature.failed")
+
+        assert not pipeline.queue.snapshot()["running"]
+
+    def test_advance_does_not_escape_on_a_conflict(self, tmp_path, clock):
+        """The second half of the original defect.
+
+        advance()'s catch-all calls _stop with the object that just failed, so a
+        conflict raised there used to raise again and escape advance entirely.
+        """
+        pipeline, submitted = self._pipeline_mid_build(tmp_path, clock)
+        feature = pipeline.store.get(submitted.id)
+
+        def _boom(_feature):
+            from openjarvis.wiz.features.store import ConcurrentModificationError
+
+            raise ConcurrentModificationError(
+                _feature.id, expected_version=1, actual_version=2
+            )
+
+        pipeline._steps = lambda: {feature.state: _boom}
+        pipeline.store = self._ConflictingStore(pipeline.store)
+
+        result = pipeline.advance(feature)  # must not raise
+
+        assert result.progressed is False
+        assert not pipeline.queue.snapshot()["running"]
