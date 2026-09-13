@@ -938,3 +938,157 @@ def reconcile(feature_id: str, reason: str) -> None:
         console.print(f"[red]{exc}[/red]")
         raise SystemExit(1) from exc
     _report_feature(feature, did="reconciled against what production actually says")
+
+
+@wiz.command("authority")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Raw report.")
+def authority(as_json: bool) -> None:
+    """What each channel is allowed to do here, and whether Wiz could ship.
+
+    Read-only, and deliberately narrow: it loads the authority policy and
+    nothing else -- no feature store, no git checkout, no engineering target, no
+    network. Safe to run on the live machine before changing anything, and it
+    prints no secrets because the policy holds none: it is a map from channel to
+    permitted consequence.
+
+    Run this before enabling a build that enforces the channel ceiling. The
+    ceiling is enforced at both gates (``feature.build`` needs CODE_WRITE,
+    shipping needs PRODUCTION_CHANGE), and ``AuthorityPolicy.default()``
+    deliberately grants neither -- writing code is an opt-in an owner makes on
+    purpose, not what happens when a config file is missing. Without this
+    command the first sign of that would be a refused build.
+    """
+    import json as _json
+    from pathlib import Path
+
+    from openjarvis.wiz.authority import (
+        CHANNEL_CEILING,
+        Authority,
+        AuthorityPolicy,
+        Channel,
+    )
+    from openjarvis.wiz.runtime import AUTHORITY_FILENAME, wiz_home
+
+    console = _console()
+    path = Path(wiz_home()) / AUTHORITY_FILENAME
+    policy = AuthorityPolicy.load(path)
+
+    def _granted(channel: Channel) -> set:
+        return set(policy.granted_to(channel))
+
+    def _holders(authority_kind: Authority) -> list:
+        return sorted(
+            channel.value
+            for channel in Channel
+            if authority_kind in _granted(channel)
+        )
+
+    # "Structurally incapable" means the ceiling forbids it, so no configuration
+    # can grant it -- a stronger statement than "it is not granted today".
+    def _ceiling_forbids(channel: Channel, authority_kind: Authority) -> bool:
+        return authority_kind not in CHANNEL_CEILING.get(channel, frozenset())
+
+    build_ok = Authority.CODE_WRITE in _granted(Channel.CONTROL_CENTER)
+    ship_ok = Authority.PRODUCTION_CHANGE in _granted(Channel.CONTROL_CENTER)
+
+    report = {
+        "policy_path": str(path),
+        "policy_file_present": path.exists(),
+        "using_defaults": not path.exists(),
+        "granted": policy.to_mapping(),
+        "ceiling": {
+            channel.value: sorted(a.value for a in authorities)
+            for channel, authorities in sorted(
+                CHANNEL_CEILING.items(), key=lambda kv: kv[0].value
+            )
+        },
+        "code_write": _holders(Authority.CODE_WRITE),
+        "pr_write": _holders(Authority.PR_WRITE),
+        "production_change": _holders(Authority.PRODUCTION_CHANGE),
+        "telegram_cannot_change_production": _ceiling_forbids(
+            Channel.TELEGRAM, Authority.PRODUCTION_CHANGE
+        ),
+        "voice_cannot_change_production": _ceiling_forbids(
+            Channel.VOICE, Authority.PRODUCTION_CHANGE
+        ),
+        "control_center_can_build": build_ok,
+        "control_center_can_change_production": ship_ok,
+        "feature_build_allowed": build_ok,
+        "feature_ship_allowed": ship_ok,
+    }
+
+    if as_json:
+        click.echo(_json.dumps(report, indent=2, sort_keys=True))
+        return
+
+    console.print(f"[bold]Authority policy[/bold] {path}")
+    if not path.exists():
+        console.print(
+            "[yellow]No authority.json here, so the built-in defaults apply.[/yellow]"
+        )
+        console.print(
+            "[dim]The defaults grant no CODE_WRITE, PR_WRITE or "
+            "PRODUCTION_CHANGE to anyone, deliberately.[/dim]"
+        )
+    console.print()
+
+    console.print("[bold]Granted[/bold]")
+    granted = report["granted"]
+    for channel in sorted(c.value for c in Channel):
+        allowed = granted.get(channel) or []
+        shown = ", ".join(allowed) if allowed else "nothing"
+        console.print(f"  {channel:<16} {shown}")
+    console.print()
+
+    console.print("[bold]Who can do what[/bold]")
+    for label, key in (
+        ("write code", "code_write"),
+        ("open pull requests", "pr_write"),
+        ("change production", "production_change"),
+    ):
+        holders = report[key]
+        text = ", ".join(holders) if holders else "[yellow]nobody[/yellow]"
+        console.print(f"  {label:<20} {text}")
+    console.print()
+
+    console.print("[bold]Ceilings that no configuration can lift[/bold]")
+    for label, key in (
+        ("Telegram", "telegram_cannot_change_production"),
+        ("Voice", "voice_cannot_change_production"),
+    ):
+        if report[key]:
+            console.print(
+                f"  [green]{label} can never change production.[/green]"
+            )
+        else:
+            console.print(
+                f"  [red]{label} is NOT structurally barred from changing "
+                f"production — the ceiling has been weakened.[/red]"
+            )
+    console.print()
+
+    console.print("[bold]Would Wiz work right now[/bold]")
+    console.print(
+        "  build a feature   "
+        + ("[green]yes[/green]" if build_ok else "[yellow]no[/yellow]")
+    )
+    console.print(
+        "  ship a feature    "
+        + ("[green]yes[/green]" if ship_ok else "[yellow]no[/yellow]")
+    )
+    if not (build_ok and ship_ok):
+        missing = []
+        if not build_ok:
+            missing.append("CODE_WRITE")
+        if not ship_ok:
+            missing.append("PRODUCTION_CHANGE")
+        console.print()
+        console.print(
+            "[yellow]control_center is missing "
+            + " and ".join(missing)
+            + ", so feature work will be refused.[/yellow]"
+        )
+        console.print(
+            f"[dim]Grant it deliberately in {path} — this command will not "
+            f"edit it for you.[/dim]"
+        )
