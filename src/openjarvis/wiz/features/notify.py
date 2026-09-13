@@ -10,15 +10,46 @@ actually change what is true — the thing they asked for exists and works
 where users are, or Wiz has hit something it genuinely cannot resolve alone
 and needs a decision.
 
-**One feature, at most one message per outcome, ever.** Deduplicated on disk
-so a watcher restart, a retried step, or ``ship`` being called twice for the
-same reason does not say it again — the same restraint
+**One feature, at most one message per outcome in a row.** Deduplicated on
+disk so a watcher restart, a retried step, or ``ship`` being called twice for
+the same reason does not say it again — the same restraint
 :mod:`~openjarvis.reliability.notify_ledger` keeps for incidents, applied to a
 different key: not "what does the owner still need to hear", but "have they
 already heard this exact thing about this exact feature". A feature does not
 flap the way an incident does, so the ledger does not need that module's
 correlated-outage machinery — a feature id and a digest of what is being said
 about it is enough.
+
+"In a row" is exact, and deliberate. The ledger remembers a feature's *most
+recent* outcome, not every outcome it ever had, so a feature that needs the
+owner, is fixed, ships, and later needs them again for the identical reason
+says so again. Remembering the whole history would suppress that second
+message, and silence about a feature that needs a person is the one failure
+this module must not have. Duplicates are recoverable; an unsent "I need you"
+is not.
+
+**Delivery is at-least-once, and that is a choice, not a limitation.** The
+ledger is written only after ``send`` returns, so a crash, a full disk, or a
+lost lease between the two costs one repeated message on the next attempt.
+The alternative ordering — record first, send second — converts a single
+transient Telegram failure into permanent silence about that outcome, because
+every later attempt reads its own record and concludes the owner was already
+told. Nothing here can make an external send exactly-once: the message is
+either sent before it is recorded or recorded before it is sent, and only one
+of those two failure modes is safe. This module has no delivery receipt to
+close that gap with, and does not pretend otherwise.
+
+**Process-safe, because more than one process sends these.** The read, the
+send and the write happen under a cross-process lease
+(:class:`~openjarvis.core.proclock.ProcessLease`), not just a
+``threading.Lock``: a watcher and a ``jarvis wiz ship`` run in two processes,
+each holding its own lock object and its own copy of the ledger, and the
+read-modify-write between them both double-sends *and* discards whichever
+feature's record lost the race — so the discarded feature is told everything
+again as well. The write itself is atomic
+(:func:`~openjarvis.reliability.statefile.write_json_atomic`), since the
+restarts this ledger exists to survive are exactly the events that can
+interrupt a ``write_text`` mid-truncate.
 
 **No model writes the message.** Deterministic copy, assembled from the
 feature's own title and the reason its own gates already recorded — the same
@@ -32,9 +63,13 @@ import hashlib
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict
+
+from openjarvis.core.proclock import LeaseTimeout, ProcessLease
+from openjarvis.reliability.statefile import write_json_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +134,24 @@ class FeatureOwnerNotifier:
     send: Callable[[str], None]
     ledger_path: Path
     persona: bool = True
+    #: How long to wait for the cross-process lease before sending anyway.
+    #: Long enough to outlast another process's send, short enough that a
+    #: stuck holder does not stall the shipping pipeline behind it.
+    lease_timeout: float = 30.0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def _lease(self) -> ProcessLease:
+        """The machine-wide lease over this ledger file.
+
+        Named after the ledger rather than after this object, because that is
+        what two processes have in common. Constructed per call: ``flock``
+        state lives on the file descriptor a single ``acquire`` opens, not on
+        the Python object, so there is nothing here worth keeping.
+        """
+        return ProcessLease(
+            Path(str(self.ledger_path) + ".lock"), owner="feature-notify"
+        )
 
     def notify(self, feature: Any, *, kind: str, reason: str) -> bool:
         """Notify if this (feature, outcome) has not already been said.
@@ -119,31 +171,69 @@ class FeatureOwnerNotifier:
             return False
         digest = _digest(f"{kind}:{reason}")
         with self._lock:
-            entries = self._load()
-            previous = entries.get(key)
-            if previous is not None and previous.get("digest") == digest:
-                return False  # already told them exactly this
-
-            # The ledger is only written *after* send() succeeds. Recording
-            # first and sending second would mean a single transient send
-            # failure (Telegram down, a network blip) permanently suppresses
-            # that outcome — the digest is already on disk, so every retry
-            # sees "already told them" and never tries again. For a COMPLETE
-            # or HUMAN_REQUIRED message, silently losing it forever is far
-            # worse than the alternative failure mode this ordering accepts:
-            # send() succeeding but the ledger write failing (a crash between
-            # the two, or a full disk) can cause one duplicate resend on the
-            # next attempt. send() stays inside the lock so a second,
-            # concurrent notify() for the same (feature, digest) still sees
-            # this one as pending and does not also send.
             try:
-                self.send(text)
-            except Exception:  # noqa: BLE001 - a failed send must not break shipping
-                logger.exception("could not notify the owner about %s", key)
-                return False
+                with self._lease.acquire(
+                    timeout=self.lease_timeout, reason=f"notify {key}"
+                ):
+                    return self._notify_locked(key, kind=kind, digest=digest, text=text)
+            except LeaseTimeout:
+                # Fail *open*, and only here. Everywhere else in this system a
+                # guard that cannot answer refuses; this one sends anyway,
+                # because the two directions do not cost the same thing. A
+                # refusal here is silence about a feature that needs a person,
+                # and nothing downstream ever retries a notification that was
+                # never attempted. Proceeding costs at most a duplicate
+                # message, which this module's contract already allows.
+                logger.warning(
+                    "could not take the feature notification lease for %s; "
+                    "sending without it, which may duplicate a message",
+                    key,
+                )
+                return self._notify_locked(key, kind=kind, digest=digest, text=text)
+            except OSError:
+                logger.exception(
+                    "could not open the feature notification lease for %s; "
+                    "sending without it",
+                    key,
+                )
+                return self._notify_locked(key, kind=kind, digest=digest, text=text)
 
-            entries[key] = {"kind": kind, "digest": digest}
-            self._save(entries)
+    def _notify_locked(self, key: str, *, kind: str, digest: str, text: str) -> bool:
+        """Decide, send, and record — all three inside the lease.
+
+        The ledger is re-read here rather than passed in: the decision must
+        rest on what is on disk *now*, under the lease, not on what this
+        process last saw. Reading before acquiring is how two processes both
+        conclude the owner has not been told.
+        """
+        entries = self._load()
+        previous = entries.get(key)
+        if previous is not None and previous.get("digest") == digest:
+            return False  # already told them exactly this
+
+        # The ledger is only written *after* send() succeeds. Recording
+        # first and sending second would mean a single transient send
+        # failure (Telegram down, a network blip) permanently suppresses
+        # that outcome — the digest is already on disk, so every retry
+        # sees "already told them" and never tries again. For a COMPLETE
+        # or HUMAN_REQUIRED message, silently losing it forever is far
+        # worse than the alternative failure mode this ordering accepts:
+        # send() succeeding but the ledger write failing (a crash between
+        # the two, or a full disk) can cause one duplicate resend on the
+        # next attempt. See the module docstring: at-least-once, on purpose.
+        try:
+            self.send(text)
+        except Exception:  # noqa: BLE001 - a failed send must not break shipping
+            logger.exception("could not notify the owner about %s", key)
+            return False
+
+        # Re-read before writing, for the same reason the decision re-read:
+        # the file may have gained another feature's record since, and this
+        # write replaces the whole object. Losing that record would tell its
+        # owner everything about that feature again.
+        entries = self._load()
+        entries[key] = {"kind": kind, "digest": digest, "at": time.time()}
+        self._save(entries)
         return True
 
     def _success_text(self, feature: Any) -> str:
@@ -161,18 +251,48 @@ class FeatureOwnerNotifier:
 
     # -- persistence, survives a restart -------------------------------------
 
-    def _load(self) -> Dict[str, Dict[str, str]]:
+    def _load(self) -> Dict[str, Dict[str, Any]]:
         try:
-            return json.loads(self.ledger_path.read_text())
+            loaded = json.loads(self.ledger_path.read_text())
         except FileNotFoundError:
             return {}
-        except (json.JSONDecodeError, OSError):
+        except json.JSONDecodeError:
+            # Unreachable through this module's own writes now that they are
+            # atomic, so a corrupt file means something else wrote here — or
+            # a pre-atomic write was interrupted. Keep it: the cost is one
+            # repeated message per feature, and the file is the only evidence
+            # of what went wrong.
+            self._quarantine()
+            return {}
+        except OSError:
             logger.exception("could not read the feature notification ledger")
             return {}
+        if not isinstance(loaded, dict):
+            self._quarantine()
+            return {}
+        return {
+            str(key): value for key, value in loaded.items() if isinstance(value, dict)
+        }
 
-    def _save(self, entries: Dict[str, Dict[str, str]]) -> None:
+    def _quarantine(self) -> None:
+        """Move an unreadable ledger aside instead of silently overwriting it."""
+        spoiled = Path(str(self.ledger_path) + ".corrupt")
         try:
-            self.ledger_path.parent.mkdir(parents=True, exist_ok=True)
-            self.ledger_path.write_text(json.dumps(entries, sort_keys=True))
+            self.ledger_path.replace(spoiled)
         except OSError:
-            logger.exception("could not persist the feature notification ledger")
+            logger.exception("could not set aside the corrupt notification ledger")
+            return
+        logger.error(
+            "the feature notification ledger was unreadable and has been kept at "
+            "%s; the owner may hear one repeated message per feature",
+            spoiled,
+        )
+
+    def _save(self, entries: Dict[str, Dict[str, Any]]) -> None:
+        # Atomic: the restarts this ledger exists to survive — a sleeping
+        # laptop, a launchd reload, a code update — are exactly the events
+        # that can land between a truncate and a write. A half-written ledger
+        # reads back as no ledger, and no ledger means the owner is told
+        # everything they already know, all over again.
+        if not write_json_atomic(self.ledger_path, entries):
+            logger.error("could not persist the feature notification ledger")
