@@ -41,6 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from openjarvis.reliability.admission import RepairAdmission
 from openjarvis.reliability.events import (
     RELIABILITY_FLAPPING_DETECTED,
     RELIABILITY_RECOVERY_REQUIRED,
@@ -62,6 +63,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "RepairGate",
+    "admission_dir",
     "UnsafeConfigurationError",
     "WatchSupervisor",
     "assert_safe_to_start",
@@ -117,6 +119,23 @@ def stop_flag_path(config: Any) -> "Path":
     if configured:
         return Path(configured).expanduser().parent / "STOPPED"
     return get_config_dir() / "reliability" / "STOPPED"
+
+
+def admission_dir(config: Any) -> "Path":
+    """Where cross-process repair admission state lives.
+
+    Beside the emergency stop and by the same rule, so that two watchers
+    started from two shells -- or a watcher and its own replacement -- resolve
+    the same directory. Two processes computing this differently would each
+    have an empty registry and would both admit the same repair, which is the
+    failure :mod:`openjarvis.reliability.admission` exists to prevent.
+    """
+    from openjarvis.core.paths import get_config_dir
+
+    configured = getattr(config.reliability, "db_path", "")
+    if configured:
+        return Path(configured).expanduser().parent / "admission"
+    return get_config_dir() / "reliability" / "admission"
 
 
 def assert_safe_to_start(config: Any) -> None:
@@ -255,6 +274,22 @@ class RepairGate:
     #: emergency stop is that it takes effect when it is pulled, not at the
     #: next restart of a process that may be mid-outage and never restart.
     stop_engaged: Callable[[], bool] = lambda: False
+    #: The machine-wide half of admission, when one is configured.
+    #:
+    #: Everything below this line is per-process state: ``_active`` sees only
+    #: the repairs *this* object started, and ``_cooldown_until`` is erased by
+    #: a restart. Both of those are wrong for the way this system actually
+    #: runs. A launchd watcher and a hand-started one each hold their own
+    #: ``RepairGate``, so the concurrency limit and the "same failure already
+    #: running" check never saw the other process at all; and restarting a
+    #: watcher mid-outage dropped the pending-pull-request cooldown that stops
+    #: one root cause becoming a pull request per tick.
+    #:
+    #: With this set, both questions are also asked of the filesystem, where
+    #: another process and a later process can see the answer. Left ``None``
+    #: this class behaves exactly as it always did, which is what the many
+    #: unit tests of its pacing policy want.
+    admission: Optional[RepairAdmission] = None
     _active: Dict[str, float] = field(default_factory=dict, repr=False)
     _cooldown_until: Dict[str, float] = field(default_factory=dict, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
@@ -324,13 +359,34 @@ class RepairGate:
                 until, why = self._cooldown_until.get(key, (0.0, ""))
                 if now < until:
                     return False, f"{why} for another {until - now:.0f}s"
+            if self.admission is not None:
+                refusal = self.admission.why_not(
+                    incident_id,
+                    fingerprint=fingerprint,
+                    max_concurrent=max(1, self.max_concurrent),
+                )
+                if refusal:
+                    return False, refusal
             return True, ""
 
     def start(self, incident_id: str, *, fingerprint: str = "") -> bool:
-        """Claim a repair slot. Returns ``False`` when it could not be claimed."""
+        """Claim a repair slot. Returns ``False`` when it could not be claimed.
+
+        The machine-wide claim is taken *before* the in-process one is
+        recorded, and a failure to take it leaves nothing behind. Recording the
+        local claim first and discovering the global one is gone would leave
+        this gate believing a repair is running that never started -- a slot
+        held by nobody, blocking the incident until the process restarts.
+        """
         with self._lock:
             allowed, _reason = self.may_start(incident_id, fingerprint=fingerprint)
             if not allowed:
+                return False
+            if self.admission is not None and not self.admission.claim(
+                incident_id,
+                fingerprint=fingerprint,
+                max_concurrent=max(1, self.max_concurrent),
+            ):
                 return False
             self._active[incident_id] = fingerprint or incident_id
             return True
@@ -365,13 +421,24 @@ class RepairGate:
                     ("cooling down after a failed repair"),
                 )
             else:
-                return
-            if seconds <= 0:
-                return
-            until = self.clock() + seconds
-            for key in (incident_id, fingerprint):
-                if key:
-                    self._cooldown_until[key] = (until, why)
+                seconds, why = 0.0, ""
+            if seconds > 0:
+                until = self.clock() + seconds
+                for key in (incident_id, fingerprint):
+                    if key:
+                        self._cooldown_until[key] = (until, why)
+            # Unconditionally, and last: an outcome that earns no cooldown --
+            # a repair that succeeded without opening a pull request -- still
+            # has to give its slot back. Returning early on that branch, as
+            # this did before the slot became machine-wide, would leak a claim
+            # per clean repair until the process exited.
+            if self.admission is not None:
+                self.admission.release(
+                    incident_id,
+                    fingerprint=fingerprint,
+                    cooldown_seconds=max(0.0, seconds),
+                    reason=why,
+                )
 
     def clear_cooldown(self, *keys: str) -> List[str]:
         """Drop the cooldown on specific incidents or fingerprints.
@@ -388,6 +455,13 @@ class RepairGate:
             for key in keys:
                 if key and self._cooldown_until.pop(key, None) is not None:
                     cleared.append(key)
+            if self.admission is not None:
+                # A cooldown an owner ended has to end on disk too, or the next
+                # tick reads it back out of the registry and the "Fix it" they
+                # sent does nothing.
+                for key in self.admission.clear_cooldown(*[k for k in keys if k]):
+                    if key not in cleared:
+                        cleared.append(key)
         return cleared
 
     @property
@@ -412,6 +486,12 @@ class RepairGate:
                     for key, (until, _why) in self._cooldown_until.items()
                     if until > now
                 },
+                # What the whole machine is doing, not just this process. A
+                # status display that showed only this watcher's repairs would
+                # be the same half-truth the gate itself used to act on.
+                "machine": (
+                    self.admission.snapshot() if self.admission is not None else None
+                ),
             }
 
 

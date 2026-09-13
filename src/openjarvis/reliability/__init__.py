@@ -10,6 +10,7 @@ See ``docs/JARVIS_ARCHITECTURE.md``, ``docs/JARVIS_ROADMAP.md`` and
 
 from __future__ import annotations
 
+from openjarvis.reliability.admission import RepairAdmission, RepairClaim
 from openjarvis.reliability.analysis import build_analysis_prompt
 from openjarvis.reliability.briefing import (
     Briefing,
@@ -77,6 +78,8 @@ __all__ = [
     "WatchSupervisor",
     "UnsafeConfigurationError",
     "RepairGate",
+    "RepairAdmission",
+    "RepairClaim",
     "RecoveryType",
     "IncidentReport",
     "FlappingVerdict",

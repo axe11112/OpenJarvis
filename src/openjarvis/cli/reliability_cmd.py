@@ -359,12 +359,13 @@ def _build_supervised_monitor(config: Any, store: Any) -> tuple:
     They are built as a pair because each needs the other: the supervisor gates
     the monitor's repairs, and the supervisor reports the monitor's health.
     """
+    from openjarvis.reliability.admission import RepairAdmission
     from openjarvis.reliability.detector import Detector
     from openjarvis.reliability.flapping import FlappingDetector
     from openjarvis.reliability.monitor import ReliabilityMonitor
     from openjarvis.reliability.monitor_health import MonitorHealth
     from openjarvis.reliability.probes.spec import load_probes
-    from openjarvis.reliability.watch import RepairGate, WatchSupervisor
+    from openjarvis.reliability.watch import RepairGate, WatchSupervisor, admission_dir
 
     rc = config.reliability
     notifier = _build_notifier(config)
@@ -388,6 +389,14 @@ def _build_supervised_monitor(config: Any, store: Any) -> tuple:
             # The durable emergency stop, so pulling it stops this watcher
             # even though the operator pulled it from another process.
             stop_engaged=lambda: _stop_flag_path(config).is_file(),
+            # Admission state that another watcher and a restarted watcher can
+            # both see. Without this the concurrency limit and every cooldown
+            # are private to one process object, so two watchers repair the
+            # same incident at once and a restart discards the cooldown that
+            # stops one outage becoming a pull request per tick.
+            admission=RepairAdmission(
+                root=admission_dir(config), owner="reliability-watch"
+            ),
         ),
         flapping=FlappingDetector(
             window=rc.flapping.window,
